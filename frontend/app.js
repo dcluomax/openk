@@ -15,8 +15,12 @@ const api = {
   async listJobs() { const r = await fetch('/api/jobs'); return r.ok ? r.json() : []; },
   async getJob(id) { const r = await fetch('/api/jobs/' + id); if (!r.ok) throw new Error('任务不存在'); return r.json(); },
   async deleteJob(id) { await fetch('/api/jobs/' + id, { method: 'DELETE' }); },
-  async retryJob(id) {
-    const r = await fetch('/api/jobs/' + id + '/retry', { method: 'POST' });
+  async retryJob(id, payload) {
+    const r = await fetch('/api/jobs/' + id + '/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '重试失败');
     return r.json();
   },
@@ -117,7 +121,7 @@ function renderJobs(force = false) {
     const recBadge = (j.recordings && j.recordings.length)
       ? `<span class="rec-badge" title="已录唱">🎤${j.recordings.length}</span>` : '';
     const retryBtn = j.state === 'error'
-      ? '<button class="retry" title="重试下载/处理">↻</button>' : '';
+      ? '<button class="retry" title="重试；若自动检测语言有误，先在上方选好语言再点此">↻</button>' : '';
     li.innerHTML = `
       <span class="dot ${j.state}"></span>
       <div class="jt">
@@ -133,7 +137,10 @@ function renderJobs(force = false) {
     if (retryEl) {
       retryEl.addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        try { await api.retryJob(j.id); selectJob(j.id); refreshList(true); }
+        try {
+          await api.retryJob(j.id, { language: $('#language').value || null });
+          selectJob(j.id); refreshList(true);
+        }
         catch (e) { alert(e.message || '重试失败'); }
       });
     }

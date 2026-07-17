@@ -301,20 +301,31 @@ def transcribe(
     if language:
         cmd += ["--language", language]
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        env=config.ca_env(),
-    )
-    assert proc.stdout is not None
-    last_line = ""
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        last_line = line
-        if on_progress and ("Transcrib" in line or "Align" in line or "%" in line):
-            on_progress(50, "正在识别并对齐歌词…")
-    code = proc.wait()
+    def _run(extra_args: List[str]) -> tuple[int, str]:
+        proc = subprocess.Popen(
+            cmd + extra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=config.ca_env(),
+        )
+        assert proc.stdout is not None
+        last = ""
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            last = line
+            if on_progress and ("Transcrib" in line or "Align" in line or "%" in line):
+                on_progress(50, "正在识别并对齐歌词…")
+        return proc.wait(), last
+
+    code, last_line = _run([])
+    # whisperX 只对部分语言内置了逐词对齐模型；当语言被（常常是误）判成没有对齐
+    # 模型的语言（如拉丁语 la）时，会在对齐阶段抛 “No default align-model for
+    # language: xx” 而整段失败。这种情况退回“仅转写、不逐词对齐”，至少产出逐行
+    # 歌词而不是直接报错——用户可再手动选对语言重试或直接编辑歌词。
+    if code != 0 and "align-model" in last_line.lower():
+        if on_progress:
+            on_progress(50, "该语言无逐词对齐模型，改为仅转写…")
+        code, last_line = _run(["--no_align"])
     if code != 0:
         raise RuntimeError(f"歌词识别失败（退出码 {code}）：{last_line}")
 

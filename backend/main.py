@@ -14,7 +14,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,6 +61,11 @@ class LyricsUpdateRequest(BaseModel):
     lines: list[dict]                 # [{start, end, text, words?}]
     language: str | None = None
     source: str | None = None
+
+
+class RetryJobRequest(BaseModel):
+    language: str | None = None       # 覆盖语言（自动检测认错时手动指定，如 zh）
+    whisper_model: str | None = None  # 覆盖识别模型
 
 
 def _public_job(job: dict) -> dict:
@@ -144,18 +149,29 @@ def delete_job(job_id: str) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: str) -> JSONResponse:
-    """重试失败的任务：重置状态并重新跑一遍处理流水线（复用已修的下载重试逻辑）。"""
+def retry_job(job_id: str, req: RetryJobRequest | None = Body(None)) -> JSONResponse:
+    """重试失败的任务：重置状态并重新跑一遍流水线。
+
+    可选在请求体里传 ``language`` / ``whisper_model`` 覆盖原设置——自动检测把语言
+    认错（如中文被判成拉丁语 la）导致歌词乱码 / 无对齐模型时，手动指定语言重试即可修正。
+    """
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     if job.get("state") in ("queued", "running"):
         raise HTTPException(status_code=409, detail="任务正在处理中，无需重试")
-    manager.update(
-        job_id,
+    fields: dict = dict(
         state="queued", step="queued", progress=0,
         message="已重新加入队列", error=None,
     )
+    if req is not None:
+        lang = (req.language or "").strip()
+        if lang:
+            fields["language"] = lang
+        wm = (req.whisper_model or "").strip()
+        if wm:
+            fields["whisper_model"] = wm
+    manager.update(job_id, **fields)
     _executor.submit(pipeline.run, job_id)
     return JSONResponse(_public_job(manager.get(job_id)))
 

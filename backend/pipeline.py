@@ -62,16 +62,31 @@ def run(job_id: str) -> None:
                 "（如需处理长音频，可调高环境变量 OPENK_MAX_SONG_SECONDS）"
             )
 
-        # 2) 人声分离
-        manager.update(job_id, step="separate", message="正在分离人声与伴奏…")
-        stems = separate.separate(
-            info["audio_path"], stems_dir,
-            model=config.SEPARATOR_MODEL,
-            on_progress=lambda p, m: manager.update(
-                job_id, progress=_scaled(_SEPARATE_RANGE, p), message=m
-            ),
-        )
-        manager.update(job_id, stems=stems, progress=_SEPARATE_RANGE[1])
+        # 2) 人声分离（已有有效分离结果则复用，避免重复分离——8GB 机器上分离最耗时/易超时，
+        #    重试只想换语言重识别时尤其不该再分离一遍）
+        prev_stems = job.get("stems") or {}
+
+        def _stem_ok(name: str | None) -> bool:
+            if not name:
+                return False
+            p = stems_dir / name
+            return p.exists() and p.stat().st_size > 0
+
+        if _stem_ok(prev_stems.get("vocals")) and _stem_ok(prev_stems.get("instrumental")):
+            stems = prev_stems
+            manager.update(job_id, step="separate",
+                           message="复用已分离的音轨，跳过分离",
+                           progress=_SEPARATE_RANGE[1])
+        else:
+            manager.update(job_id, step="separate", message="正在分离人声与伴奏…")
+            stems = separate.separate(
+                info["audio_path"], stems_dir,
+                model=config.SEPARATOR_MODEL,
+                on_progress=lambda p, m: manager.update(
+                    job_id, progress=_scaled(_SEPARATE_RANGE, p), message=m
+                ),
+            )
+            manager.update(job_id, stems=stems, progress=_SEPARATE_RANGE[1])
 
         # 分离完成后，默认删除原始下载音频以节省空间（已去重，不会再次分离）。
         if not config.KEEP_SOURCE:
