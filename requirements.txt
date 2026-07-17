@@ -1,0 +1,11 @@
+# openk 运行时（轻量）依赖 —— Web 服务与下载
+# 安装：pip install -r requirements.txt
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# yt-dlp：YouTube 反爬变化很快，强烈建议用 nightly 版本，并安装 Deno (JS runtime)：
+#   pip install -U --pre "yt-dlp[default]"     # nightly（含 JS 引擎支持）
+#   brew install deno                           # macOS 的 JS runtime
+# 无 JS runtime 时 YouTube 提取已被官方标为 deprecated，并可能导致 403。详见 README。
+yt-dlp[default]>=2025.1.1

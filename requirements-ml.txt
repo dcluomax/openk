@@ -1,0 +1,11 @@
+# openk 机器学习（重量级）依赖 —— 人声分离 + 歌词识别对齐
+# 这些包会拉取 PyTorch / onnxruntime 等，体积较大，请单独安装。
+#
+# macOS (Apple Silicon / Intel，无 NVIDIA 显卡):
+#   pip install -r requirements-ml.txt
+#
+# 提示：audio-separator 的 [cpu] extra 在 Apple Silicon 上会自动启用 CoreML 加速。
+# 若有 NVIDIA 显卡，请改用 audio-separator[gpu] 并按各自文档安装 CUDA 版 PyTorch。
+
+audio-separator[cpu]>=0.24
+whisperx>=3.3.1

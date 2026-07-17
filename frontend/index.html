@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>openk · 卡拉OK</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 顶部栏 -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🎤</span>
+        <div>
+          <h1>openk</h1>
+          <p>把任意视频变成专业卡拉OK · 人声分离 + 歌词自动对齐</p>
+        </div>
+      </div>
+    </header>
+
+    <!-- 新建任务 -->
+    <section class="card create">
+      <div class="row">
+        <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接，例如 https://www.youtube.com/watch?v=…" autocomplete="off" />
+        <button id="go" class="primary">开始制作</button>
+      </div>
+      <div class="row options">
+        <label>
+          语言
+          <select id="language">
+            <option value="">自动检测</option>
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+          </select>
+        </label>
+        <label>
+          识别模型
+          <select id="model">
+            <option value="">默认 (small · 快)</option>
+            <option value="medium">medium · 更准</option>
+            <option value="large-v3">large-v3 · 最准 (慢)</option>
+            <option value="tiny">tiny · 最快</option>
+          </select>
+        </label>
+        <span class="hint">提示：请仅用于自有或授权 / 知识共享许可的内容。</span>
+      </div>
+    </section>
+
+    <div class="layout">
+      <!-- 任务列表 -->
+      <aside class="card jobs">
+        <h2>我的曲库</h2>
+        <input id="search" class="search-box" type="text" placeholder="🔍 搜索已处理的歌曲…" autocomplete="off" />
+        <ul id="jobList" class="job-list"></ul>
+        <p id="jobsEmpty" class="empty">还没有任务，粘贴链接开始吧。</p>
+      </aside>
+
+      <!-- 播放器 / 处理进度 -->
+      <main class="card stage">
+        <!-- 处理进度 -->
+        <div id="progressPanel" class="progress-panel hidden">
+          <div class="progress-head">
+            <img id="progThumb" class="thumb" alt="" />
+            <div>
+              <h3 id="progTitle">处理中…</h3>
+              <p id="progMessage" class="muted">正在准备…</p>
+            </div>
+          </div>
+          <div class="steps">
+            <div class="step" data-step="download"><span>1</span>下载音频</div>
+            <div class="step" data-step="separate"><span>2</span>人声分离</div>
+            <div class="step" data-step="transcribe"><span>3</span>歌词对齐</div>
+          </div>
+          <div class="bar"><div id="progBar" class="bar-fill"></div></div>
+          <p id="progPct" class="muted small">0%</p>
+          <p id="progError" class="error hidden"></p>
+        </div>
+
+        <!-- 空状态 -->
+        <div id="emptyStage" class="empty-stage">
+          <div class="big-emoji">🎶</div>
+          <h3>选择或新建一首歌开始演唱</h3>
+          <p class="muted">处理完成后，这里会显示同步高亮的歌词与卡拉OK播放器。</p>
+        </div>
+
+        <!-- 卡拉OK 播放器 -->
+        <div id="player" class="player hidden">
+          <div class="player-head">
+            <div class="ph-left">
+              <h3 id="playerTitle"></h3>
+              <span id="lyricSource" class="badge hidden"></span>
+            </div>
+            <a id="sourceLink" class="muted small" target="_blank" rel="noreferrer">原始视频 ↗</a>
+          </div>
+
+          <div class="lyrics-tools">
+            <button id="editLyrics" class="lyr-btn hidden" title="识别不准时可逐行手动修改歌词">✏️ 编辑歌词</button>
+            <div id="editBar" class="edit-bar hidden">
+              <span class="muted small">逐行修改文字，保存后自动重建逐字时间轴</span>
+              <button id="saveLyrics" class="lyr-btn primary">保存</button>
+              <button id="cancelLyrics" class="lyr-btn">取消</button>
+            </div>
+          </div>
+
+          <div id="lyrics" class="lyrics"></div>
+
+          <div class="controls">
+            <button id="playBtn" class="round" title="播放/暂停">▶</button>
+            <span id="curTime" class="time">0:00</span>
+            <input id="seek" class="seek" type="range" min="0" max="1000" value="0" />
+            <span id="durTime" class="time">0:00</span>
+          </div>
+
+          <div class="mixer">
+            <label class="mix">
+              🎸 伴奏
+              <input id="instVol" type="range" min="0" max="100" value="100" />
+            </label>
+            <label class="mix">
+              🎙️ 导唱人声
+              <input id="vocalVol" type="range" min="0" max="100" value="0" />
+            </label>
+            <label class="mix">
+              🌫️ 混响
+              <select id="reverb">
+                <option value="none">干声</option>
+                <option value="room">小房间</option>
+                <option value="ktv" selected>KTV</option>
+                <option value="hall">大厅</option>
+                <option value="church">教堂</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="recorder">
+            <button id="recBtn" class="rec">🎤 开始录唱</button>
+            <span id="recStatus" class="muted small"></span>
+            <label class="mon" title="边唱边从耳机听到自己的声音"><input type="checkbox" id="monitor" /> 耳机监听</label>
+            <span class="hint">录唱会把伴奏与你的歌声合成保存；建议戴耳机以避免啸叫。</span>
+          </div>
+
+          <div class="rec-list-wrap hidden" id="recListWrap">
+            <h4>🎵 我的录音</h4>
+            <ul id="recList" class="rec-list"></ul>
+          </div>
+
+          <audio id="instAudio" preload="auto"></audio>
+          <audio id="vocalAudio" preload="auto"></audio>
+        </div>
+      </main>
+    </div>
+
+    <footer class="foot">
+      <span>基于 audio-separator（UVR 模型） · whisperX · yt-dlp 构建</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
