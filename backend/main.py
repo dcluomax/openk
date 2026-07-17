@@ -68,6 +68,11 @@ class RetryJobRequest(BaseModel):
     whisper_model: str | None = None  # 覆盖识别模型
 
 
+class LyricsAlignRequest(BaseModel):
+    lrclib_id: int | str | None = None   # 选中的 LRCLIB 歌词 id
+    language: str | None = None          # 对齐用语言（留空按歌词字符集自动判断）
+
+
 def _public_job(job: dict) -> dict:
     """给前端补充媒体访问 URL。"""
     job = dict(job)
@@ -193,6 +198,86 @@ def update_lyrics(job_id: str, req: LyricsUpdateRequest) -> dict:
         req.lines, req.language or job.get("language"), source, manager.job_dir(job_id)
     )
     manager.update(job_id, lyrics_source=result.get("source"), line_count=result.get("line_count"))
+    return {"ok": True, **result}
+
+
+@app.get("/api/lyrics/search")
+def lyrics_search(q: str | None = Query(None), track: str | None = Query(None),
+                  artist: str | None = Query(None)) -> list[dict]:
+    """在 LRCLIB 歌词库里搜索候选歌词（供手动挑选后重新对齐）。"""
+    from .steps import lyrics_sources as ls
+
+    if not any((q, track, artist)):
+        raise HTTPException(status_code=400, detail="请输入搜索关键词")
+    try:
+        return ls.search_lrclib(query=q, track=track, artist=artist)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"歌词搜索失败：{exc}")
+
+
+@app.post("/api/jobs/{job_id}/lyrics/align")
+def align_lyrics(job_id: str, req: LyricsAlignRequest) -> dict:
+    """把选中的歌词库歌词强制对齐到该任务的人声，得到逐字时间戳并覆盖歌词。
+
+    用于 ASR 识别不准（语言误判成拼音/英文等）时，手动搜到正确歌词后重新对齐。
+    复用已分离的人声，不重新下载/分离。
+    """
+    from .steps import lyrics_sources as ls, transcribe
+
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if not req.lrclib_id:
+        raise HTTPException(status_code=400, detail="缺少歌词 id")
+
+    stems = job.get("stems") or {}
+    vocals = stems.get("vocals")
+    if not vocals:
+        raise HTTPException(status_code=400, detail="该任务还没有分离出人声，无法对齐")
+    vocals_path = manager.job_dir(job_id) / "stems" / vocals
+    if not vocals_path.exists():
+        raise HTTPException(status_code=400, detail="人声文件不存在，请先重新处理")
+
+    rec = ls.get_lrclib_by_id(req.lrclib_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="未找到该歌词")
+
+    who = " - ".join(x for x in (rec.get("artistName"), rec.get("trackName")) if x)
+    base_src = f"LRCLIB · {who}" if who else "LRCLIB"
+    lang_override = (req.language or "").strip()
+    synced = rec.get("syncedLyrics")
+    plain = rec.get("plainLyrics")
+    try:
+        if synced:
+            lines = ls.parse_lrc(synced)
+            if not lines:
+                raise HTTPException(status_code=400, detail="歌词解析为空")
+            language = lang_override or ls.detect_language(lines)
+            result = transcribe.align_known_lyrics(
+                vocals_path, lines, language, manager.job_dir(job_id), base_src
+            )
+        elif plain:
+            lines = ls.spread_plain(plain, job.get("duration"))
+            if not lines:
+                raise HTTPException(status_code=400, detail="歌词为空")
+            language = lang_override or ls.detect_language(lines)
+            result = transcribe.save_line_lyrics(
+                lines, language, base_src + " · 近似时间轴",
+                manager.job_dir(job_id),
+            )
+        else:
+            raise HTTPException(status_code=400, detail="该结果没有歌词内容")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"对齐失败：{exc}")
+    manager.update(
+        job_id,
+        language=result.get("language"),
+        lyrics_file=result.get("lyrics_file"),
+        line_count=result.get("line_count"),
+        lyrics_source=result.get("source"),
+    )
     return {"ok": True, **result}
 
 
