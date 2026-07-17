@@ -1,0 +1,35 @@
+# 运行数据（下载的音频、分离结果、歌词）
+data/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.pytest_cache/
+
+# 模型缓存
+*.onnx
+*.ckpt
+*.pth
+
+# 凭据 / 环境变量（安全：切勿提交）
+.env
+.env.*
+cookies*.txt
+*.cookies
+*.log
+
+# 本地缓存（NLTK / 模型）
+nltk_data/
+
+# 编辑器
+.idea/
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db
