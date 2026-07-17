@@ -2,6 +2,12 @@
 
 把任意 YouTube / 视频链接一键变成卡拉OK：**自动去除人声**、**逐字对齐歌词**，并提供带同步高亮歌词的播放器。
 
+<p align="center">
+  <img src="docs/screenshots/player.png" alt="openk 卡拉OK 播放器 —— 逐字高亮歌词" width="860" />
+  <br/>
+  <sub>卡拉OK 播放器：逐字高亮歌词 · 独立伴奏/导唱音量 · KTV 混响 · 一键录唱 · 歌词来源标注</sub>
+</p>
+
 - 🎸 **人声分离**：基于 [audio-separator](https://github.com/nomadkaraoke/python-audio-separator)（[Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) 的 MDX-Net / BS-Roformer / Demucs 模型封装），在 Apple Silicon 上自动启用 CoreML 加速。
 - 🎯 **优秀的歌词自动对齐**（多来源，自动择优）：
   1. **[LRCLIB](https://lrclib.net) 歌词库** —— 用歌名/艺人/时长精确匹配，直接拿到**准确、干净**的逐行时间戳歌词（免费、无需 key）。
@@ -12,8 +18,26 @@
 - 🎚️ **卡拉OK播放器**：伴奏 / 导唱人声独立音量、进度拖动、逐字高亮、点歌词跳转、自动滚动、歌词来源标注。
 - 🎙️ **录唱与回放**：麦克风 + 伴奏实时合成录制，内置多种**混响**（KTV / 小房间 / 大厅 / 教堂）；录音自动保存，可回放、下载、删除。
 - 🗂️ **数据管理**：已处理的歌曲进曲库，可**搜索**；同一视频**自动去重**，不重复下载与分离；默认删除源音频以**节省空间**（只保留伴奏、人声与歌词，唱歌只看字幕、无需视频）。
+- ✏️ **歌词可编辑**：识别偶有错字时可逐行手动修改，保存后**自动重建逐字时间轴**（未改动的行保留原有精确时间）。
+- ↻ **失败一键重试**：下载 / 处理偶发失败（如 YouTube 限流）时，曲库项上会出现重试按钮；下载还内置自动退避重试。
 
 > ⚠️ 请仅用于你**拥有版权或授权**（如知识共享许可）的内容。本项目不鼓励侵犯版权。
+
+---
+
+## 界面预览
+
+**处理过程实时可见** —— 下载 → 人声分离 → 歌词对齐，三步流水线带进度：
+
+<p align="center">
+  <img src="docs/screenshots/processing.png" alt="三步处理流水线，实时进度" width="860" />
+</p>
+
+**混音与录唱** —— 伴奏 / 导唱人声独立音量、KTV 等多种混响、一键录唱与耳机监听：
+
+<p align="center">
+  <img src="docs/screenshots/controls.png" alt="混音与录唱控制条" width="820" />
+</p>
 
 ---
 
@@ -54,7 +78,8 @@ openk/
 │       ├── lyrics.py         # 歌词来源编排（择优 + 逐词对齐）
 │       └── transcribe.py     # whisperX 强制对齐 / 识别 → lyrics.json / .lrc
 ├── frontend/              # 纯静态卡拉OK播放器 (HTML/CSS/JS)
-├── scripts/seed_demo.py   # 生成演示任务（无需 ML 依赖）
+├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）
+├── docs/screenshots/      # 界面截图（README 用）
 ├── requirements.txt       # 轻量依赖（Web + 下载）
 └── requirements-ml.txt    # 重量依赖（分离 + 识别）
 ```
