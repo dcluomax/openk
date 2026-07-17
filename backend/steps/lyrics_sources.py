@@ -219,6 +219,83 @@ def fetch_lrclib(meta: Dict[str, Optional[str]], duration: Optional[float]) -> O
     return None
 
 
+def _to_simp(s: Optional[str]) -> Optional[str]:
+    """转简体（装了 zhconv 才生效，否则原样返回）。
+
+    LRCLIB 里中文歌名多为简体，而 YouTube 标题常是繁体，只用原文检索会漏。
+    """
+    if not s:
+        return s
+    try:
+        import zhconv
+        return zhconv.convert(s, "zh-hans")
+    except Exception:
+        return s
+
+
+def search_lrclib(query: Optional[str] = None, track: Optional[str] = None,
+                  artist: Optional[str] = None, limit: int = 15) -> List[Dict[str, Any]]:
+    """搜索 LRCLIB，返回候选列表（精简元信息，不含完整歌词正文，供前端选择）。
+
+    同时用原文与简体形式检索并合并去重，尽量提高繁体标题的命中率。
+    """
+    seen: Dict[Any, Dict[str, Any]] = {}
+
+    def _collect(results: Any) -> None:
+        if isinstance(results, list):
+            for r in results:
+                if isinstance(r, dict) and r.get("id") is not None:
+                    seen.setdefault(r["id"], r)
+
+    attempts: List[Dict[str, Any]] = []
+    if track or artist:
+        attempts.append({"track_name": track, "artist_name": artist})
+        st, sa = _to_simp(track), _to_simp(artist)
+        if (st, sa) != (track, artist):
+            attempts.append({"track_name": st, "artist_name": sa})
+    seen_q: List[str] = []
+    for q in (query, _to_simp(query)):
+        if q and q not in seen_q:
+            seen_q.append(q)
+            attempts.append({"q": q})
+
+    for params in attempts:
+        if len(seen) >= limit:
+            break
+        _collect(_http_get_json(f"{_LRCLIB}/api/search", params))
+
+    out: List[Dict[str, Any]] = []
+    for r in list(seen.values())[:limit]:
+        out.append({
+            "id": r.get("id"),
+            "trackName": r.get("trackName") or r.get("name"),
+            "artistName": r.get("artistName"),
+            "albumName": r.get("albumName"),
+            "duration": r.get("duration"),
+            "synced": bool(r.get("syncedLyrics")),
+            "instrumental": bool(r.get("instrumental")),
+        })
+    return out
+
+
+def get_lrclib_by_id(rid: Any) -> Optional[Dict[str, Any]]:
+    """按 LRCLIB id 取完整记录（含 syncedLyrics / plainLyrics）。"""
+    rec = _http_get_json(f"{_LRCLIB}/api/get/{urllib.parse.quote(str(rid))}", {})
+    return rec if isinstance(rec, dict) else None
+
+
+def spread_plain(plain: str, duration: Optional[float]) -> List[Dict[str, Any]]:
+    """把无时间轴的纯文本歌词按时长均匀铺开，得到近似逐行时间（无逐字）。"""
+    text_lines = [ln.strip() for ln in (plain or "").splitlines() if ln.strip()]
+    n = len(text_lines)
+    if n == 0:
+        return []
+    span = duration if duration and duration > 0 else n * 4.0
+    step = span / n
+    return [{"start": round(i * step, 3), "end": round((i + 1) * step, 3), "text": t}
+            for i, t in enumerate(text_lines)]
+
+
 # ---------------------------------------------------------------------------
 # 对外：从各来源获取逐行歌词候选
 # ---------------------------------------------------------------------------

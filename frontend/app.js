@@ -24,6 +24,19 @@ const api = {
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '重试失败');
     return r.json();
   },
+  async searchLyrics(params) {
+    const r = await fetch('/api/lyrics/search?' + new URLSearchParams(params).toString());
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '搜索失败');
+    return r.json();
+  },
+  async alignLyrics(id, payload) {
+    const r = await fetch(`/api/jobs/${id}/lyrics/align`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '对齐失败');
+    return r.json();
+  },
   async updateLyrics(id, payload) {
     const r = await fetch('/api/jobs/' + id + '/lyrics', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -55,6 +68,7 @@ const state = {
   search: '',
   editing: false,    // 歌词编辑态
   lyricsUrl: null,   // 当前歌词 json 地址（保存后重新拉取）
+  currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
   audioGraph: null,  // Web Audio 图（混响/录制）
   recorder: null,
   recording: false,
@@ -267,9 +281,12 @@ async function showPlayer(job) {
   // 载入歌词
   state.lyrics = null; state.lineEls = []; state.activeLine = -1;
   state.lyricsUrl = job.media?.lyrics || null;
+  state.currentTitle = job.title || '';
   state.editing = false;
   $('#editBar').classList.add('hidden');
   $('#editLyrics').classList.add('hidden');
+  $('#searchLyrics').classList.add('hidden');
+  $('#lyricSearch').classList.add('hidden');
   const box = $('#lyrics');
   box.innerHTML = '<p class="muted" style="text-align:center">正在载入歌词…</p>';
   try {
@@ -314,6 +331,7 @@ function renderLyrics() {
     state.lineEls.push(div);
   });
   $('#editLyrics').classList.toggle('hidden', !(state.lyrics?.lines?.length) || state.editing);
+  $('#searchLyrics').classList.toggle('hidden', state.editing);
 }
 
 /* ---------- 歌词编辑（识别不准时手动纠正） ---------- */
@@ -334,6 +352,8 @@ function enterLyricsEdit() {
   });
   $('#editBar').classList.remove('hidden');
   $('#editLyrics').classList.add('hidden');
+  $('#searchLyrics').classList.add('hidden');
+  $('#lyricSearch').classList.add('hidden');
 }
 
 function exitLyricsEdit() {
@@ -368,6 +388,88 @@ async function saveLyricsEdit() {
     alert(e.message || '保存失败');
   } finally {
     btn.disabled = false; btn.textContent = '保存';
+  }
+}
+
+/* ---------- 搜歌词并重新对齐（识别成拼音/英文时用） ---------- */
+function guessQuery(title) {
+  if (!title) return '';
+  const m = title.match(/《\s*([^《》]+?)\s*》/);   // 只有书名号《》才较可靠地是歌名
+  let t = title
+    .replace(/[\(（\[【『「][^)）\]】』」]*[\)）\]】』」]/g, ' ')  // 去掉各种括号/引号内的噪声副标题
+    .replace(/\s+/g, ' ').trim();
+  if (m && m[1] && !t.includes(m[1])) t = (t + ' ' + m[1]).trim();
+  return t.length > 28 ? t.slice(0, 28) : t;
+}
+
+function toggleLyricSearch(show) {
+  const panel = $('#lyricSearch');
+  const willShow = (show === undefined) ? panel.classList.contains('hidden') : show;
+  panel.classList.toggle('hidden', !willShow);
+  if (willShow) {
+    if (!$('#lsQuery').value.trim()) $('#lsQuery').value = guessQuery(state.currentTitle);
+    $('#lsQuery').focus(); $('#lsQuery').select();
+  }
+}
+
+async function doLyricSearch() {
+  const q = $('#lsQuery').value.trim();
+  if (!q) { $('#lsQuery').focus(); return; }
+  const hint = $('#lsHint'); const ul = $('#lsResults');
+  hint.textContent = '搜索中…'; ul.innerHTML = '';
+  const go = $('#lsGo'); go.disabled = true;
+  try {
+    renderLyricResults(await api.searchLyrics({ q }));
+  } catch (e) {
+    hint.textContent = e.message || '搜索失败';
+  } finally { go.disabled = false; }
+}
+
+function renderLyricResults(results) {
+  const hint = $('#lsHint'); const ul = $('#lsResults');
+  ul.innerHTML = '';
+  if (!results || !results.length) {
+    hint.textContent = '没搜到，换个关键词试试（只写歌名、或用简体）。';
+    return;
+  }
+  hint.textContent = `找到 ${results.length} 条，选一条重新对齐：`;
+  results.forEach((r) => {
+    const li = document.createElement('li');
+    const dur = r.duration ? fmt(r.duration) : '';
+    const tag = r.synced
+      ? '<span class="ls-tag synced">逐字对齐</span>'
+      : '<span class="ls-tag">近似时间</span>';
+    li.innerHTML = `
+      <div class="ls-info">
+        <div class="ls-name">${escapeHtml(r.trackName || '?')} ${tag}</div>
+        <div class="ls-sub muted small">${escapeHtml(r.artistName || '')}${r.albumName ? ' · ' + escapeHtml(r.albumName) : ''}${dur ? ' · ' + dur : ''}</div>
+      </div>
+      <button class="lyr-btn primary ls-use">用这个</button>`;
+    li.querySelector('.ls-use').addEventListener('click', () => applyLyric(r, li));
+    ul.appendChild(li);
+  });
+}
+
+async function applyLyric(r, li) {
+  if (!state.currentJobId) return;
+  const btn = li.querySelector('.ls-use');
+  const hint = $('#lsHint');
+  btn.disabled = true; btn.textContent = '处理中…';
+  hint.textContent = r.synced
+    ? '正在把歌词逐字对齐到人声，约需 1 分钟，请稍候…'
+    : '正在应用歌词…';
+  try {
+    await api.alignLyrics(state.currentJobId, { lrclib_id: r.id });
+    const url = (state.lyricsUrl || `/media/${state.currentJobId}/lyrics.json`) + '?t=' + Date.now();
+    state.lyrics = await (await fetch(url)).json();
+    const badge = $('#lyricSource');
+    if (state.lyrics.source) { badge.textContent = '歌词来源：' + state.lyrics.source; badge.classList.remove('hidden'); }
+    renderLyrics();
+    refreshList(true);
+    toggleLyricSearch(false);
+  } catch (e) {
+    hint.textContent = e.message || '对齐失败';
+    btn.disabled = false; btn.textContent = '用这个';
   }
 }
 
@@ -720,6 +822,10 @@ function bindPlayer() {
   $('#editLyrics').addEventListener('click', enterLyricsEdit);
   $('#saveLyrics').addEventListener('click', saveLyricsEdit);
   $('#cancelLyrics').addEventListener('click', exitLyricsEdit);
+  $('#searchLyrics').addEventListener('click', () => toggleLyricSearch());
+  $('#lsGo').addEventListener('click', doLyricSearch);
+  $('#lsClose').addEventListener('click', () => toggleLyricSearch(false));
+  $('#lsQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLyricSearch(); });
   $('#recBtn').addEventListener('click', () => (state.recording ? stopRecording() : startRecording()));
   $('#monitor').addEventListener('change', async () => {
     const on = $('#monitor').checked;

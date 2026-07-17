@@ -100,11 +100,22 @@
 
           <div class="lyrics-tools">
             <button id="editLyrics" class="lyr-btn hidden" title="识别不准时可逐行手动修改歌词">✏️ 编辑歌词</button>
+            <button id="searchLyrics" class="lyr-btn hidden" title="从歌词库搜索正确歌词并重新对齐（识别成拼音/英文时用）">🔍 搜歌词重对齐</button>
             <div id="editBar" class="edit-bar hidden">
               <span class="muted small">逐行修改文字，保存后自动重建逐字时间轴</span>
               <button id="saveLyrics" class="lyr-btn primary">保存</button>
               <button id="cancelLyrics" class="lyr-btn">取消</button>
             </div>
+          </div>
+
+          <div id="lyricSearch" class="lyric-search hidden">
+            <div class="ls-bar">
+              <input id="lsQuery" type="text" placeholder="歌手 歌名，如：大壮 敬自己" autocomplete="off" />
+              <button id="lsGo" class="lyr-btn primary">搜索</button>
+              <button id="lsClose" class="lyr-btn">关闭</button>
+            </div>
+            <p id="lsHint" class="muted small">从 LRCLIB 歌词库搜索正确歌词，选一条即可重新对齐到人声（识别成拼音/英文时特别有用）。</p>
+            <ul id="lsResults" class="ls-results"></ul>
           </div>
 
           <div id="lyrics" class="lyrics"></div>
