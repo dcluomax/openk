@@ -69,6 +69,7 @@ const state = {
   editing: false,    // 歌词编辑态
   lyricsUrl: null,   // 当前歌词 json 地址（保存后重新拉取）
   currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
+  libMode: 'recent', // 点歌台视图：recent 最近 / artist 按歌手
   audioGraph: null,  // Web Audio 图（混响/录制）
   recorder: null,
   recording: false,
@@ -106,14 +107,61 @@ async function refreshList(force = false) {
   renderJobs(force);
 }
 
+const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
+
+function jobMatches(j, kw) {
+  if (!kw) return true;
+  return [j.track, j.artist, j.title, j.url].filter(Boolean).join(' ').toLowerCase().includes(kw);
+}
+
+function makeJobItem(j) {
+  const li = document.createElement('li');
+  li.className = 'job-item' + (j.id === state.currentJobId ? ' active' : '');
+  const recBadge = (j.recordings && j.recordings.length)
+    ? `<span class="rec-badge" title="已录唱">🎤${j.recordings.length}</span>` : '';
+  const retryBtn = j.state === 'error'
+    ? '<button class="retry" title="重试；若自动检测语言有误，先在上方选好语言再点此">↻</button>' : '';
+  const primary = j.track || j.title || j.url || '未命名';
+  const sub = j.state === 'done'
+    ? (j.artist || '')
+    : `${STATE_TEXT[j.state] || j.state} · ${j.progress || 0}%`;
+  li.innerHTML = `
+    <span class="dot ${j.state}"></span>
+    <div class="jt">
+      <div class="name">${escapeHtml(primary)}</div>
+      <div class="st">${escapeHtml(sub) || (STATE_TEXT[j.state] || '')}</div>
+    </div>
+    ${recBadge}${retryBtn}
+    <button class="del" title="删除">✕</button>`;
+  li.querySelector('.jt').addEventListener('click', () => selectJob(j.id));
+  li.querySelector('.dot').addEventListener('click', () => selectJob(j.id));
+  const retryEl = li.querySelector('.retry');
+  if (retryEl) {
+    retryEl.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      try {
+        await api.retryJob(j.id, { language: $('#language').value || null });
+        selectJob(j.id); refreshList(true);
+      } catch (e) { alert(e.message || '重试失败'); }
+    });
+  }
+  li.querySelector('.del').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    if (!confirm('删除该任务及其文件（包括录音）？')) return;
+    await api.deleteJob(j.id);
+    if (state.currentJobId === j.id) resetStage();
+    refreshList(true);
+  });
+  return li;
+}
+
 function renderJobs(force = false) {
   const kw = state.search.trim().toLowerCase();
-  const jobs = kw
-    ? state.allJobs.filter((j) => (j.title || j.url || '').toLowerCase().includes(kw))
-    : state.allJobs;
+  const jobs = state.allJobs.filter((j) => jobMatches(j, kw));
 
   // 仅在数据真正变化时才重绘，避免定时刷新造成闪烁或打断点击。
-  const sig = JSON.stringify([kw, jobs.map((j) => [j.id, j.state, j.progress, j.title, j.id === state.currentJobId])]);
+  const sig = JSON.stringify([kw, state.libMode,
+    jobs.map((j) => [j.id, j.state, j.progress, j.track, j.artist, j.title, j.recordings?.length || 0, j.id === state.currentJobId])]);
   if (!force && sig === _listSig) return;
   _listSig = sig;
 
@@ -128,44 +176,24 @@ function renderJobs(force = false) {
     empty.classList.add('hidden');
   }
 
-  const stateText = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
-  for (const j of jobs) {
-    const li = document.createElement('li');
-    li.className = 'job-item' + (j.id === state.currentJobId ? ' active' : '');
-    const recBadge = (j.recordings && j.recordings.length)
-      ? `<span class="rec-badge" title="已录唱">🎤${j.recordings.length}</span>` : '';
-    const retryBtn = j.state === 'error'
-      ? '<button class="retry" title="重试；若自动检测语言有误，先在上方选好语言再点此">↻</button>' : '';
-    li.innerHTML = `
-      <span class="dot ${j.state}"></span>
-      <div class="jt">
-        <div class="name">${escapeHtml(j.title || j.url)}</div>
-        <div class="st">${stateText[j.state] || j.state} · ${j.progress || 0}%</div>
-      </div>
-      ${recBadge}
-      ${retryBtn}
-      <button class="del" title="删除">✕</button>`;
-    li.querySelector('.jt').addEventListener('click', () => selectJob(j.id));
-    li.querySelector('.dot').addEventListener('click', () => selectJob(j.id));
-    const retryEl = li.querySelector('.retry');
-    if (retryEl) {
-      retryEl.addEventListener('click', async (ev) => {
-        ev.stopPropagation();
-        try {
-          await api.retryJob(j.id, { language: $('#language').value || null });
-          selectJob(j.id); refreshList(true);
-        }
-        catch (e) { alert(e.message || '重试失败'); }
-      });
+  if (state.libMode === 'artist') {
+    // 按歌手分组（点歌台式浏览）
+    const groups = new Map();
+    for (const j of jobs) {
+      const key = (j.artist || '').trim() || '未知歌手';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(j);
     }
-    li.querySelector('.del').addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      if (!confirm('删除该任务及其文件（包括录音）？')) return;
-      await api.deleteJob(j.id);
-      if (state.currentJobId === j.id) resetStage();
-      refreshList(true);
-    });
-    ul.appendChild(li);
+    const names = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    for (const name of names) {
+      const head = document.createElement('li');
+      head.className = 'artist-group';
+      head.innerHTML = `<span class="ag-name">${escapeHtml(name)}</span><span class="ag-count">${groups.get(name).length} 首</span>`;
+      ul.appendChild(head);
+      for (const j of groups.get(name)) ul.appendChild(makeJobItem(j));
+    }
+  } else {
+    for (const j of jobs) ul.appendChild(makeJobItem(j));
   }
 }
 
@@ -852,6 +880,13 @@ function init() {
   $('#go').addEventListener('click', onCreate);
   $('#url').addEventListener('keydown', (e) => { if (e.key === 'Enter') onCreate(); });
   $('#search').addEventListener('input', (e) => { state.search = e.target.value; renderJobs(true); });
+  document.querySelectorAll('.lib-mode').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.libMode = btn.dataset.mode;
+      document.querySelectorAll('.lib-mode').forEach((b) => b.classList.toggle('active', b === btn));
+      renderJobs(true);
+    });
+  });
   bindPlayer();
   refreshList();
   // 后台自适应刷新列表：有运行中任务时 3s，全部空闲时放慢到 15s；
