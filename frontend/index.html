@@ -52,10 +52,16 @@
     </section>
 
     <div class="layout">
-      <!-- 任务列表 -->
+      <!-- 点歌台 -->
       <aside class="card jobs">
-        <h2>我的曲库</h2>
-        <input id="search" class="search-box" type="text" placeholder="🔍 搜索已处理的歌曲…" autocomplete="off" />
+        <div class="jobs-head">
+          <h2>🎤 点歌台</h2>
+          <div class="lib-modes">
+            <button class="lib-mode active" data-mode="recent">最近</button>
+            <button class="lib-mode" data-mode="artist">按歌手</button>
+          </div>
+        </div>
+        <input id="search" class="search-box" type="text" placeholder="🔍 搜歌名 / 歌手…" autocomplete="off" />
         <ul id="jobList" class="job-list"></ul>
         <p id="jobsEmpty" class="empty">还没有任务，粘贴链接开始吧。</p>
       </aside>

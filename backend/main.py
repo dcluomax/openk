@@ -91,6 +91,24 @@ def _public_job(job: dict) -> dict:
     job["recordings"] = [
         {**r, "url": f"/media/{jid}/recordings/{r['file']}"} for r in recs if r.get("file")
     ]
+    # 解析歌手 / 歌名（点歌台式分组与显示用）：
+    # 优先用 LRCLIB 匹配到的「歌手 - 歌名」（最干净），否则从标题猜。
+    artist, track = job.get("artist"), job.get("track")
+    src = job.get("lyrics_source") or ""
+    if not track and src.startswith("LRCLIB"):
+        parts = [p.strip() for p in src.split("·")]
+        if len(parts) >= 2 and " - " in parts[1]:
+            a, t = parts[1].split(" - ", 1)
+            artist, track = (a.strip() or None), (t.strip() or None)
+    if not track:
+        try:
+            from .steps.lyrics_sources import guess_meta
+            meta = guess_meta({"title": job.get("title") or ""})
+            artist = artist or meta.get("artist")
+            track = track or meta.get("track")
+        except Exception:
+            pass
+    job["artist"], job["track"] = artist, track
     return job
 
 

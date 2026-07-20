@@ -124,8 +124,17 @@ select {
   .layout { grid-template-columns: 1fr; }
 }
 
-/* 曲库 */
-.jobs h2 { margin: 0 0 14px; font-size: 16px; }
+/* 点歌台 / 曲库 */
+.jobs-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 12px; }
+.jobs-head h2 { margin: 0; font-size: 16px; }
+.lib-modes { display: inline-flex; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.lib-mode { background: none; border: none; color: var(--muted); font-size: 12px; padding: 4px 10px; cursor: pointer; transition: background 0.15s, color 0.15s; }
+.lib-mode.active { background: var(--accent); color: #fff; }
+.artist-group {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 10px 6px 4px 4px; font-size: 12px; font-weight: 600; color: var(--accent-2);
+}
+.artist-group .ag-count { font-weight: 400; color: var(--muted); }
 .job-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .job-item {
   display: flex; align-items: center; gap: 10px;
