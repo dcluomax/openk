@@ -93,7 +93,29 @@ openk/
 
 ---
 
-## 安装
+## 用 Docker 运行（跨平台，最省事）
+
+镜像已发布到 GitHub Container Registry，**内置 ffmpeg / Deno / Python 与全部依赖**，Mac / Windows / Linux 通用，只需装好 [Docker](https://docs.docker.com/get-docker/)：
+
+```bash
+docker run -d --name openk -p 8000:8000 \
+  -v "$PWD/openk-data:/data" \
+  ghcr.io/dcluomax/openk:latest
+```
+
+（Windows PowerShell 把挂载写成 `-v ${PWD}/openk-data:/data`。）打开 <http://localhost:8000> 即可使用；数据、录音与下载的模型都存在挂载的 `openk-data/` 里，重启不丢。
+
+- 更新镜像：`docker pull ghcr.io/dcluomax/openk:latest`，再 `docker rm -f openk` 并重跑上面的命令。
+- 传配置：追加 `-e OPENK_WHISPER_LANGUAGE=zh`、`-e OPENK_SEPARATOR_SEGMENT_SIZE=128` 等环境变量（见下方「配置」表）。
+- ⚠️ 人声分离很吃内存，请在 Docker Desktop 的「Resources」里给容器**至少 6–8GB 内存**。
+- 首次处理某首歌会联网下载模型（分离 / 识别 / 对齐），之后从 `openk-data` 缓存复用。
+- 私有包免登录拉不到时：在仓库 **Packages → openk → Package settings** 把可见性改成 **Public**，或先 `docker login ghcr.io`。
+
+> 镜像由 [GitHub Actions 工作流](.github/workflows/docker-publish.yml)在每次推送 `main` 时自动构建并发布（`linux/amd64` + `linux/arm64` 双架构）。
+
+---
+
+## 从源码安装
 
 需要 **Python 3.10–3.12**、**ffmpeg**，以及 **Deno**（YouTube 提取所需的 JS runtime）。
 
