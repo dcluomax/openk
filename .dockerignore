@@ -1,0 +1,19 @@
+# 构建镜像时排除，保持构建上下文精简
+data/
+.venv/
+venv/
+**/__pycache__/
+*.pyc
+.git/
+.github/
+docs/
+models/
+*.log
+cookies*.txt
+*.cookies
+.env
+.env.*
+nltk_data/
+.DS_Store
+.idea/
+.vscode/
