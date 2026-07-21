@@ -14,10 +14,12 @@ COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 WORKDIR /app
 
 # Python 依赖分层安装（利于缓存）。
+# 少数依赖（如 demucs 的 diffq）无预编译轮子、需现场编译，故临时装 build-essential，装完即卸以缩小镜像。
 # torch 在 x86_64 上走 CPU 专用源，避免拉入巨大的 CUDA 版本；arm64 的 PyPI 轮子本就是 CPU 版。
 ARG TARGETARCH
 COPY requirements.txt requirements-ml.txt ./
-RUN python -m pip install --no-cache-dir -U pip \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+ && python -m pip install --no-cache-dir -U pip \
  && if [ "$TARGETARCH" = "amd64" ]; then \
       pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu ; \
     else \
@@ -25,7 +27,9 @@ RUN python -m pip install --no-cache-dir -U pip \
     fi \
  && pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir -U --pre "yt-dlp[default]" \
- && pip install --no-cache-dir -r requirements-ml.txt
+ && pip install --no-cache-dir -r requirements-ml.txt \
+ && apt-get purge -y --auto-remove build-essential \
+ && rm -rf /var/lib/apt/lists/*
 
 # 应用代码
 COPY backend/ ./backend/
