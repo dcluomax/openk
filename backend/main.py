@@ -48,6 +48,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from .remote.api import router as _worker_router  # noqa: E402
+app.include_router(_worker_router, prefix="/api")
+
 _executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 
 
