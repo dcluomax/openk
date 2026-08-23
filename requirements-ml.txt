@@ -9,3 +9,11 @@
 
 audio-separator[cpu]>=0.24
 whisperx>=3.3.1
+
+# librosa 必须钉在 1.0 以下。
+# yt-dlp 下载下来常常是 .webm/.m4a，libsndfile 本身认不了这些容器，
+# 一直靠 librosa 的 audioread 回退调 ffmpeg 解码。librosa 1.0 移除了该回退，
+# 于是分离阶段直接 LibsndfileError: Format not recognised。
+# audio-separator 只写了 `librosa` 没有上限，新装环境会静默拉到 1.0 并踩中。
+librosa>=0.10,<1.0
+audioread>=3.0

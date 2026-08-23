@@ -151,7 +151,10 @@ def _stage_in(src: str, tmp: Path) -> str:
     if not STAGE_LOCAL:
         return src
     dst = tmp / Path(src).name
-    shutil.copy2(src, dst)
+    # 用 copyfile 而不是 copy2：copy2 会 copystat→chflags，而网络挂载
+    # （SMB/NFS）上取到的 st_flags 往往无法在本地重放，直接 EPERM 报错。
+    # 暂存只关心内容，元数据一概不需要。
+    shutil.copyfile(src, dst)
     return str(dst)
 
 
@@ -161,8 +164,15 @@ def _stage_out(tmp_out: Path, real_out: str) -> None:
     target = Path(real_out)
     target.mkdir(parents=True, exist_ok=True)
     for item in tmp_out.iterdir():
-        if item.is_file():
-            shutil.copy2(item, target / item.name)
+        if not item.is_file():
+            continue
+        # 先写临时名再改名：worker 可能在任何时刻掉线，而任务重排后
+        # pipeline 会用 _stem_ok() 判断分离结果是否可复用。半截文件
+        # 一旦被当成有效结果，损坏会一路带到播放器。改名是原子的。
+        final = target / item.name
+        part = target / (item.name + ".part")
+        shutil.copyfile(item, part)
+        os.replace(part, final)
 
 
 _hinted = False
@@ -224,11 +234,28 @@ def run_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── 主循环 ──
 
+def _preflight() -> None:
+    """启动时把「跑到一半才炸」的问题提前暴露出来。
+
+    ffmpeg 缺失是最典型的一个：audio-separator 要到真正开始分离时才去调用它，
+    届时只会回一句 "Separation produced no output files"，完全看不出根因。
+    托管运行（launchd/systemd）时 PATH 往往比交互 shell 窄得多，这类问题几乎
+    只在后台托管后才出现，更难查。
+    """
+    missing = [b for b in ("ffmpeg", "ffprobe") if shutil.which(b) is None]
+    if missing:
+        log(f"警告：PATH 中找不到 {', '.join(missing)}，分离/转码步骤一定会失败。")
+        log(f"      当前 PATH={os.environ.get('PATH', '')}")
+        log("      托管运行时记得把 ffmpeg 所在目录写进服务配置的 PATH")
+        log("      （macOS Homebrew 通常是 /opt/homebrew/bin）。")
+
+
 def main() -> None:
     log(f"worker={WORKER_ID} server={SERVER} kinds={','.join(KINDS)}")
     if PATH_MAP:
         for src, dst in PATH_MAP:
             log(f"路径映射：{src} → {dst}")
+    _preflight()
     backoff = 2.0
     while True:
         try:
