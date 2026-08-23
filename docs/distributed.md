@@ -258,9 +258,14 @@ sudo systemctl enable --now openk-worker
   <key>Label</key><string>org.openk.worker</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string><string>-lc</string>
-    <string>set -a; . "$HOME/openk/worker.env"; set +a; exec "$HOME/openk/.venv/bin/python" "$HOME/openk/worker/openk_worker.py"</string>
+    <string>/bin/sh</string><string>-c</string>
+    <string>set -a; . "$HOME/openk/worker.env"; set +a; cd "$HOME/openk"; exec "$HOME/openk/.venv/bin/python" worker/openk_worker.py</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/openk-worker.log</string>
@@ -270,11 +275,16 @@ sudo systemctl enable --now openk-worker
 ```
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/org.openk.worker.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openk.worker.plist
 ```
 
-> macOS 的 launchd **不继承登录 shell 的环境变量**，所以上面用 `worker.env` 文件传配置，
-> 并把它 `chmod 600`（里面有口令）。
+> 两个容易踩的点：
+> 1. launchd **不继承登录 shell 的环境变量**，所以用 `worker.env` 文件传配置，
+>    并把它 `chmod 600`（里面有口令）。
+> 2. 上面是 `sh -c` 而**不是** `sh -lc`。加 `-l` 会走登录 shell，触发
+>    `path_helper` 重建 PATH，把 `EnvironmentVariables` 里设的 PATH 直接冲掉，
+>    结果就是 ffmpeg 找不到、分离阶段莫名其妙地失败。
+>    worker 启动时会自检 ffmpeg/ffprobe，缺了会在日志里直接点名。
 
 ## 排查
 
@@ -286,6 +296,8 @@ launchctl load -w ~/Library/LaunchAgents/org.openk.worker.plist
 | worker 报权限不足 | 两端 uid 对不上 | 见下方「共享存储的属主」 |
 | 任务反复重排、`attempts` 递增 | worker 中途死掉，或租约太短 | 看 worker 日志有无 OOM；调大 `OPENK_WORKER_LEASE_SECONDS` |
 | 分离极慢 | 直接在网络存储上做随机读写 | 确认 `OPENK_WORKER_STAGE_LOCAL=true` |
+| 分离报 `Separation produced no output files` | 找不到 ffmpeg，或 librosa 版本过新 | 见 worker 启动自检的日志；确认 `librosa<1.0` |
+| 分离报 `Format not recognised` | librosa ≥1.0 移除了 audioread 回退，读不了 webm/m4a | `pip install "librosa<1.0"` |
 | 服务端启动报缺 torch | 用了精简镜像但没开满三个远程步骤 | 补全 `OPENK_REMOTE_STEPS`，或用完整镜像 |
 
 ### macOS worker：`No route to host`，但手动跑就是通的
