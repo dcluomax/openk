@@ -42,6 +42,25 @@ MAX_SONG_SECONDS = int(os.environ.get("OPENK_MAX_SONG_SECONDS", str(7 * 60)))
 # 分离完成后是否保留原始下载音频。默认删除以节省磁盘（已按视频去重，不会重复分离）。
 KEEP_SOURCE = os.environ.get("OPENK_KEEP_SOURCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+# --- 远程算力（把 ML 步骤派发到别的机器）---
+# 需要卸载到 worker 的步骤，逗号分隔：separate / transcribe / align。
+# 留空＝全部本地执行（默认行为不变）。设成 "separate,transcribe,align" 后，
+# 本机就完全不需要 requirements-ml.txt 里的 torch / onnxruntime 了。
+REMOTE_STEPS = {
+    s.strip() for s in os.environ.get("OPENK_REMOTE_STEPS", "").split(",") if s.strip()
+}
+# worker 与服务端之间的共享口令（Bearer）。留空则不校验，仅建议在可信内网使用。
+WORKER_TOKEN = os.environ.get("OPENK_WORKER_TOKEN", "").strip()
+# 租约时长（秒）：worker 领走任务后必须在此时间内上报进度续租，否则任务被回收重排。
+WORKER_LEASE_SECONDS = int(os.environ.get("OPENK_WORKER_LEASE_SECONDS", "120"))
+# 认定 worker 离线的静默时长（秒），仅用于前端展示与提示文案。
+WORKER_OFFLINE_AFTER = int(os.environ.get("OPENK_WORKER_OFFLINE_AFTER", "90"))
+# 等待 worker 接手的上限（秒）。0 ＝ 无限等待，即 worker 离线时任务排队而不失败。
+REMOTE_WAIT_TIMEOUT = float(os.environ.get("OPENK_REMOTE_WAIT_TIMEOUT", "0"))
+# 等待超时后是否退回本机执行（本机若无 ML 依赖会直接报错，故默认关闭）。
+REMOTE_FALLBACK_LOCAL = os.environ.get(
+    "OPENK_REMOTE_FALLBACK_LOCAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 # --- 服务 ---
 HOST = os.environ.get("OPENK_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENK_PORT", "8000"))

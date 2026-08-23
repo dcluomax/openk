@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .. import config
+from ..remote import client as remote
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -41,7 +42,27 @@ def separate(
     """把音频分离为 vocals（人声）与 instrumental（伴奏）两个声部。
 
     返回 ``{"vocals": <文件名>, "instrumental": <文件名>}``（相对 out_dir）。
+    开启远程时由 worker 机器执行，输出直接落在共享的 out_dir 中。
     """
+    def _local() -> Dict[str, str]:
+        return separate_local(audio_path, out_dir, model, on_progress)
+
+    if remote.enabled("separate"):
+        return remote.run("separate", {
+            "audio_path": str(audio_path),
+            "out_dir": str(out_dir),
+            "model": model,
+        }, on_progress=on_progress, local=_local)
+    return _local()
+
+
+def separate_local(
+    audio_path: str | Path,
+    out_dir: Path,
+    model: str = "",
+    on_progress: ProgressCb = None,
+) -> Dict[str, str]:
+    """在本机执行分离（worker 进程直接调用这个函数）。"""
     # 定位 audio-separator 命令行：优先 PATH；venv 未激活时（如用 .venv/bin/python
     # 直接启动服务）PATH 里没有 venv/bin，退回到与当前 Python 同目录的可执行文件。
     separator_cli = shutil.which("audio-separator")

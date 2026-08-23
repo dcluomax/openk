@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
+from ..remote import client as remote
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -226,8 +227,28 @@ def align_known_lyrics(vocals_path: str | Path, lines: List[Dict[str, Any]],
                        on_progress: ProgressCb = None) -> Dict[str, Any]:
     """用 whisperX 把已知逐行歌词强制对齐到人声，得到逐词时间戳（卡拉OK级精度）。
 
-    对齐失败会抛出异常，交由上层回退到逐行歌词。
+    这是命中歌词库时的主路径，也是唯一会把 torch 载入进程的步骤——远程化后
+    服务端可以完全不装 requirements-ml.txt。对齐失败会抛异常，交由上层回退。
     """
+    def _local() -> Dict[str, Any]:
+        return align_known_lyrics_local(
+            vocals_path, lines, language, out_dir, source, on_progress)
+
+    if remote.enabled("align"):
+        return remote.run("align", {
+            "vocals_path": str(vocals_path),
+            "lines": lines,
+            "language": language,
+            "out_dir": str(out_dir),
+            "source": source,
+        }, on_progress=on_progress, local=_local)
+    return _local()
+
+
+def align_known_lyrics_local(vocals_path: str | Path, lines: List[Dict[str, Any]],
+                             language: str, out_dir: Path, source: str,
+                             on_progress: ProgressCb = None) -> Dict[str, Any]:
+    """在本机执行强制对齐（worker 进程直接调用这个函数）。"""
     import whisperx  # 延迟导入，避免把 torch 载入 Web 进程
 
     _ensure_nltk_punkt()  # 预先确保切句资源就绪，避免对齐时 SSL 下载失败
@@ -271,6 +292,27 @@ def transcribe(
 
     返回 ``{"lyrics_file": "lyrics.json", "language": <代码>, "line_count": N}``。
     """
+    def _local() -> Dict[str, Any]:
+        return transcribe_local(audio_path, out_dir, model, language, on_progress)
+
+    if remote.enabled("transcribe"):
+        return remote.run("transcribe", {
+            "audio_path": str(audio_path),
+            "out_dir": str(out_dir),
+            "model": model,
+            "language": language,
+        }, on_progress=on_progress, local=_local)
+    return _local()
+
+
+def transcribe_local(
+    audio_path: str | Path,
+    out_dir: Path,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    on_progress: ProgressCb = None,
+) -> Dict[str, Any]:
+    """在本机执行识别（worker 进程直接调用这个函数）。"""
     if shutil.which("whisperx") is None:
         raise RuntimeError(
             "未找到 whisperx，请先安装 ML 依赖：\n"
