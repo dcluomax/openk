@@ -69,6 +69,10 @@ YouTube 链接
 - **歌词文本优先取自 LRCLIB / YouTube 字幕**（人工校对过，远比 ASR 识别准确），再用 whisperX 把它**强制对齐**到纯人声得到逐词时间戳。
 - **先分离出纯人声再对齐/识别**，比直接处理混音准确得多。
 
+图中 `audio-separator` 和 `whisperX` 两步吃掉了几乎全部算力，其余环节都很轻。
+所以它们可以**整体挪到另一台机器上跑**（可选，默认不启用）——
+常开的弱机器管 Web 和下载，算力机只在需要时上线干重活，见 [分布式部署](docs/distributed.md)。
+
 ## 目录结构
 
 ```
@@ -78,6 +82,10 @@ openk/
 │   ├── config.py          # 配置（可用环境变量覆盖）
 │   ├── jobs.py            # 任务管理（内存 + status.json 持久化）
 │   ├── pipeline.py        # 下载→分离→对齐 编排
+│   ├── remote/            # 可选：把重活分给远程算力机（见 docs/distributed.md）
+│   │   ├── queue.py          # 任务队列（长轮询派发 + 租约回收）
+│   │   ├── client.py         # 流水线侧入口：走远程还是本地
+│   │   └── api.py            # /api/worker/* 接口
 │   └── steps/
 │       ├── download.py       # yt-dlp（音频 + 字幕 + 元数据）
 │       ├── separate.py       # audio-separator（人声/伴奏分离）
@@ -85,6 +93,7 @@ openk/
 │       ├── lyrics.py         # 歌词来源编排（择优 + 逐词对齐）
 │       └── transcribe.py     # whisperX 强制对齐 / 识别 → lyrics.json / .lrc
 ├── frontend/              # 纯静态卡拉OK播放器 (HTML/CSS/JS)
+├── worker/                # 可选：远程算力 worker（跑在算力机上）
 ├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）
 ├── docs/screenshots/      # 界面截图（README 用）
 ├── requirements.txt       # 轻量依赖（Web + 下载）
@@ -112,6 +121,13 @@ docker run -d --name openk -p 8000:8000 \
 - 私有包免登录拉不到时：在仓库 **Packages → openk → Package settings** 把可见性改成 **Public**，或先 `docker login ghcr.io`。
 
 > 镜像由 [GitHub Actions 工作流](.github/workflows/docker-publish.yml)在每次推送 `main` 时自动构建并发布（`linux/amd64` + `linux/arm64` 双架构）。
+
+> **精简镜像**：把重活都交给远程 worker 时（见 [分布式部署](docs/distributed.md)），
+> 服务端不再需要 torch / onnxruntime，可以自行构建一个不含 ML 依赖的镜像，
+> 体积约从 5GB 降到 760MB：
+> ```bash
+> docker build --build-arg WITH_ML=0 -t openk:slim .
+> ```
 
 ---
 
@@ -178,6 +194,10 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 | `OPENK_PORT` | `8000` | 服务端口 |
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
 
+> 想把人声分离 / 歌词对齐挪到另一台算力更强的机器上跑，见
+> **[分布式部署](docs/distributed.md)**（`OPENK_REMOTE_*` / `OPENK_WORKER_*` 系列变量）。
+> 不配置时行为与单机版完全一致。
+
 ## 歌词方案与常见问题
 
 **歌词来源如何选择？** 处理时自动按 `LRCLIB → YouTube 字幕 → whisperX 识别` 的优先级尝试，
@@ -218,10 +238,21 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 | DELETE | `/api/jobs/{id}/recordings/{file}` | 删除单条录音 |
 | GET | `/media/{id}/...` | 分离音频 / 歌词 / 录音（支持 Range） |
 
+启用[分布式部署](docs/distributed.md)后额外提供（均需 `Authorization: Bearer <OPENK_WORKER_TOKEN>`）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/worker/claim` | worker 长轮询领取任务；无任务返回 `204` |
+| POST | `/api/worker/tasks/{id}/progress` | 上报进度，同时续租 |
+| POST | `/api/worker/tasks/{id}/finish` | 提交结果或错误 |
+| GET | `/api/worker/status` | 队列与 worker 在线情况（排查用） |
+
 ## 性能与内存
 
 - ⚠️ **内存要求**：人声分离很吃内存，**建议 16GB 及以上**。8GB 机器（如 M1 Air）分离整首歌会很慢，
   甚至因内存不足导致模型卡死。请先**关闭浏览器等占内存的程序**再处理。
+  机器实在带不动、但手头有另一台算力更强的机器时，可以把分离和对齐**整个挪过去**跑，
+  见 [分布式部署](docs/distributed.md)。
 - **默认模型** `UVR-MDX-NET-Inst_HQ_3.onnx`（MDX-Net，走 onnxruntime/CoreML）比 BS-Roformer 更省内存、更稳；
   内存充足（16GB+）追求最高质量可设 `OPENK_SEPARATOR_MODEL=""` 用 Roformer。
 - **卡住 / 内存不足的对策**：关闭其他大程序；减小段大小 `export OPENK_SEPARATOR_SEGMENT_SIZE=128`；

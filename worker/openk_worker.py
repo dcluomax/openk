@@ -10,9 +10,10 @@
     出站长连接则稳定得多。
 
 用法：
-    export OPENK_SERVER=http://192.168.0.62:8100
-    export OPENK_WORKER_TOKEN=...
-    export OPENK_WORKER_PATH_MAP=/mnt/MainPool/Media=/Volumes/Media
+    export OPENK_SERVER=http://<服务端地址>:8000
+    export OPENK_WORKER_TOKEN=<与服务端一致的密钥>
+    # 若两端看到的共享存储挂载点不同，用 PATH_MAP 做转换（可留空）
+    export OPENK_WORKER_PATH_MAP=<服务端路径>=<本机路径>
     python3 worker/openk_worker.py
 """
 from __future__ import annotations
@@ -164,6 +165,26 @@ def _stage_out(tmp_out: Path, real_out: str) -> None:
             shutil.copy2(item, target / item.name)
 
 
+_hinted = False
+
+
+def _hint_local_network(exc: Exception) -> None:
+    """macOS 上的「本地网络」授权被拒时，报错是 EHOSTUNREACH，极具误导性。
+
+    表现是：同一台机器上手动跑能通，交给 launchd 托管就一直 No route to host。
+    这里给一次明确提示，免得照着「网络不通」的方向白查半天。
+    """
+    global _hinted
+    if _hinted or sys.platform != "darwin":
+        return
+    if "No route to host" not in str(exc) and "Errno 65" not in str(exc):
+        return
+    _hinted = True
+    log("提示：macOS 可能拦截了本进程的「本地网络」访问（表现为 No route to host）。")
+    log("      到 系统设置 ▸ 隐私与安全性 ▸ 本地网络，打开对应 Python 的开关；")
+    log("      若列表中没有，先在终端手动跑一次本脚本触发授权登记。")
+
+
 def run_task(task: Dict[str, Any]) -> Dict[str, Any]:
     from backend.steps import separate as sep_step, transcribe as tr_step
 
@@ -226,6 +247,7 @@ def main() -> None:
             continue
         except Exception as exc:  # noqa: BLE001 - 服务端离线属于正常状态
             log(f"连不上服务端（{exc}）；{backoff:.0f}s 后重试")
+            _hint_local_network(exc)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue

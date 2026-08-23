@@ -14,20 +14,26 @@ COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 WORKDIR /app
 
 # Python 依赖分层安装（利于缓存）。
+# WITH_ML=0 构建出「只跑 Web + 下载」的精简镜像：把人声分离与歌词对齐交给
+# 远程 worker（见 OPENK_REMOTE_STEPS）时，服务端完全不需要 torch/onnxruntime，
+# 镜像体积和构建时间都能降一个数量级。
 # 少数依赖（如 demucs 的 diffq）无预编译轮子、需现场编译，故临时装 build-essential，装完即卸以缩小镜像。
 # torch 在 x86_64 上走 CPU 专用源，避免拉入巨大的 CUDA 版本；arm64 的 PyPI 轮子本就是 CPU 版。
 ARG TARGETARCH
+ARG WITH_ML=1
 COPY requirements.txt requirements-ml.txt ./
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
  && python -m pip install --no-cache-dir -U pip \
- && if [ "$TARGETARCH" = "amd64" ]; then \
-      pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu ; \
-    else \
-      pip install --no-cache-dir torch torchaudio ; \
-    fi \
  && pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir -U --pre "yt-dlp[default]" \
- && pip install --no-cache-dir -r requirements-ml.txt \
+ && if [ "$WITH_ML" != "0" ]; then \
+      if [ "$TARGETARCH" = "amd64" ]; then \
+        pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu ; \
+      else \
+        pip install --no-cache-dir torch torchaudio ; \
+      fi \
+   && pip install --no-cache-dir -r requirements-ml.txt ; \
+    fi \
  && apt-get purge -y --auto-remove build-essential \
  && rm -rf /var/lib/apt/lists/*
 
@@ -35,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 COPY scripts/ ./scripts/
+COPY worker/ ./worker/
 COPY run.sh README.md ./
 
 # 容器内监听 0.0.0.0；数据与模型缓存统一放到 /data（挂载卷即可持久化，避免每次重下模型）

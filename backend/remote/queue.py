@@ -130,7 +130,7 @@ class TaskQueue:
         """
         deadline = time.monotonic() + max(0.0, wait_seconds)
         with self._cond:
-            self._touch_worker(worker_id)
+            self._touch_worker(worker_id, kinds)
             while True:
                 task = self._next_pending(kinds)
                 if task is not None:
@@ -144,7 +144,7 @@ class TaskQueue:
                 if remaining <= 0:
                     return None
                 self._cond.wait(remaining)
-                self._touch_worker(worker_id)
+                self._touch_worker(worker_id, kinds)
 
     def progress(self, task_id: str, worker_id: str,
                  percent: int, message: str) -> bool:
@@ -236,9 +236,12 @@ class TaskQueue:
         except ValueError:
             pass
 
-    def _touch_worker(self, worker_id: str) -> None:
+    def _touch_worker(self, worker_id: str,
+                      kinds: Optional[List[str]] = None) -> None:
         info = self._workers.setdefault(worker_id, {})
         info["last_seen"] = time.time()
+        if kinds:
+            info["kinds"] = list(kinds)
 
     def _ensure_reaper(self) -> None:
         if self._reaper is not None and self._reaper.is_alive():
