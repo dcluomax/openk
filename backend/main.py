@@ -377,7 +377,16 @@ if config.FRONTEND_DIR.exists():
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(app, host=config.HOST, port=config.PORT)
+    kwargs = {"host": config.HOST, "port": config.PORT}
+    if config.SSL_CERTFILE and config.SSL_KEYFILE:
+        kwargs["ssl_certfile"] = config.SSL_CERTFILE
+        kwargs["ssl_keyfile"] = config.SSL_KEYFILE
+        print(f"[openk] HTTPS 已启用 → https://{config.HOST}:{config.PORT}")
+    elif config.HOST not in ("127.0.0.1", "localhost", "::1"):
+        # 别等用户点了「开始录唱」才发现录不了。
+        print("[openk] 提示：当前是 HTTP，浏览器只在 https 或 localhost 下允许使用麦克风。")
+        print("[openk]       从其他设备访问时录音会被浏览器拦截；生成证书见 scripts/make_cert.py。")
+    uvicorn.run(app, **kwargs)
 
 
 if __name__ == "__main__":

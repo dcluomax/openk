@@ -299,6 +299,19 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openk.worker.plist
 | 分离报 `Separation produced no output files` | 找不到 ffmpeg，或 librosa 版本过新 | 见 worker 启动自检的日志；确认 `librosa<1.0` |
 | 分离报 `Format not recognised` | librosa ≥1.0 移除了 audioread 回退，读不了 webm/m4a | `pip install "librosa<1.0"` |
 | 服务端启动报缺 torch | 用了精简镜像但没开满三个远程步骤 | 补全 `OPENK_REMOTE_STEPS`，或用完整镜像 |
+| 浏览器提示「当前浏览器不支持麦克风」 | 用 `http://` + 局域网 IP 访问，不是安全上下文 | 启用 HTTPS，见下方 |
+
+### 加了 HTTPS 之后 worker 怎么连
+
+给浏览器上 TLS 有两种做法，对 worker 的影响不一样：
+
+- **反向代理终结 TLS（推荐）**：nginx / Caddy 监听 443，转发到 openk 的 HTTP 端口。
+  浏览器走 HTTPS，worker 继续用 `OPENK_SERVER=http://<内网IP>:<HTTP端口>` 直连，
+  两边互不干扰，worker 不需要处理自签证书。注意把 `client_max_body_size` 调大，
+  并对媒体流关掉 `proxy_buffering`（Range 请求被缓冲会导致播放卡顿）。
+- **openk 自己开 TLS**（`OPENK_SSL_CERTFILE` / `OPENK_SSL_KEYFILE`）：此时只有 HTTPS 一个入口，
+  `OPENK_SERVER` 也得改成 `https://…`。自签证书 Python 默认不信任，
+  需要给 worker 进程设 `SSL_CERT_FILE=/path/to/openk.crt` 指向同一份证书。
 
 ### macOS worker：`No route to host`，但手动跑就是通的
 

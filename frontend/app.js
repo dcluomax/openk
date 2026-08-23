@@ -662,13 +662,31 @@ function pickRecorderOptions() {
   return {};
 }
 
+// 麦克风不可用时给出**准确**的原因。
+// 浏览器只在安全上下文（https 或 localhost）下暴露 navigator.mediaDevices，
+// 所以从局域网 IP 走 http 访问时它直接是 undefined——这跟「浏览器不支持」
+// 完全是两回事，照着后者去查只会白费功夫。
+function micUnavailableReason() {
+  if (window.isSecureContext === false || (!window.isSecureContext && location.protocol === 'http:'
+      && !['localhost', '127.0.0.1', '::1'].includes(location.hostname))) {
+    return '浏览器出于隐私保护，只允许 https 或 localhost 页面使用麦克风。\n\n'
+         + '当前地址是 ' + location.origin + '（不安全来源），因此麦克风被屏蔽。\n\n'
+         + '解决办法：\n'
+         + '· 给 openk 配上 HTTPS（python -m scripts.make_cert 生成自签证书）\n'
+         + '· 或在本机用 http://localhost:' + (location.port || '8000') + ' 访问';
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return '当前浏览器不支持麦克风录制（缺少 getUserMedia）。';
+  }
+  return '';
+}
+
 // 建立麦克风支路（监听/录音共用，仅建一次）。需在用户手势内调用以取得授权。
 async function ensureMic() {
   const g = ensureAudioGraph();
   if (g.mic) return g;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    alert('当前浏览器不支持麦克风'); throw new Error('no mic');
-  }
+  const why = micUnavailableReason();
+  if (why) { alert(why); throw new Error('no mic'); }
   if (g.actx.state === 'suspended') await g.actx.resume();
   let stream;
   try {
@@ -713,7 +731,9 @@ function maybeReleaseMic() {
 
 async function startRecording() {
   if (!inst.getAttribute('src')) { alert('请先选择一首歌'); return; }
-  if (!navigator.mediaDevices || !window.MediaRecorder) { alert('当前浏览器不支持录音'); return; }
+  const why = micUnavailableReason();
+  if (why) { alert(why); return; }
+  if (!window.MediaRecorder) { alert('当前浏览器不支持录音（缺少 MediaRecorder）。'); return; }
   const g = ensureAudioGraph();
   try { await ensureMic(); } catch { return; }
 
