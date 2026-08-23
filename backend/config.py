@@ -30,6 +30,22 @@ WHISPER_COMPUTE_TYPE = os.environ.get("OPENK_WHISPER_COMPUTE_TYPE", "int8").stri
 WHISPER_LANGUAGE = os.environ.get("OPENK_WHISPER_LANGUAGE", "").strip()
 WHISPER_BATCH_SIZE = os.environ.get("OPENK_WHISPER_BATCH_SIZE", "4").strip()
 
+# --- 歌词时间轴校正 ---
+# 歌词库（LRCLIB 等）的时间轴对的是录音室单曲，而我们处理的是 YouTube 视频。
+# 官方 MV 常在歌曲前加一段剧情或环境音，两条时间轴就整体错开（有的差好几秒）。
+# whisperX 只在给定窗口内部细化词位置，救不回整体偏移，所以对齐前先估一个平移量。
+LYRICS_OFFSET_AUTO = os.environ.get(
+    "OPENK_LYRICS_OFFSET_AUTO", "true").strip().lower() in {"1", "true", "yes", "on"}
+# 搜索范围（秒）。片头再长也很少超过半分钟，范围开太大反而容易被副歌的重复段带偏。
+LYRICS_OFFSET_MAX = float(os.environ.get("OPENK_LYRICS_OFFSET_MAX", "30"))
+# 死区（秒）：估计值小于它就当作没有偏移，免得给本来就准的歌添乱。
+LYRICS_OFFSET_MIN = float(os.environ.get("OPENK_LYRICS_OFFSET_MIN", "0.5"))
+# 估偏移时，每行按多长的「正在唱」来画掩码（秒）。歌词库给的 end 常常就是下一行起点，
+# 照搬会让整首连成一块、没有句间空档可对齐——而空档恰恰是最有用的信号。1~2.5 秒都稳。
+LYRICS_OFFSET_BLOCK = float(os.environ.get("OPENK_LYRICS_OFFSET_BLOCK", "2.0"))
+# 送进 whisperX 的窗口左右各留出的余量（秒）。留一点余量，词才不会被窗口边缘夹住。
+LYRICS_ALIGN_PAD = float(os.environ.get("OPENK_LYRICS_ALIGN_PAD", "0.35"))
+
 # --- 下载 ---
 # 可选：cookies.txt 路径，用于绕过 YouTube "确认你不是机器人" 校验。
 # 生成方式：yt-dlp --cookies cookies.txt --cookies-from-browser chrome

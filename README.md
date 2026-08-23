@@ -186,6 +186,11 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 | `OPENK_WHISPER_LANGUAGE` | 空（自动） | 强制语言，如 `zh`、`en` |
 | `OPENK_WHISPER_DEVICE` | `cpu` | `cpu` 或 `cuda` |
 | `OPENK_WHISPER_COMPUTE_TYPE` | `int8` | `int8`（CPU）/ `float16`（GPU） |
+| `OPENK_LYRICS_OFFSET_AUTO` | `true` | 对齐前自动校正歌词库与视频之间的整体时间轴偏移 |
+| `OPENK_LYRICS_OFFSET_MAX` | `30` | 偏移搜索范围（秒），单向 |
+| `OPENK_LYRICS_OFFSET_MIN` | `0.5` | 死区（秒）：小于它就当没偏移，避免动到本来就准的歌 |
+| `OPENK_LYRICS_OFFSET_BLOCK` | `2.0` | 估偏移时每行按多长的「正在唱」计（秒），1~2.5 都稳 |
+| `OPENK_LYRICS_ALIGN_PAD` | `0.35` | 送进 whisperX 的窗口左右余量（秒） |
 | `OPENK_SEPARATOR_MODEL` | `UVR-MDX-NET-Inst_HQ_3.onnx` | UVR 模型；省内存较稳。设为空 `""` 用最高质量的 Roformer（需 16GB+） |
 | `OPENK_SEPARATOR_SEGMENT_SIZE` | 空 | 减小可降低峰值内存（如 `128`），内存不足时用 |
 | `OPENK_SEPARATOR_TIMEOUT` | `1200` | 分离超时秒数，超时报错而非无限卡住 |
@@ -246,6 +251,11 @@ python -m backend.main
 - **想要最准的歌词**：LRCLIB 覆盖了海量流行歌，命中时歌词文本最干净；再经 whisperX 逐词对齐即得卡拉OK级同步。
 - **小众/无歌词的歌**：会自动退回 whisperX 对纯人声识别，仍能得到逐词歌词。
 - **识别成拼音、整首英文、或错字太多**：多半是 whisperX 对纯人声轨**语言检测错了**（中文被误判成英文时会把唱词转写成拼音）。两种修法：① 提交前先在顶部**语言下拉选「中文」**；② 已处理的歌用播放器里的 **🔍 搜歌词、重对齐**——从 LRCLIB 搜到正确歌词一键重对齐（有时间轴的做逐字，纯文本的按时长铺开），或用 **✏️ 编辑歌词** 手动改。失败的歌也可先选好语言再点 ↻ 重试。
+- **歌词整体早了/晚了几秒**：歌词库的时间轴对的是**录音室单曲**，而我们处理的是 YouTube 视频。
+  官方 MV 常在歌曲前面加一段剧情、对白或环境音（Ed Sheeran《Shape of You》的 MV 就多了约 5.8 秒），
+  两条时间轴于是整体错开。openk 会在对齐前先估出这个平移量并自动校正，
+  worker 日志里能看到「歌词时间轴整体偏移 +5.90s」这类记录。
+  校正范围和灵敏度可用 `OPENK_LYRICS_OFFSET_*` 调整，设 `OPENK_LYRICS_OFFSET_AUTO=false` 可完全关闭。
 - **歌词只有整行高亮、没有逐字**：whisperX 逐词对齐依赖 NLTK 的 `punkt_tab` 资源，首次运行需联网下载；
   macOS 自带 Python 常因缺根证书报 `SSL: CERTIFICATE_VERIFY_FAILED`，程序已用 certifi 证书自动补齐（`_ensure_nltk_punkt`）。
   若此前已生成为整行歌词的旧任务，可就地升级为逐字（复用已分离人声，无需重下/重分离）：
