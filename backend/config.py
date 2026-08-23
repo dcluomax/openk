@@ -65,6 +65,13 @@ REMOTE_FALLBACK_LOCAL = os.environ.get(
 HOST = os.environ.get("OPENK_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENK_PORT", "8000"))
 
+# HTTPS。浏览器只在「安全上下文」（https 或 localhost）下开放 getUserMedia，
+# 所以一旦不是在本机访问——比如手机连到局域网里的这台服务器——录音功能
+# 必须走 https，否则 navigator.mediaDevices 直接不存在。
+# 用 scripts/make_cert.py 可以生成自签证书。
+SSL_CERTFILE = os.environ.get("OPENK_SSL_CERTFILE", "").strip()
+SSL_KEYFILE = os.environ.get("OPENK_SSL_KEYFILE", "").strip()
+
 # 同时运行的处理任务数（人声分离与转写很吃 CPU，默认串行执行）。
 MAX_WORKERS = int(os.environ.get("OPENK_MAX_WORKERS", "1"))
 
