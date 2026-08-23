@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import socket
@@ -251,6 +252,14 @@ def _preflight() -> None:
 
 
 def main() -> None:
+    # backend 各步骤用的是 logging，worker 自己只有 print。不接上的话，
+    # 像「歌词时间轴整体偏移 +5.8s」这种关键判断会被默默丢掉，出了问题无从查起。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s %(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
     log(f"worker={WORKER_ID} server={SERVER} kinds={','.join(KINDS)}")
     if PATH_MAP:
         for src, dst in PATH_MAP:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
 from ..remote import client as remote
+
+log = logging.getLogger("openk.transcribe")
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -222,6 +225,80 @@ def _ensure_nltk_punkt() -> None:
                 pass
 
 
+def estimate_lyrics_offset(audio, lines: List[Dict[str, Any]],
+                           sample_rate: int = 16000,
+                           max_shift: float = 30.0,
+                           block_seconds: float = 2.0) -> tuple[float, float]:
+    """估计歌词库时间轴与本段音频之间的整体偏移（秒）。
+
+    为什么需要这一步：LRCLIB 之类的歌词库对的是**录音室单曲**的时间轴，而我们
+    处理的是 YouTube 视频。官方 MV 常常在歌曲前面加一段剧情、对白或环境音
+    （Shape of You 的 MV 就多了约 5.8 秒），两条时间轴于是整体错开。
+
+    而 whisperX 的 align() 会把音频按 segment 的 start/end 裁出来
+    （alignment.py 里的 ``audio[:, f1:f2]``）再做强制对齐，词只可能落在窗口
+    内部。也就是说，直接把歌词库的时间戳当窗口传进去，整体偏移在原理上就
+    不可能被修正——输出看着有逐词时间戳，其实整体是错位的。
+
+    做法是把歌词行画成一条 0/1 的「应该有人在唱」曲线，与人声轨的能量包络做
+    互相关，取最佳平移量。人声轨里通常还残留一些伴奏，所以这里不设硬阈值，
+    直接对 z-score 后的包络求相关，避免多一个需要按歌调参的旋钮。
+
+    返回 ``(偏移秒数, 峰值信噪比)``；偏移为正表示歌词应当整体往后挪。
+    """
+    import numpy as np
+
+    step = 0.1                       # 相关分析的时间分辨率
+    hop = int(sample_rate * step)
+    frame = hop * 2
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size < frame or not lines:
+        return 0.0, 0.0
+
+    n = 1 + (samples.size - frame) // hop
+    strided = np.lib.stride_tricks.as_strided(
+        samples, shape=(n, frame),
+        strides=(samples.strides[0] * hop, samples.strides[0]))
+    rms = np.sqrt((strided.astype(np.float32) ** 2).mean(axis=1) + 1e-12)
+    env = 20.0 * np.log10(rms / (rms.max() + 1e-12) + 1e-12)
+    env = (env - env.mean()) / (env.std() + 1e-9)
+
+    starts = np.array([float(l["start"]) for l in lines], dtype=np.float64)
+    # 关键：歌词库给的 end 往往就是下一行的起点（lyrics_sources 会这么补齐），
+    # 直接拿来画掩码，整首歌会连成一整块，没有间隙也就没有可对齐的结构，
+    # 实测偏移会偏掉半秒以上。所以给每行封一个「大致唱多久」的上限，
+    # 让句间空档重新露出来——真正携带对齐信息的正是这些空档。
+    cap = max(0.5, block_seconds)
+    ends_arr: List[float] = []
+    for i, l in enumerate(lines):
+        e = l.get("end")
+        e = float(e) if e is not None else 0.0
+        if e <= starts[i]:
+            e = starts[i] + cap
+        ends_arr.append(min(e, starts[i] + cap))
+    ends = np.maximum(np.array(ends_arr, dtype=np.float64), starts + 0.5)
+
+    shifts = np.arange(-max_shift, max_shift + 1e-9, step)
+    scores = np.empty(shifts.size, dtype=np.float64)
+    for k, sh in enumerate(shifts):
+        mask = np.zeros(n, dtype=np.float32)
+        for a, b in zip(starts + sh, ends + sh):
+            i, j = int(round(a / step)), int(round(b / step))
+            if j > 0 and i < n:
+                mask[max(0, i):min(n, j)] = 1.0
+        total = mask.sum()
+        # 除以 sqrt(覆盖帧数)：否则平移量越大、露出音频的部分越多，分数会被面积带偏
+        scores[k] = float((env * mask).sum()) / np.sqrt(total) if total > 0 else -1e9
+
+    best = int(scores.argmax())
+    snr = float((scores[best] - np.median(scores)) / (scores.std() + 1e-9))
+    zero = int(round(max_shift / step))
+    # 只有确实比「不平移」更贴合才采纳，避免在没有把握时乱挪
+    if scores[best] <= scores[zero]:
+        return 0.0, snr
+    return float(shifts[best]), snr
+
+
 def align_known_lyrics(vocals_path: str | Path, lines: List[Dict[str, Any]],
                        language: str, out_dir: Path, source: str,
                        on_progress: ProgressCb = None) -> Dict[str, Any]:
@@ -257,10 +334,34 @@ def align_known_lyrics_local(vocals_path: str | Path, lines: List[Dict[str, Any]
     if on_progress:
         on_progress(10, "正在加载对齐模型…")
     audio = whisperx.load_audio(str(vocals_path))
+
+    lines = [dict(l) for l in lines]
+    if config.LYRICS_OFFSET_AUTO and len(lines) >= 4:
+        if on_progress:
+            on_progress(25, "正在校正歌词时间轴…")
+        try:
+            offset, snr = estimate_lyrics_offset(
+                audio, lines, max_shift=config.LYRICS_OFFSET_MAX,
+                block_seconds=config.LYRICS_OFFSET_BLOCK)
+        except Exception as e:      # 校正是锦上添花，失败了也要能继续对齐
+            log.warning("歌词时间轴校正失败，按原时间轴对齐：%s", e)
+            offset, snr = 0.0, 0.0
+        if abs(offset) >= config.LYRICS_OFFSET_MIN:
+            log.info("歌词时间轴整体偏移 %+.2fs（信噪比 %.2f），已校正；"
+                     "多半是视频比单曲多了一段片头", offset, snr)
+            for l in lines:
+                l["start"] = float(l["start"]) + offset
+                if l.get("end") is not None:
+                    l["end"] = float(l["end"]) + offset
+        else:
+            log.info("歌词时间轴与音频基本吻合（估计 %+.2fs），不作校正", offset)
+
     model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
 
     segs: List[Dict[str, Any]] = []
     n = len(lines)
+    pad = max(0.0, config.LYRICS_ALIGN_PAD)
+    duration = len(audio) / 16000.0
     for i, ln in enumerate(lines):
         start = float(ln["start"])
         end = ln.get("end")
@@ -269,6 +370,11 @@ def align_known_lyrics_local(vocals_path: str | Path, lines: List[Dict[str, Any]
         end = float(end)
         if end <= start:
             end = start + 0.5
+        # 留余量，但不越过相邻行，免得两行抢同一段音频
+        lo = start - pad if i == 0 else max(start - pad, (float(lines[i - 1]["start"]) + start) / 2)
+        hi = end + pad if i + 1 >= n else min(end + pad, (end + float(lines[i + 1]["start"])) / 2)
+        start = max(0.0, lo)
+        end = min(duration, max(hi, start + 0.5))
         text = str(ln["text"]).strip()
         if text:
             segs.append({"text": text, "start": start, "end": end})
