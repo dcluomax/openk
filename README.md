@@ -192,11 +192,51 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 | `OPENK_KEEP_SOURCE` | `false` | 分离后是否保留原始下载音频；默认删除以节省空间 |
 | `OPENK_COOKIEFILE` | 空 | cookies.txt 路径，用于绕过 YouTube 机器人校验 / 限流 |
 | `OPENK_PORT` | `8000` | 服务端口 |
+| `OPENK_HOST` | `127.0.0.1` | 监听地址；局域网访问填 `0.0.0.0` |
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
+| `OPENK_SSL_CERTFILE` | 空 | HTTPS 证书路径；与下一项同时设置才启用 |
+| `OPENK_SSL_KEYFILE` | 空 | HTTPS 私钥路径 |
+
+> **想用麦克风唱歌，就必须走 HTTPS。** 浏览器只在「安全上下文」下开放
+> `getUserMedia`，`http://<局域网IP>` 不算，所以在别的设备上打开会提示无法录音。
+> 详见下方 [启用 HTTPS](#启用-https)。
 
 > 想把人声分离 / 歌词对齐挪到另一台算力更强的机器上跑，见
 > **[分布式部署](docs/distributed.md)**（`OPENK_REMOTE_*` / `OPENK_WORKER_*` 系列变量）。
 > 不配置时行为与单机版完全一致。
+
+## 启用 HTTPS
+
+麦克风、以及部分浏览器的音频 API，只在**安全上下文**（`https://` 或 `localhost`）下可用。
+自己电脑上访问 `http://127.0.0.1:8000` 不受影响；但从手机 / 平板 / 另一台电脑连过来时，
+必须启用 HTTPS，否则录音功能会被浏览器直接屏蔽。
+
+**1. 生成自签证书**（把地址换成你自己的）：
+
+```bash
+python -m scripts.make_cert 192.168.1.10 myhost.local localhost 127.0.0.1
+```
+
+> 证书的 SAN 里**必须包含你实际访问用的那个 IP**。只写域名的话，
+> 用 IP 访问时即使点了「继续前往」，浏览器仍然不认为是安全上下文，麦克风照样打不开。
+
+**2. 启动时指定证书**：
+
+```bash
+export OPENK_HOST=0.0.0.0
+export OPENK_SSL_CERTFILE=~/.openk/certs/openk.crt
+export OPENK_SSL_KEYFILE=~/.openk/certs/openk.key
+python -m backend.main
+```
+
+浏览器首次打开会警告「不安全」——这是自签证书的正常现象，点高级 → 继续访问即可。
+
+- **iOS / iPadOS**：Safari 需要先信任证书才能录音。把 `openk.crt` 传到设备上安装描述文件，
+  再到 `设置 ▸ 通用 ▸ 关于本机 ▸ 证书信任设置` 里为它打开开关。
+- **已有反向代理**（nginx / Caddy / Traefik）：不用改 openk，让代理终结 TLS 并转发到
+  openk 的 HTTP 端口即可。这样 openk 与内网 worker 之间仍走明文 HTTP，
+  不必给 worker 额外配置证书。记得把 `client_max_body_size` 调大（录音是整段上传），
+  并对媒体流关闭 `proxy_buffering`，否则进度条会卡顿。
 
 ## 歌词方案与常见问题
 

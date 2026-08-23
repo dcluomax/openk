@@ -12,3 +12,7 @@ zhconv>=1.4
 #   brew install deno                           # macOS 的 JS runtime
 # 无 JS runtime 时 YouTube 提取已被官方标为 deprecated，并可能导致 403。详见 README。
 yt-dlp[default]>=2025.1.1
+
+# 只有 scripts/make_cert.py 生成自签 HTTPS 证书时才用得到。
+# 不需要局域网麦克风、或已有反向代理终结 TLS 的话，可以不装。
+cryptography>=42.0
