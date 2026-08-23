@@ -1,0 +1,45 @@
+# openk 的 TLS 反向代理示例（nginx）
+#
+# 什么时候需要它：麦克风只在「安全上下文」下可用，所以从手机或另一台电脑
+# 连过来时必须走 https。让 nginx 终结 TLS、openk 继续跑明文 HTTP，好处是
+# worker 那条内网通道完全不用动，也不必给 worker 配自签证书。
+# （另一种做法是让 openk 自己开 TLS，设 OPENK_SSL_CERTFILE/KEYFILE 即可。）
+#
+# 用法：
+#   cp deploy/nginx-tls.conf.example /etc/nginx/conf.d/openk.conf
+#   然后按注释改掉 listen 端口、证书路径和 proxy_pass 后面的地址。
+#   证书可以用 python -m scripts.make_cert <你的IP> 生成。
+
+server {
+    # 想用标准端口就改成 443。
+    listen 8443 ssl;
+    http2 on;
+    server_name _;
+
+    # 改成你自己的证书路径。自签证书要求 SAN 里带上实际访问用的那个 IP，
+    # 否则浏览器即使点了「继续前往」也不算安全上下文，麦克风照样打不开。
+    ssl_certificate     /certs/openk.crt;
+    ssl_certificate_key /certs/openk.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 录音是整段音频一次性上传，默认的 1M 会直接把它挡掉。
+    client_max_body_size 512m;
+
+    location / {
+        # 改成 openk 实际监听的地址。同一 docker 网络里可以直接用容器名。
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+
+        # 伴奏和人声是边下边播的 Range 请求，开缓冲会让进度条卡顿。
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+    }
+}

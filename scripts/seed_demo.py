@@ -12,12 +12,19 @@ from __future__ import annotations
 import json
 import math
 import struct
+import sys
 import time
 import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEMO_DIR = ROOT / "data" / "jobs" / "demo"
+sys.path.insert(0, str(ROOT))
+
+from backend import config  # noqa: E402
+
+# 跟着 OPENK_JOBS_DIR / OPENK_DATA_DIR 走。写死成 ROOT/data 的话，
+# 一旦把任务目录指到别处（NAS、外接盘），示例曲就落在服务端看不见的地方。
+DEMO_DIR = config.JOBS_DIR / "demo"
 STEMS_DIR = DEMO_DIR / "stems"
 SR = 22050
 DURATION = 18.0

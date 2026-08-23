@@ -153,6 +153,10 @@ worker 一上线，积压的任务立刻开始处理（长轮询让派发延迟�
 | `OPENK_WORKER_STAGE_LOCAL` | `true` | 先把输入拷到本机临时盘再算。网络存储上强烈建议保持开启 |
 | `OPENK_WORKER_POLL_WAIT` | `25` | 长轮询挂起秒数 |
 | `OPENK_WORKER_HEARTBEAT` | `30` | 心跳续租间隔 |
+| `OPENK_MODELS_DIR` | 空 | 模型缓存目录。留空时 audio-separator 会写 `/tmp`，重启可能被清空；模型有好几 GB，建议指到持久盘 |
+
+现成模板：[`deploy/worker.env.example`](../deploy/worker.env.example)、
+[`deploy/openk.env.example`](../deploy/openk.env.example)。
 
 worker 还需要装好 ML 依赖（`requirements.txt` + `requirements-ml.txt`），
 以及 ffmpeg——它才是真正干活的那台。
@@ -374,3 +378,11 @@ python test_lyrics.py
 覆盖歌词时间轴校正：能否找回已知偏移、**时间轴本来就准时不乱动**、
 **歌词库把 end 补成下一行起点时依然估得准**（这是实测踩到的坑）、
 输入异常时安全退化。用合成音频，不需要 torch / whisperX。
+
+```bash
+python test_config.py
+```
+
+覆盖存储路径的可配置性：**不设环境变量时行为与以前完全一致**、
+各目录能否单独指到不同的盘、`OPENK_MODELS_DIR` 是否把三个库的缓存一并带走、
+用户已有的 `HF_HOME` 会不会被覆盖。
