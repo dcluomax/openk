@@ -84,6 +84,20 @@ def test_offline_queues_instead_of_failing() -> None:
           bool(err) and isinstance(err[0], TimeoutError))
 
 
+def test_status_reports_capabilities() -> None:
+    """/worker/status 要能看出每个 worker 能接哪些活，否则线上无从排查。"""
+    q = TaskQueue()
+    q.claim("w-gpu", ["separate", "align"], wait_seconds=0)
+    st = q.status()
+    w = next((x for x in st["workers"] if x["id"] == "w-gpu"), None)
+
+    check("状态里列出了 worker", w is not None)
+    check("上报了该 worker 能接的任务类型",
+          bool(w) and sorted(w["kinds"]) == ["align", "separate"],
+          repr(w and w.get("kinds")))
+    check("空闲时长可读", bool(w) and w["idle_seconds"] >= 0)
+
+
 def test_lease_requeue() -> None:
     """worker 领走任务后掉线，任务必须回到队列而不是永远卡住。"""
     q = TaskQueue(lease_seconds=1)
@@ -104,18 +118,18 @@ def test_lease_requeue() -> None:
 
 
 def test_path_map() -> None:
-    os.environ["OPENK_WORKER_PATH_MAP"] = "/mnt/MainPool/Media=/Volumes/Media"
+    os.environ["OPENK_WORKER_PATH_MAP"] = "/srv/shared=/mnt/nas"
     sys.modules.pop("worker.openk_worker", None)
     from worker import openk_worker as w
     w.PATH_MAP = w._path_map()
 
     check("共享目录被翻译成本机视角",
-          w.localize("/mnt/MainPool/Media/openk/jobs/a/source/x.mp3")
-          == "/Volumes/Media/openk/jobs/a/source/x.mp3")
+          w.localize("/srv/shared/openk/jobs/a/source/x.mp3")
+          == "/mnt/nas/openk/jobs/a/source/x.mp3")
     check("不匹配的路径原样保留",
           w.localize("/tmp/other.mp3") == "/tmp/other.mp3")
     check("只按目录边界匹配，不做子串替换",
-          w.localize("/mnt/MainPool/MediaOther/x") == "/mnt/MainPool/MediaOther/x")
+          w.localize("/srv/shared-other/x") == "/srv/shared-other/x")
 
 
 def test_http_layer() -> None:
@@ -168,7 +182,8 @@ def test_http_layer() -> None:
 
 def main() -> int:
     for fn in (test_roundtrip, test_kind_filter, test_offline_queues_instead_of_failing,
-               test_lease_requeue, test_path_map, test_http_layer):
+               test_status_reports_capabilities, test_lease_requeue,
+               test_path_map, test_http_layer):
         print(f"\n── {fn.__name__} ──")
         try:
             fn()
