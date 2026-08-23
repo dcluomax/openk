@@ -89,6 +89,10 @@ def separate_local(
     ]
     if model:
         cmd += ["--model_filename", model]
+    # 模型放哪。不指定的话 audio-separator 默认写 /tmp，有些系统重启就清空，
+    # 于是每次都要重新下几百 MB 的模型。
+    if config.MODELS_DIR:
+        cmd += ["--model_file_dir", str(Path(config.MODELS_DIR) / "audio-separator")]
     # 低内存机器可通过减小段大小降低峰值内存（对 MDX 模型生效）。
     if config.SEPARATOR_SEGMENT_SIZE:
         cmd += ["--mdx_segment_size", config.SEPARATOR_SEGMENT_SIZE]
