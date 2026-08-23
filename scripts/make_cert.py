@@ -79,7 +79,7 @@ def main() -> int:
     if not san:
         return print("没有可用的主机名/IP") or 1
 
-    out = config.DATA_DIR / "certs"
+    out = config.CERTS_DIR
     out.mkdir(parents=True, exist_ok=True)
     crt, key = out / "openk.crt", out / "openk.key"
 

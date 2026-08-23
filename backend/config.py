@@ -5,10 +5,28 @@ import os
 from pathlib import Path
 
 # --- 目录 ---
+# 除 BASE_DIR 外都可以单独指向别处：把体积大的任务数据放 NAS、模型放本地 SSD，
+# 是分布式部署里很常见的搭配，所以它们不强制挤在同一个 DATA_DIR 下面。
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("OPENK_DATA_DIR", BASE_DIR / "data")).resolve()
-JOBS_DIR = DATA_DIR / "jobs"
-FRONTEND_DIR = BASE_DIR / "frontend"
+# 每首歌的音频、分离结果、歌词和录音都在这里，是占空间的大头。
+JOBS_DIR = Path(os.environ.get("OPENK_JOBS_DIR", DATA_DIR / "jobs")).resolve()
+# HTTPS 自签证书（scripts/make_cert.py 的输出位置）。
+CERTS_DIR = Path(os.environ.get("OPENK_CERTS_DIR", DATA_DIR / "certs")).resolve()
+FRONTEND_DIR = Path(os.environ.get("OPENK_FRONTEND_DIR", BASE_DIR / "frontend")).resolve()
+
+# 分离 / 对齐模型的缓存目录。留空＝各库自己的默认位置。
+# 值得单独配的原因：audio-separator 默认把模型放 /tmp，有些系统重启就清空，
+# 每次都要重新下几百 MB；whisperX 走 HuggingFace 缓存，默认落在 HOME，
+# 容器里 HOME 常常不是持久卷。模型总量能到好几 GB，值得放在你选定的位置。
+MODELS_DIR = os.environ.get("OPENK_MODELS_DIR", "").strip()
+if MODELS_DIR:
+    _models = Path(MODELS_DIR).expanduser().resolve()
+    MODELS_DIR = str(_models)
+    # setdefault：如果用户已经显式设过这些变量，以用户的为准
+    os.environ.setdefault("AUDIO_SEPARATOR_MODEL_DIR", str(_models / "audio-separator"))
+    os.environ.setdefault("HF_HOME", str(_models / "huggingface"))
+    os.environ.setdefault("TORCH_HOME", str(_models / "torch"))
 
 # --- 人声分离 (audio-separator / UVR 模型) ---
 # 默认用 MDX-Net（onnxruntime/CoreML），比 BS-Roformer 更省内存、在低配机器上更稳。

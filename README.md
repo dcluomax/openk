@@ -94,7 +94,8 @@ openk/
 │       └── transcribe.py     # whisperX 强制对齐 / 识别 → lyrics.json / .lrc
 ├── frontend/              # 纯静态卡拉OK播放器 (HTML/CSS/JS)
 ├── worker/                # 可选：远程算力 worker（跑在算力机上）
-├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）
+├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）/ make_cert.py（自签证书）
+├── deploy/                # 部署模板：环境变量示例、nginx TLS 反代示例
 ├── docs/screenshots/      # 界面截图（README 用）
 ├── requirements.txt       # 轻量依赖（Web + 下载）
 └── requirements-ml.txt    # 重量依赖（分离 + 识别）
@@ -180,6 +181,31 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 
 ## 配置（环境变量）
 
+现成的模板在 `deploy/` 下，复制一份改就行（`docker run --env-file`、
+systemd 的 `EnvironmentFile=` 都直接吃这个格式）：
+
+```bash
+cp deploy/openk.env.example  openk.env     # 服务端
+cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
+```
+
+### 存储路径
+
+不设的话都在 `OPENK_DATA_DIR` 下面，也可以各自指到不同的盘。
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `OPENK_DATA_DIR` | `<项目>/data` | 数据总目录 |
+| `OPENK_JOBS_DIR` | `<data>/jobs` | 每首歌的音频、分离结果、歌词、录音；占空间的大头，可单独放 NAS |
+| `OPENK_MODELS_DIR` | 空 | 模型缓存。**留空时 audio-separator 会写 `/tmp`**，有些系统重启就清空，每次都要重下几百 MB；设上之后 audio-separator / HuggingFace / torch 三处缓存一起跟着走 |
+| `OPENK_CERTS_DIR` | `<data>/certs` | HTTPS 自签证书的存放位置 |
+| `OPENK_FRONTEND_DIR` | `<项目>/frontend` | 前端静态文件目录 |
+
+> 若你已经自己设过 `HF_HOME` / `TORCH_HOME` / `AUDIO_SEPARATOR_MODEL_DIR`，
+> openk 不会覆盖它们，以你的设置为准。
+
+### 处理与服务
+
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `OPENK_WHISPER_MODEL` | `small` | 识别模型：`tiny/base/small/medium/large-v3` |
@@ -222,6 +248,8 @@ python scripts/seed_demo.py     # 生成一首合成演示曲
 python -m scripts.make_cert 192.168.1.10 myhost.local localhost 127.0.0.1
 ```
 
+证书写到 `OPENK_CERTS_DIR`（默认 `<data>/certs`）。
+
 > 证书的 SAN 里**必须包含你实际访问用的那个 IP**。只写域名的话，
 > 用 IP 访问时即使点了「继续前往」，浏览器仍然不认为是安全上下文，麦克风照样打不开。
 
@@ -240,8 +268,9 @@ python -m backend.main
   再到 `设置 ▸ 通用 ▸ 关于本机 ▸ 证书信任设置` 里为它打开开关。
 - **已有反向代理**（nginx / Caddy / Traefik）：不用改 openk，让代理终结 TLS 并转发到
   openk 的 HTTP 端口即可。这样 openk 与内网 worker 之间仍走明文 HTTP，
-  不必给 worker 额外配置证书。记得把 `client_max_body_size` 调大（录音是整段上传），
-  并对媒体流关闭 `proxy_buffering`，否则进度条会卡顿。
+  不必给 worker 额外配置证书。现成的 nginx 配置见
+  [`deploy/nginx-tls.conf.example`](deploy/nginx-tls.conf.example)——里面已经处理好了
+  上传体积上限和媒体流缓冲这两个容易踩的点。
 
 ## 歌词方案与常见问题
 
