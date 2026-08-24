@@ -2,6 +2,8 @@
 
 路由:
     POST /api/jobs              创建任务（提交链接，后台处理）
+    POST /api/playlists/preview 读取播放列表清单（不建任务）
+    POST /api/playlists/import  批量导入播放列表
     GET  /api/jobs              任务列表
     GET  /api/jobs/{id}         任务状态
     DELETE /api/jobs/{id}       删除任务及其文件
@@ -22,6 +24,7 @@ from pydantic import BaseModel
 
 from . import config, pipeline
 from .jobs import extract_video_id, manager
+from .steps import playlist as playlist_step
 
 config.ensure_dirs()
 
@@ -69,6 +72,19 @@ class LyricsUpdateRequest(BaseModel):
 class RetryJobRequest(BaseModel):
     language: str | None = None       # 覆盖语言（自动检测认错时手动指定，如 zh）
     whisper_model: str | None = None  # 覆盖识别模型
+
+
+class PlaylistPreviewRequest(BaseModel):
+    url: str
+    limit: int | None = None          # 留空用 OPENK_PLAYLIST_MAX_ITEMS
+
+
+class PlaylistImportRequest(BaseModel):
+    url: str
+    video_ids: list[str] | None = None  # 留空＝导入全部可导入项
+    language: str | None = None
+    whisper_model: str | None = None
+    limit: int | None = None
 
 
 class LyricsAlignRequest(BaseModel):
@@ -137,6 +153,124 @@ def create_job(req: CreateJobRequest) -> JSONResponse:
     )
     _executor.submit(pipeline.run, job["id"])
     return JSONResponse(_public_job(job))
+
+
+def _entry_status(entry: dict) -> tuple[str, str | None]:
+    """判断列表里某一首在本地的状态，决定它默认要不要被勾上。
+
+    返回 ``(status, job_id)``，status 取值：
+    ``new`` 没做过 / ``done`` 曲库里已有 / ``pending`` 正在排队或处理 /
+    ``failed`` 上次失败（可重新导入）/ ``too_long`` 超长 / ``unavailable`` 已失效。
+    """
+    if entry.get("unavailable"):
+        return "unavailable", None
+
+    dur = entry.get("duration") or 0
+    if config.PLAYLIST_SKIP_LONG and config.MAX_SONG_SECONDS and dur > config.MAX_SONG_SECONDS:
+        return "too_long", None
+
+    existing = manager.find_by_video(entry.get("video_id"))
+    if existing:
+        state = existing.get("state")
+        if state == "done":
+            return "done", existing.get("id")
+        if state in {"queued", "running"}:
+            return "pending", existing.get("id")
+        return "failed", existing.get("id")
+    return "new", None
+
+
+# 默认勾选：没做过的，以及上次失败可以重来的。
+_IMPORTABLE = {"new", "failed"}
+
+
+def _preview(url: str, limit: int | None) -> dict:
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="请提供播放列表链接")
+
+    cap = config.PLAYLIST_MAX_ITEMS
+    n = cap if limit is None else max(1, min(int(limit), cap))
+    try:
+        data = playlist_step.fetch_entries(url, limit=n, cookiefile=config.COOKIEFILE)
+    except playlist_step.PlaylistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for entry in data["entries"]:
+        status, job_id = _entry_status(entry)
+        entry["status"] = status
+        entry["job_id"] = job_id
+        entry["importable"] = status in _IMPORTABLE
+    data["limit"] = n
+    data["importable"] = sum(1 for e in data["entries"] if e["importable"])
+    return data
+
+
+@app.post("/api/playlists/preview")
+def preview_playlist(req: PlaylistPreviewRequest) -> dict:
+    """读取播放列表清单，并标出每一首在本地的状态。**不创建任何任务。**
+
+    单独做成一步是为了让用户先看清楚要导入什么：歌单里混着现场版、
+    纯音乐、已经做过的歌很常见，一股脑全导会白白占用几小时算力。
+    """
+    return _preview(req.url, req.limit)
+
+
+@app.post("/api/playlists/import")
+def import_playlist(req: PlaylistImportRequest) -> dict:
+    """批量把播放列表里的歌加入队列。
+
+    ``video_ids`` 留空表示导入全部可导入项（没做过的 + 上次失败的）。
+    已完成的会被跳过而不是重做——同一支视频的分离结果本来就可以复用。
+    """
+    data = _preview(req.url, req.limit)
+    entries = data["entries"]
+
+    if req.video_ids is not None:
+        wanted = {v.strip() for v in req.video_ids if v and v.strip()}
+        entries = [e for e in entries if e["video_id"] in wanted]
+
+    language = (req.language or "").strip() or None
+    whisper_model = (req.whisper_model or "").strip() or None
+
+    created: list[dict] = []
+    skipped: list[dict] = []
+    reason_text = {
+        "done": "曲库里已有",
+        "pending": "已在队列中",
+        "unavailable": "视频已失效",
+        "too_long": "时长超过单曲上限",
+    }
+    for entry in entries:
+        status = entry["status"]
+        if status not in _IMPORTABLE:
+            skipped.append({
+                "video_id": entry["video_id"],
+                "title": entry["title"],
+                "reason": reason_text.get(status, status),
+                "job_id": entry.get("job_id"),
+            })
+            continue
+        job = manager.create(
+            playlist_step.video_url(entry["video_id"]),
+            video_id=entry["video_id"],
+            language=language,
+            whisper_model=whisper_model,
+            # 记下来源，方便日后回看这首歌是从哪个歌单进来的。
+            playlist_id=data["playlist_id"],
+            playlist_title=data["title"],
+        )
+        _executor.submit(pipeline.run, job["id"])
+        created.append(_public_job(job))
+
+    return {
+        "playlist_id": data["playlist_id"],
+        "title": data["title"],
+        "created": created,
+        "skipped": skipped,
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+    }
 
 
 @app.get("/api/jobs")
