@@ -132,6 +132,22 @@ class JobManager:
                     return dict(job)
         return None
 
+    def find_by_video(self, video_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """查找同一视频最近的一个任务，**不限状态**。
+
+        与 :meth:`find_reusable` 的区别：那个只认已完成的任务（用于复用结果），
+        这个把排队中 / 处理中 / 失败的也算上。批量导入需要区分这几种状态，
+        才能既不重复排队、又允许用户重新加回上次失败的那几首。
+        """
+        if not video_id:
+            return None
+        with self._lock:
+            for job in sorted(self._jobs.values(),
+                              key=lambda j: j.get("created_at", 0), reverse=True):
+                if job.get("video_id") == video_id:
+                    return dict(job)
+        return None
+
     # ---- 录音管理 ----
     def recordings_dir(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "recordings"

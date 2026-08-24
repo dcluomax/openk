@@ -310,6 +310,33 @@ select {
 }
 .ls-tag.synced { color: #fff; background: var(--accent); border-color: var(--accent); }
 
+/* --- 播放列表批量导入 --- */
+.pl-panel {
+  margin: 10px 0 0; padding: 12px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--card-2);
+}
+.pl-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pl-spacer { flex: 1; }
+.pl-all { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.pl-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 320px; overflow-y: auto; }
+.pl-list li {
+  display: flex; align-items: center; gap: 10px; padding: 7px 4px;
+  border-top: 1px solid var(--line);
+}
+.pl-list li.off { opacity: .55; }
+.pl-info { flex: 1; min-width: 0; }
+.pl-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl-dur { color: var(--muted); font-size: 12px; white-space: nowrap; }
+/* 状态标签：一眼看出这首为什么被勾上或勾不上 */
+.pl-tag {
+  display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 6px;
+  border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+}
+.pl-tag.new { color: #fff; background: var(--accent); border-color: var(--accent); }
+.pl-tag.done { color: #3fb950; border-color: #3fb950; }
+.pl-tag.failed { color: #d29922; border-color: #d29922; }
+
+
 .controls { display: flex; align-items: center; gap: 12px; margin: 14px 0 10px; }
 button.round {
   width: 48px; height: 48px; border-radius: 50%;

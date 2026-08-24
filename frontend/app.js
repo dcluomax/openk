@@ -47,6 +47,22 @@ const api = {
   },
   async listRecordings(id) { const r = await fetch(`/api/jobs/${id}/recordings`); return r.ok ? r.json() : []; },
   async deleteRecording(id, file) { await fetch(`/api/jobs/${id}/recordings/${encodeURIComponent(file)}`, { method: 'DELETE' }); },
+  async previewPlaylist(payload) {
+    const r = await fetch('/api/playlists/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '读取播放列表失败');
+    return r.json();
+  },
+  async importPlaylist(payload) {
+    const r = await fetch('/api/playlists/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '导入失败');
+    return r.json();
+  },
 };
 
 const fmt = (s) => {
@@ -76,12 +92,23 @@ const state = {
   recTimer: null,
   recStart: 0,
   micStream: null,
+  playlist: null,    // 播放列表预览结果
+  plAsked: false,    // 本次输入是否已问过「要不要批量导入」
 };
 
 /* ---------------- 新建任务 ---------------- */
 async function onCreate() {
   const url = $('#url').value.trim();
   if (!url) { $('#url').focus(); return; }
+  // 从歌单里点开某首歌复制出来的链接会带 list= 参数，用户往往并没意识到。
+  // 直接按单曲处理会漏掉整个歌单，先问一句最省事。
+  if (isPlaylistUrl(url) && !state.plAsked) {
+    state.plAsked = true;
+    if (confirm('这个链接里带着一个播放列表。要批量导入整个歌单吗？\n（点「取消」则只做当前这一首）')) {
+      openPlaylist();
+      return;
+    }
+  }
   const btn = $('#go');
   btn.disabled = true; btn.textContent = '提交中…';
   try {
@@ -97,6 +124,111 @@ async function onCreate() {
     alert(e.message || '提交失败');
   } finally {
     btn.disabled = false; btn.textContent = '开始制作';
+  }
+}
+
+/* ---------------- 播放列表批量导入 ---------------- */
+const PL_STATUS = {
+  new: ['可导入', 'new'],
+  failed: ['上次失败·可重来', 'failed'],
+  done: ['曲库已有', 'done'],
+  pending: ['队列中', ''],
+  too_long: ['超长·跳过', ''],
+  unavailable: ['已失效', ''],
+};
+
+function isPlaylistUrl(url) {
+  const m = /[?&]list=([0-9A-Za-z_-]+)/.exec(url || '');
+  // RD/UL/LL/WL 开头的是 YouTube 自动生成的电台或稍后观看，摊平没有意义。
+  return !!m && !/^(RD|UL|LL|WL)/.test(m[1]);
+}
+
+async function openPlaylist() {
+  const url = $('#url').value.trim();
+  if (!url) { $('#url').focus(); return; }
+  const btn = $('#plGo');
+  btn.disabled = true; btn.textContent = '读取中…';
+  $('#plPanel').classList.remove('hidden');
+  $('#plList').innerHTML = '';
+  $('#plTitle').textContent = '正在读取播放列表…';
+  $('#plCount').textContent = '';
+  $('#plHint').textContent = '';
+  try {
+    const data = await api.previewPlaylist({ url });
+    state.playlist = data;
+    renderPlaylist(data);
+  } catch (e) {
+    $('#plTitle').textContent = '读取失败';
+    $('#plHint').textContent = e.message || '读取播放列表失败';
+  } finally {
+    btn.disabled = false; btn.textContent = '🎵 导入歌单';
+  }
+}
+
+function renderPlaylist(data) {
+  $('#plTitle').textContent = data.title || '播放列表';
+  $('#plCount').textContent = `共 ${data.total} 首 · ${data.importable} 首可导入`;
+  const notes = [];
+  if (data.truncated) notes.push(`歌单更长，这里只列出前 ${data.limit} 首（可调 OPENK_PLAYLIST_MAX_ITEMS）`);
+  if (data.importable === 0) notes.push('没有需要新建的歌曲——这个歌单已经全部处理过了。');
+  else notes.push('默认勾选了还没做过的歌；取消勾选可以跳过。');
+  $('#plHint').textContent = notes.join(' ');
+
+  const ul = $('#plList');
+  ul.innerHTML = '';
+  data.entries.forEach((e) => {
+    const [text, cls] = PL_STATUS[e.status] || [e.status, ''];
+    const li = document.createElement('li');
+    if (!e.importable) li.classList.add('off');
+    li.innerHTML = `
+      <input type="checkbox" class="pl-pick" data-id="${e.video_id}"
+             ${e.importable ? 'checked' : ''} ${e.importable ? '' : 'disabled'} />
+      <div class="pl-info"><div class="pl-name"></div></div>
+      <span class="pl-dur"></span>
+      <span class="pl-tag ${cls}">${text}</span>`;
+    // 标题来自外部数据，用 textContent 赋值以免被当成 HTML 解析。
+    li.querySelector('.pl-name').textContent = e.title;
+    li.querySelector('.pl-dur').textContent = e.duration ? fmt(e.duration) : '';
+    ul.appendChild(li);
+  });
+  syncPlAll();
+}
+
+function pickedIds() {
+  return Array.from(document.querySelectorAll('.pl-pick:checked')).map((c) => c.dataset.id);
+}
+
+function syncPlAll() {
+  const boxes = Array.from(document.querySelectorAll('.pl-pick:not(:disabled)'));
+  const all = $('#plAll');
+  all.disabled = boxes.length === 0;
+  all.checked = boxes.length > 0 && boxes.every((b) => b.checked);
+}
+
+async function onPlaylistImport() {
+  const data = state.playlist;
+  if (!data) return;
+  const ids = pickedIds();
+  if (!ids.length) { alert('没有勾选任何歌曲'); return; }
+  const btn = $('#plImport');
+  btn.disabled = true; btn.textContent = '导入中…';
+  try {
+    const res = await api.importPlaylist({
+      url: `https://www.youtube.com/playlist?list=${data.playlist_id}`,
+      video_ids: ids,
+      language: $('#language').value || null,
+      whisper_model: $('#model').value || null,
+    });
+    $('#plPanel').classList.add('hidden');
+    $('#url').value = '';
+    state.plAsked = false;
+    await refreshList(true);
+    const skipped = res.skipped_count ? `，跳过 ${res.skipped_count} 首` : '';
+    alert(`已加入队列 ${res.created_count} 首${skipped}。\n分离与识别很吃算力，会按顺序逐首处理。`);
+  } catch (e) {
+    alert(e.message || '导入失败');
+  } finally {
+    btn.disabled = false; btn.textContent = '导入选中';
   }
 }
 
@@ -899,6 +1031,18 @@ function bindPlayer() {
 function init() {
   $('#go').addEventListener('click', onCreate);
   $('#url').addEventListener('keydown', (e) => { if (e.key === 'Enter') onCreate(); });
+  // 换了链接就重新问一次「要不要批量导入」
+  $('#url').addEventListener('input', () => { state.plAsked = false; });
+  $('#plGo').addEventListener('click', openPlaylist);
+  $('#plClose').addEventListener('click', () => $('#plPanel').classList.add('hidden'));
+  $('#plImport').addEventListener('click', onPlaylistImport);
+  $('#plAll').addEventListener('change', (e) => {
+    document.querySelectorAll('.pl-pick:not(:disabled)')
+      .forEach((c) => { c.checked = e.target.checked; });
+  });
+  $('#plList').addEventListener('change', (e) => {
+    if (e.target.classList.contains('pl-pick')) syncPlAll();
+  });
   $('#search').addEventListener('input', (e) => { state.search = e.target.value; renderJobs(true); });
   document.querySelectorAll('.lib-mode').forEach((btn) => {
     btn.addEventListener('click', () => {

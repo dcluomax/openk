@@ -88,6 +88,7 @@ openk/
 │   │   └── api.py            # /api/worker/* 接口
 │   └── steps/
 │       ├── download.py       # yt-dlp（音频 + 字幕 + 元数据）
+│       ├── playlist.py       # 播放列表摊平（只读清单，不下载）
 │       ├── separate.py       # audio-separator（人声/伴奏分离）
 │       ├── lyrics_sources.py # LRCLIB 查询 + VTT/SRT/LRC 解析 + 元数据清洗
 │       ├── lyrics.py         # 歌词来源编排（择优 + 逐词对齐）
@@ -168,6 +169,27 @@ python -m backend.main
 
 浏览器打开 <http://127.0.0.1:8000> ，粘贴视频链接，点击「开始制作」。
 
+### 批量导入播放列表
+
+粘贴歌单链接后点「🎵 导入歌单」，会先列出整个列表让你挑，确认后一次性排队：
+
+- **不会白干**：曲库里已有的、正在排队的、已失效的、以及超过
+  `OPENK_MAX_SONG_SECONDS` 的长视频，都在**下载之前**就标出来并默认不勾选；
+  上次失败的会标成「可重来」，方便只补做失败的那几首。
+- **重复点也安全**：同一个歌单导入两次，第二次一首都不会重复排队。
+- **一次上限** 由 `OPENK_PLAYLIST_MAX_ITEMS` 控制（默认 100）；歌单更长时会如实提示被截断。
+- 从歌单里点开某首歌复制的链接会带 `list=` 参数，直接点「开始制作」时页面会问一句
+  要不要整个歌单导入，避免只做了一首。
+
+> 只支持你自己能打开的普通歌单。YouTube 自动生成的电台 / 稍后观看（`RD`、`WL` 开头）
+> 内容因账号而异，会被拒绝。私有歌单需要配 `OPENK_COOKIEFILE`。
+>
+> 歌单链接的 list ID 有 30 多个字符，**很容易在聊天软件里被换行截断**——
+> 截断后 YouTube 的报错和「歌单不存在」一模一样，所以请从浏览器地址栏完整复制。
+
+分离和识别都是按分钟计的重活，默认 `OPENK_MAX_WORKERS=1` 串行处理，
+导入几十首后队列会慢慢消化，期间服务照常可用。
+
 ### 先体验界面（无需 ML 依赖）
 
 ```bash
@@ -222,6 +244,8 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 | `OPENK_SEPARATOR_TIMEOUT` | `1200` | 分离超时秒数，超时报错而非无限卡住 |
 | `OPENK_KEEP_SOURCE` | `false` | 分离后是否保留原始下载音频；默认删除以节省空间 |
 | `OPENK_COOKIEFILE` | 空 | cookies.txt 路径，用于绕过 YouTube 机器人校验 / 限流 |
+| `OPENK_PLAYLIST_MAX_ITEMS` | `100` | 批量导入播放列表时一次最多摊平多少首 |
+| `OPENK_PLAYLIST_SKIP_LONG` | `true` | 导入前按列表里的时长先筛掉超过 `OPENK_MAX_SONG_SECONDS` 的项 |
 | `OPENK_PORT` | `8000` | 服务端口 |
 | `OPENK_HOST` | `127.0.0.1` | 监听地址；局域网访问填 `0.0.0.0` |
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
@@ -305,6 +329,8 @@ python -m backend.main
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/jobs` | 提交任务 `{url, language?, whisper_model?}`（同视频已处理则直接复用） |
+| POST | `/api/playlists/preview` | 读取播放列表清单 `{url, limit?}`，标出每首在本地的状态；**不创建任务** |
+| POST | `/api/playlists/import` | 批量导入 `{url, video_ids?, language?, whisper_model?, limit?}`；`video_ids` 留空＝导入全部可导入项 |
 | GET | `/api/jobs?q=` | 任务列表，`q` 可按标题搜索 |
 | GET | `/api/jobs/{id}` | 任务状态（含媒体 URL 与录音列表） |
 | DELETE | `/api/jobs/{id}` | 删除任务及其文件 |
