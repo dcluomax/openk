@@ -1,47 +1,30 @@
 #!/bin/sh
-# 启动 worker 前确保共享存储已挂载，并在 SMB 中途掉线后自愈。
+# 启动 worker 前，等共享存储就绪。
 #
-# 用法：worker 的 LaunchAgent / systemd 单元先跑这个脚本，失败就不启动 worker，
-# 交给 KeepAlive / Restart 退避重试，而不是让 worker 对着不存在的路径反复报错。
+# 这里只「等待」不「挂载」，是刻意的：挂载已经由系统里既有的登录项完成
+# （它用钥匙串凭据，不需要在磁盘上另存一份密码）。本脚本要解决的是时序问题——
+# 开机后 worker 可能比挂载先起来，对着还不存在的路径反复报错。
 #
-# 几个不显然的选择（都是实测踩出来的）：
-#   * 挂到 $HOME 下而不是 /Volumes：卸载时 macOS 会把 /Volumes 下的挂载点目录一并删掉，
-#     重启后就不存在了，而在 /Volumes 里建目录需要 root —— 开机自启时没人输密码。
-#   * 用 mount_smbfs 而不是 osascript 'mount volume'：后者需要 GUI 上下文，
-#     在 SSH 或无人登录时会挂住不返回，直接把启动流程卡死。
-#   * 凭据放 0600 文件而不是钥匙串：security -w 读密码会弹窗要授权，同样卡死。
-#     代价是磁盘上多一份明文密码，建议给这个用途单开一个只读共享的账号。
-
-MOUNT_POINT="${OPENK_SMB_MOUNT:-$HOME/mnt/Media}"
-CRED_FILE="${OPENK_SMB_CRED:-$HOME/.openk-smb}"
-# 挂载点里必然存在的一个子路径，用来判断「真的挂上了」而不只是目录存在
+# 两条走过弯路、别再踩的经验：
+#  1. 不要另起一个 mount_smbfs 挂到别处：macOS 不允许同一共享挂两次，
+#     后挂的会一直 "File exists"，而且两份挂载点也会让路径映射产生歧义。
+#  2. 挂载点绝对不要放在 $HOME 里面。家目录会被各种 CLI / 编辑器 / 索引器
+#     递归扫描，一旦扫进一个几十 TB 的网络共享，就会永久卡在 opendir 上——
+#     现象是进程 0% CPU、没有任何网络连接，极难定位。
+MOUNT_POINT="${OPENK_SMB_MOUNT:-/Volumes/Media}"
 PROBE="${OPENK_SMB_PROBE:-$MOUNT_POINT/openk/data}"
-RETRIES="${OPENK_SMB_RETRIES:-10}"
+WAIT_SECONDS="${OPENK_SMB_WAIT:-120}"
 
-[ -d "$PROBE" ] && exit 0
-
-if [ ! -r "$CRED_FILE" ]; then
-    echo "[mount] 缺少凭据文件 $CRED_FILE（见 deploy/smb-credentials.example）"
-    exit 1
-fi
-# shellcheck disable=SC1090
-. "$CRED_FILE"
-: "${SMB_HOST:?凭据文件缺少 SMB_HOST}" "${SMB_SHARE:?凭据文件缺少 SMB_SHARE}"
-: "${SMB_USER:?凭据文件缺少 SMB_USER}" "${SMB_PASS:?凭据文件缺少 SMB_PASS}"
-
-mkdir -p "$MOUNT_POINT"
-
-# 开机时网络栈和服务端可能都还没就绪，退避重试而不是一次就放弃
-attempt=1
-while [ "$attempt" -le "$RETRIES" ]; do
-    [ -d "$PROBE" ] && { echo "[mount] 已就绪"; exit 0; }
-    mount_smbfs -N "//${SMB_USER}:${SMB_PASS}@${SMB_HOST}/${SMB_SHARE}" "$MOUNT_POINT" 2>&1 \
-        | sed 's/^/[mount] /'
-    sleep 1
-    [ -d "$PROBE" ] && { echo "[mount] 挂载成功（第 ${attempt} 次）"; exit 0; }
-    sleep $((attempt * 3))
-    attempt=$((attempt + 1))
+waited=0
+while [ "$waited" -lt "$WAIT_SECONDS" ]; do
+    if [ -d "$PROBE" ]; then
+        [ "$waited" -gt 0 ] && echo "[mount] $PROBE 就绪（等了 ${waited}s）"
+        exit 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
 done
 
-echo "[mount] 放弃：$PROBE 仍不可用，本轮不启动 worker"
+echo "[mount] 等待 ${WAIT_SECONDS}s 后 $PROBE 仍不可用，本轮不启动 worker"
+echo "[mount] 检查登录项是否挂上了 $MOUNT_POINT：mount | grep $MOUNT_POINT"
 exit 1
