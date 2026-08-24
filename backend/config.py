@@ -73,6 +73,15 @@ COOKIEFILE = os.environ.get("OPENK_COOKIEFILE", "").strip() or None
 # 默认 7 分钟；设为 0 可关闭该限制。
 MAX_SONG_SECONDS = int(os.environ.get("OPENK_MAX_SONG_SECONDS", str(7 * 60)))
 
+# --- 播放列表批量导入 ---
+# 一次最多摊平多少首。歌单动辄上百首，而分离+转写是按分钟计的重活，
+# 默认给个保守上限，免得误贴一个「全部收藏」把队列堵到明天。
+PLAYLIST_MAX_ITEMS = int(os.environ.get("OPENK_PLAYLIST_MAX_ITEMS", "100"))
+# 导入前是否按列表里的时长先筛掉超长视频。列表页已经带了时长，
+# 在这里筛等于一次下载都不用发；否则要等下载完才在流水线里被 MAX_SONG_SECONDS 拦下。
+PLAYLIST_SKIP_LONG = os.environ.get(
+    "OPENK_PLAYLIST_SKIP_LONG", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # 分离完成后是否保留原始下载音频。默认删除以节省磁盘（已按视频去重，不会重复分离）。
 KEEP_SOURCE = os.environ.get("OPENK_KEEP_SOURCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
