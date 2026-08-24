@@ -95,7 +95,7 @@ openk/
 ├── frontend/              # 纯静态卡拉OK播放器 (HTML/CSS/JS)
 ├── worker/                # 可选：远程算力 worker（跑在算力机上）
 ├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）/ make_cert.py（自签证书）
-├── deploy/                # 部署模板：环境变量示例、nginx TLS 反代示例
+├── deploy/                # 部署模板：环境变量、nginx TLS 反代、macOS 开机自启与挂载
 ├── docs/screenshots/      # 界面截图（README 用）
 ├── requirements.txt       # 轻量依赖（Web + 下载）
 └── requirements-ml.txt    # 重量依赖（分离 + 识别）
