@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 上跑 openk worker 的 LaunchAgent。
+
+  装到 ~/Library/LaunchAgents/org.openk.worker.plist，然后：
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openk.worker.plist
+
+  为什么是 LaunchAgent 而不是 LaunchDaemon：
+  worker 要连局域网里的服务端，macOS 15+ 的「本地网络」隐私授权需要一次 GUI 确认，
+  而 LaunchDaemon 在开机时没有会话可以弹窗。用 Agent + 自动登录能绕开这个死结，
+  代价是需要一个已登录的图形会话（配合立即锁屏，见 docs/distributed.md）。
+
+  ProgramArguments 里先跑 ensure-mount.sh：挂载没就绪就直接退出，
+  由 KeepAlive 按 ThrottleInterval 退避重试，而不是让 worker 对着空路径刷错误日志。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.openk.worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>"$HOME/openk/bin/ensure-mount.sh" || exit 1; set -a; . "$HOME/openk/worker.env"; set +a; cd "$HOME/openk"; exec "$HOME/openk/.venv/bin/python" worker/openk_worker.py</string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- 挂载失败时会快速退出，间隔太短会疯狂重试刷日志 -->
+  <key>ThrottleInterval</key><integer>30</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd 不继承登录 shell 的 PATH，ffmpeg 等要显式给到 -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key><string>/tmp/openk-worker.log</string>
+  <key>StandardErrorPath</key><string>/tmp/openk-worker.log</string>
+</dict>
+</plist>

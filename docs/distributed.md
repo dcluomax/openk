@@ -290,6 +290,68 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openk.worker.plist
 >    结果就是 ffmpeg 找不到、分离阶段莫名其妙地失败。
 >    worker 启动时会自检 ffmpeg/ffprobe，缺了会在日志里直接点名。
 
+### macOS worker：重启之后自己回来
+
+上面那份 plist 只解决了「登录之后自启」。**机器重启且没人登录时，它不会跑。**
+worker 停在那里，服务端只会显示 worker 离线，任务一直排队。
+
+要做到无人干预自恢复，得凑齐三件事：
+
+**1. 共享存储要能在没有 GUI 的情况下挂上。**
+用 [`deploy/ensure-mount.sh.example`](../deploy/ensure-mount.sh.example)，
+让它在 worker 之前跑；挂不上就退出，交给 `KeepAlive` 退避重试。
+脚本里注释了三个实测踩到的坑，简单说：
+
+| 做法 | 结果 |
+|------|------|
+| `osascript 'mount volume'` | 需要 GUI 上下文，SSH / 无人登录时**挂住不返回** |
+| `security find-internet-password -w` 取钥匙串密码 | **弹窗**要授权，同样卡死 |
+| 挂到 `/Volumes/xxx` | 卸载时挂载点目录被系统删掉，重启后不存在，重建又要 root |
+| `mount_smbfs` + 0600 凭据文件 + 挂到 `$HOME` 下 | 可行 |
+
+代价是磁盘上有一份明文密码，建议给它单开一个权限最小的账号。
+模板见 [`deploy/smb-credentials.example`](../deploy/smb-credentials.example)。
+
+**2. 要有一个已登录的图形会话。**
+worker 连的是局域网地址，macOS 15+ 的「本地网络」隐私授权需要一次 GUI 确认，
+而 LaunchDaemon 开机时没有会话可以弹窗——这就是这里用 LaunchAgent + 自动登录、
+而不是改成 LaunchDaemon 的原因。
+
+```bash
+# 前提：FileVault 必须关闭，否则开机要先解锁磁盘，自动登录无从谈起
+fdesetup status
+
+sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser <用户名>
+# 还需要写 /etc/kcpassword（口令与固定密钥异或，不是加密）；
+# 图形界面里「系统设置 → 用户与群组 → 自动登录」勾一下更省事
+
+# 自动登录会让机器开机即进桌面，所以立刻上锁，
+# 把「无人值守可用」和「有人在场可进」分开
+sudo sysadminctl -screenLock immediate -password -
+```
+
+> 这是有安全代价的：`/etc/kcpassword` 能被 root 或任何能读盘的人还原成明文。
+> 不过如果 FileVault 本来就是关的，物理接触者早就能读全盘了，
+> 自动登录带来的**额外**风险接近于零。反过来说，
+> 如果你开着 FileVault，就不该走这条路，也走不通。
+
+**3. 断电之后要自己开机。**
+
+```bash
+sudo pmset -a autorestart 1   # 来电后自动开机
+sudo pmset -a sleep 0         # 别睡过去
+```
+
+配好后**一定要真重启一次验证**，别只看配置项：
+
+```bash
+sudo shutdown -r now
+# 等一两分钟，然后从服务端确认，而不是从这台机器上看
+curl -s http://<服务端>:8000/api/worker/status
+```
+
+现成模板：[`deploy/org.openk.worker.plist.example`](../deploy/org.openk.worker.plist.example)。
+
 ## 排查
 
 | 现象 | 原因 | 处理 |
