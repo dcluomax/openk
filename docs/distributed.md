@@ -297,25 +297,30 @@ worker 停在那里，服务端只会显示 worker 离线，任务一直排队�
 
 要做到无人干预自恢复，得凑齐三件事：
 
-**1. 共享存储要能在没有 GUI 的情况下挂上。**
-用 [`deploy/ensure-mount.sh.example`](../deploy/ensure-mount.sh.example)，
-让它在 worker 之前跑；挂不上就退出，交给 `KeepAlive` 退避重试。
-脚本里注释了三个实测踩到的坑，简单说：
+**1. 共享存储要在 worker 之前就绪。**
+开机后 worker 很可能比挂载先起来，对着还不存在的路径反复报错。
+用 [`deploy/ensure-mount.sh.example`](../deploy/ensure-mount.sh.example) 挡在前面：
+它只**等待**挂载出现，等不到就退出，交给 `KeepAlive` 退避重试。
 
-| 做法 | 结果 |
-|------|------|
-| `osascript 'mount volume'` | 需要 GUI 上下文，SSH / 无人登录时**挂住不返回** |
-| `security find-internet-password -w` 取钥匙串密码 | **弹窗**要授权，同样卡死 |
-| 挂到 `/Volumes/xxx` | 卸载时挂载点目录被系统删掉，重启后不存在，重建又要 root |
-| `mount_smbfs` + 0600 凭据文件 + 挂到 `$HOME` 下 | 可行 |
+挂载本身交给系统既有的登录项（macOS 上用 `open smb://…`，走钥匙串凭据），
+不要在磁盘上另存一份密码。
 
-代价是磁盘上有一份明文密码，建议给它单开一个权限最小的账号。
-模板见 [`deploy/smb-credentials.example`](../deploy/smb-credentials.example)。
+> **两个代价很高的坑**，都是实测撞出来的：
+>
+> **别把挂载点放在 `$HOME` 里面。** 家目录会被各种 CLI、编辑器、索引器递归扫描。
+> 一旦扫进一个几十 TB 的网络共享，进程就会永久卡在 `opendir()` 上——
+> 而且现象极具迷惑性：**0% CPU、没有任何 TCP 连接、日志停在启动阶段**，
+> 看起来像死锁或者网络故障，实际是 SMB 目录遍历在内核里等 I/O。
+> 挂到 `/Volumes/…` 这类家目录之外的位置就没事。
+>
+> **别为了「可控」另起一个 `mount_smbfs` 把同一个共享挂到第二个位置。**
+> macOS 不允许同一共享挂两次，后挂的会一直报 `File exists`；
+> 就算绕开了，两份挂载点也会让路径映射产生歧义。
 
 **2. 要有一个已登录的图形会话。**
 worker 连的是局域网地址，macOS 15+ 的「本地网络」隐私授权需要一次 GUI 确认，
 而 LaunchDaemon 开机时没有会话可以弹窗——这就是这里用 LaunchAgent + 自动登录、
-而不是改成 LaunchDaemon 的原因。
+而不是改成 LaunchDaemon 的原因。挂载用的 `open smb://` 同样需要图形会话。
 
 ```bash
 # 前提：FileVault 必须关闭，否则开机要先解锁磁盘，自动登录无从谈起
