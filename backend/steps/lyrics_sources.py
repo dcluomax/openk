@@ -26,6 +26,61 @@ _NOISE = re.compile(
 )
 _TRAILING = re.compile(r"[\-–—|·]\s*(official.*|lyric.*|audio.*|mv.*|hd.*|4k.*)$", re.IGNORECASE)
 
+# 直接缀在标题末尾、前面没有分隔符的宣传语，例如
+# 「…【地球上最浪漫的一首歌】Official Music Video」。
+_TAIL_WORDS = re.compile(
+    r"\s*(official\s*(music\s*)?(video|audio|mv|lyric[s]?\s*video)?|"
+    r"music\s*video|lyric[s]?\s*video|karaoke|卡拉ok|ktv|"
+    r"動態歌詞\s*lyrics?|动态歌词\s*lyrics?|"
+    r"高清|完整版|官方(版|完整版|音樂視頻|音乐视频)?|伴奏|純音樂|纯音乐)\s*$",
+    re.IGNORECASE,
+)
+
+# 括号里整体就是噪声（不是歌名），如 (KTV)、(國語)、(粵語)、(娛己娛人卡拉OK)
+_PAREN_NOISE = re.compile(
+    r"[（(]\s*(ktv|karaoke|卡拉ok|國語|国语|粵語|粤语|台語|台语|英文|日語|日语|"
+    r"男唱版|女唱版|合唱版|原唱|伴奏|清唱|[^)）]{0,6}卡拉ok)\s*[)）]",
+    re.IGNORECASE,
+)
+
+# 娛己娛人这类卡拉OK碟的固定命名：`NO -240 淚的小雨- 高勝美(國語) (…) - 特大字幕MV`
+# 编号后面是歌名，紧跟一个 `-` 再接歌手。这批碟片在中文卡拉OK收藏里非常常见，
+# 不认它的话歌名会被整条塞进歌手字段，点歌台就没法按歌手浏览了。
+_KTV_NUMBERED = re.compile(
+    r"^NO\s*[-–—]?\s*\d+\s*[-–—]?\s*(?P<track>.+?)\s*[-–—]\s*(?P<artist>[^-–—(（]{1,20})")
+
+# 歌名被书名号/方括号包起来：`黃鴻升 Alien Huang【地球上最浪漫的一首歌】Official MV`
+_BRACKET_TRACK = re.compile(r"[【〖\[]\s*([^】〗\]]+?)\s*[】〗\]]")
+
+# 竖线分隔：`餘情未了丨李國祥丨K歌男唱版丨…`（丨是常见的中文全角竖线）
+_PIPE_SPLIT = re.compile(r"\s*[丨｜|]\s*")
+
+# 歌名后用括号标注歌手：`雙星情歌-(許冠傑)-MV`
+_DASH_PAREN_ARTIST = re.compile(
+    r"^(?P<track>[^-–—]+?)\s*[-–—]\s*[（(]\s*(?P<artist>[^)）]+?)\s*[)）]")
+
+# 【】里若含这些词就是宣传语而非歌名
+_BRACKET_NOISE = re.compile(
+    r"official|lyric|mv|audio|video|hd|4k|字幕|歌詞|歌词|完整版|高清|伴奏|現場|现场",
+    re.IGNORECASE)
+
+
+def _strip_romanization(name: str) -> str:
+    """`黃鴻升 Alien Huang` → `黃鴻升`；`Mayday五月天` / `MAYDAY五月天` → `五月天`。
+
+    中文歌手名旁边常挂一段英文译名，写法还很不统一（前置、后置、大小写不同）。
+    点歌台上按歌手分组时，同一个人若一半条目带译名、一半不带，就会被拆成两个
+    歌手，所以只要含中文就把中文主段取出来作为归一后的名字。
+    """
+    name = (name or "").strip()
+    if not re.search(r"[\u4e00-\u9fff]", name):
+        return name
+    runs = re.findall(r"[\u4e00-\u9fff][\u4e00-\u9fff·&、\s]*", name)
+    if not runs:
+        return name
+    best = max(runs, key=lambda r: len(r.strip())).strip()
+    return best or name
+
 
 # ---------------------------------------------------------------------------
 # LRC / VTT / SRT 解析
@@ -105,46 +160,99 @@ def _fill_ends(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 def _clean_title(title: str) -> str:
     t = _NOISE.sub("", title or "")
+    t = _PAREN_NOISE.sub("", t)
     t = _TRAILING.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip(" -–—|·")
+    # 末尾的宣传语可能叠了好几层（`…Official Music Video` + `高清`），循环剥到不变为止。
+    for _ in range(4):
+        stripped = _TAIL_WORDS.sub("", t)
+        if stripped == t:
+            break
+        t = stripped
+    t = re.sub(r"\s+", " ", t).strip(" -–—|·丨｜_")
     return t.strip()
 
 
+def _split_artist_track(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """从一条视频标题里猜「歌手 / 歌名」。
+
+    规则按可靠度从高到低排，命中就返回——中文 MV 的命名方式实在太杂，
+    与其追求一条通用正则，不如把几种真正常见的写法逐个认掉。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+
+    # 1. 卡拉OK碟的编号命名（歌名在编号后、歌手在破折号后）
+    m = _KTV_NUMBERED.match(raw)
+    if m:
+        return (_clean_title(m.group("artist")) or None,
+                _clean_title(m.group("track")) or None)
+
+    # 2. 《》里的歌名最可靠
+    m = re.search(r"《\s*([^《》]+?)\s*》", raw)
+    if m:
+        track = m.group(1).strip()
+        before = re.sub(r"[（(【\[][^)）】\]]*[)）】\]]", "", raw[:m.start()])
+        before = re.sub(r"(这首|那首|演唱|翻唱|带来|新歌|单曲|歌曲|作品|经典|的)\s*$", "", before)
+        before = before.strip(" -–—|·:：、")
+        if before and len(before) <= 20:
+            return _strip_romanization(before) or None, _clean_title(track) or None
+        # 也有把歌手写在书名号之后的：`《跟往事乾杯》演唱 - 姜育恆`
+        after = raw[m.end():]
+        m2 = re.search(r"[-–—]\s*([^-–—(（【\[]{1,20})\s*$", after)
+        if m2:
+            return (_strip_romanization(_clean_title(m2.group(1))) or None,
+                    _clean_title(track) or None)
+        return None, _clean_title(track) or None
+
+    # 3. `歌手…【歌名】…`：方括号里不含宣传词时就是歌名
+    m = _BRACKET_TRACK.search(raw)
+    if m and not _BRACKET_NOISE.search(m.group(1)):
+        before = _clean_title(raw[:m.start()])
+        return (_strip_romanization(before) or None,
+                _clean_title(m.group(1)) or None)
+
+    # 4. `歌名-(歌手)-MV`
+    m = _DASH_PAREN_ARTIST.match(raw)
+    if m and not _PAREN_NOISE.match(f"({m.group('artist')})"):
+        return (_strip_romanization(_clean_title(m.group("artist"))) or None,
+                _clean_title(m.group("track")) or None)
+
+    cleaned = _clean_title(raw)
+
+    # 5. 全角竖线分隔：`餘情未了丨李國祥丨…`，前两段是歌名与歌手
+    parts = [p for p in _PIPE_SPLIT.split(cleaned) if p.strip()]
+    if len(parts) >= 2 and _PIPE_SPLIT.search(raw):
+        return (_strip_romanization(parts[1]) or None, parts[0].strip() or None)
+
+    # 6. 最常见的 `歌手 - 歌名`
+    parts = re.split(r"\s*[-–—]{1,2}\s*", cleaned, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return (_strip_romanization(parts[0]) or None, parts[1].strip() or None)
+
+    return None, cleaned or None
+
+
 def guess_meta(info: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """从 yt-dlp 元信息推断 artist / track / album，用于歌词库匹配。"""
+    """从 yt-dlp 元信息推断 artist / track / album，用于歌词库匹配与点歌台展示。"""
     artist = (info.get("artist") or "").strip() or None
     track = (info.get("track") or "").strip() or None
     album = (info.get("album") or "").strip() or None
 
     if not track:
-        raw = info.get("title") or ""
-        # 中文歌常把歌名放在《》书名号里（最可靠）；artist 取书名号前的短前缀，
-        # 并去掉“这首/演唱/翻唱”等填充词。否则再按 "Artist - Title" 拆分。
-        m = re.search(r"《\s*([^《》]+?)\s*》", raw)
-        if m:
-            track = m.group(1).strip()
-            before = re.sub(r"[（(【\[][^)）】\]]*[)）】\]]", "", raw[:m.start()])
-            before = re.sub(r"(这首|那首|演唱|翻唱|带来|新歌|单曲|歌曲|作品|经典|的)\s*$", "", before)
-            before = before.strip(" -–—|·:：、")
-            if before and not artist and len(before) <= 12:
-                artist = before
-        else:
-            cleaned = _clean_title(raw)
-            # "Artist - Title" 是最常见的音乐视频命名
-            parts = re.split(r"\s[-–—]\s", cleaned, maxsplit=1)
-            if len(parts) == 2 and not artist:
-                artist, track = parts[0].strip(), parts[1].strip()
-            else:
-                track = cleaned or None
+        guessed_artist, track = _split_artist_track(info.get("title") or "")
+        artist = artist or guessed_artist
 
     # 去掉 feat. 部分，以及中文书名号/方括号内的副标题与宣传语（几乎不是歌名主体）
     if track:
         track = re.sub(r"\s*[\(（]?\s*(feat\.?|ft\.?)\s+[^\)）]*[\)）]?", "", track, flags=re.IGNORECASE)
-        track = re.sub(r"[『「【〖\[][^』」】〗\]]*[』」】〗\]]", "", track)
+        track = re.sub(r"[『「〖][^』」〗]*[』」〗]", "", track)
         track = re.sub(r"\s+", " ", track).strip(" -–—|·")
     if artist:
-        artist = re.sub(r"[『「【〖\[][^』」】〗\]]*[』」】〗\]]", "", artist).strip()
+        artist = re.sub(r"[『「【〖\[][^』」】〗\]]*[』」】〗\]]", "", artist)
+        artist = _strip_romanization(artist).strip(" -–—|·、")
     return {"artist": artist or None, "track": track or None, "album": album}
+
 
 
 # ---------------------------------------------------------------------------
