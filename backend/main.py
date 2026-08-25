@@ -143,6 +143,16 @@ def _public_job(job: dict) -> dict:
     if job.get("lyrics_file"):
         media["lyrics"] = f"/media/{jid}/{job['lyrics_file']}"
     job["media"] = media
+    # 封面：远程下载的是 http 图床地址，本地导入的是作业目录内的相对路径。
+    # 后者要翻译成 /media/{id}/... 才能被浏览器加载；早期版本存的是容器内绝对
+    # 路径，这里一并归一，免得旧任务在点歌台上是一片空白封面。
+    thumb = job.get("thumbnail")
+    if thumb and not str(thumb).startswith(("http://", "https://", "/media/")):
+        rel = str(thumb).replace("\\", "/")
+        marker = f"/jobs/{jid}/"
+        if marker in rel:
+            rel = rel.split(marker, 1)[1]
+        job["thumbnail"] = f"/media/{jid}/{rel.lstrip('/')}"
     # 录音列表（补充可访问 URL）
     recs = job.get("recordings") or []
     job["recordings"] = [
