@@ -105,6 +105,9 @@ def separate_local(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # 进度输出里会带上文件名与源文件元数据，非 UTF-8 字节并不罕见；
+        # 严格解码会让一首本来能分离的歌直接失败。
+        errors="replace",
         bufsize=1,
         env=config.ca_env(),
     )
