@@ -30,6 +30,7 @@ class JobManager:
     def __init__(self) -> None:
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._interrupted: List[str] = []
         config.ensure_dirs()
         self._load_from_disk()
 
@@ -52,12 +53,37 @@ class JobManager:
             job_id = data.get("id")
             if not job_id:
                 continue
-            # 服务重启时，未完成的任务视为中断（失败），避免出现“卡住”的假运行态。
             if data.get("state") in {"queued", "running"}:
-                data["state"] = "error"
-                data["error"] = data.get("error") or "服务重启，任务被中断"
-                data["message"] = "任务已中断"
+                if config.RESUME_ON_START:
+                    # 批量导入几百首时，整批要跑十几个小时。中途一次重启就把
+                    # 没轮到的全标成失败，等于让用户手动重试几百次——所以这里
+                    # 重新排队。流水线本身会复用已有的分离结果，重跑代价可控。
+                    data["state"] = "queued"
+                    data["step"] = "queued"
+                    data["progress"] = 0
+                    data["error"] = None
+                    data["message"] = "服务重启，已重新排队"
+                    self._interrupted.append(job_id)
+                else:
+                    data["state"] = "error"
+                    data["error"] = data.get("error") or "服务重启，任务被中断"
+                    data["message"] = "任务已中断"
             self._jobs[job_id] = data
+        # 持久化重排后的状态，避免再次重启时状态与磁盘不一致。
+        for job_id in self._interrupted:
+            self._persist(job_id)
+
+    def take_interrupted(self) -> List[str]:
+        """取出并清空「重启前未完成」的任务 id，交给调用方重新提交执行。
+
+        由 :mod:`backend.main` 在启动时调用——队列执行器在那边，这里只管状态。
+        创建时间早的排前面，保持原有的先来后到。
+        """
+        with self._lock:
+            ids = sorted(self._interrupted,
+                         key=lambda j: self._jobs.get(j, {}).get("created_at", 0))
+            self._interrupted = []
+        return ids
 
     def _persist(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -145,6 +171,21 @@ class JobManager:
             for job in sorted(self._jobs.values(),
                               key=lambda j: j.get("created_at", 0), reverse=True):
                 if job.get("video_id") == video_id:
+                    return dict(job)
+        return None
+
+    def find_by_local_path(self, local_path: Optional[str]) -> Optional[Dict[str, Any]]:
+        """按本地文件路径查最近的任务。
+
+        文件名里没有 YouTube ID 时，:meth:`find_by_video` 无从判断，
+        只能靠路径去重——否则同一个文件会被反复导入。
+        """
+        if not local_path:
+            return None
+        with self._lock:
+            for job in sorted(self._jobs.values(),
+                              key=lambda j: j.get("created_at", 0), reverse=True):
+                if job.get("local_path") == local_path:
                     return dict(job)
         return None
 

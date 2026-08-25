@@ -423,6 +423,20 @@ docker run ... --user 3000:3000 -e HOME=/data ...
 docker run --rm --user 0:0 -v /srv/openk-data:/data openk:slim chown -R 3000:3000 /data
 ```
 
+### 只读挂载的媒体目录还要带上附加组
+
+启用本地媒体导入时，被挂进去的媒体目录往往属于另一个组（NAS 上常见的
+`homeGroup` 之类），靠**组权限**而不是属主授权。`--user 3000:3000` 只带 uid/gid，
+**不会**带上该用户在宿主机上的附加组，于是容器里 `ls` 那个目录就是 `Permission denied`，
+表现成扫描不到文件、或导入后每首都报「路径不存在，或不在允许的媒体目录内」。
+
+把宿主机上那个组显式加进来即可（`id <用户>` 可以查到该带哪些 gid）：
+
+```bash
+docker run ... --user 3000:3000 --group-add 1000 \
+  -v /mnt/pool/Media/ktv:/media/ktv:ro -e OPENK_LOCAL_MEDIA_DIRS=/media/ktv ...
+```
+
 ## 安全边界
 
 `/api/worker/*` 由 `OPENK_WORKER_TOKEN` 做 Bearer 鉴权，**没有 TLS**。
@@ -462,3 +476,12 @@ python test_playlist.py
 已有 / 排队中 / 失效 / 超长项在下载前就被挡下、勾选式部分导入、
 `OPENK_PLAYLIST_MAX_ITEMS` 上限夹取，以及**链接被截断时的提示是否可操作**。
 用假的 yt-dlp 作答，不联网、也不需要装 yt-dlp。
+
+```bash
+python test_local_media.py
+```
+
+覆盖本地媒体导入，重点在**安全边界**：未配置白名单时功能是否真的关着（404 而非 403）、
+白名单外的绝对路径 / `../` 穿越 / **指向外部的软链接**是否都被拒、非媒体后缀是否被拒、
+文件名里的 11 位视频 ID 能否正确解析（`[Official MV]` 这类方括号不能误判成 ID）、
+以及**重启续跑**：queued/running 的任务重启后回到 queued 而不是 error，并且只会被重排一次。
