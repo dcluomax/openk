@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .. import config
+from .retry import with_retry
 from ..remote import client as remote
 
 ProgressCb = Optional[Callable[[int, str], None]]
@@ -62,7 +63,21 @@ def separate_local(
     model: str = "",
     on_progress: ProgressCb = None,
 ) -> Dict[str, str]:
-    """在本机执行分离（worker 进程直接调用这个函数）。"""
+    """在本机执行分离（worker 进程直接调用这个函数）。
+
+    分离器偶尔会原生崩溃，跟歌本身无关，重跑一次基本就好，所以这里带一次重试。
+    """
+    return with_retry(
+        lambda: _separate_local_once(audio_path, out_dir, model, on_progress),
+        label="人声分离", on_progress=on_progress)
+
+
+def _separate_local_once(
+    audio_path: str | Path,
+    out_dir: Path,
+    model: str = "",
+    on_progress: ProgressCb = None,
+) -> Dict[str, str]:
     # 定位 audio-separator 命令行：优先 PATH；venv 未激活时（如用 .venv/bin/python
     # 直接启动服务）PATH 里没有 venv/bin，退回到与当前 Python 同目录的可执行文件。
     separator_cli = shutil.which("audio-separator")

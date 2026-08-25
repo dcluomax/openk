@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
+from .retry import with_retry
 from ..remote import client as remote
 
 log = logging.getLogger("openk.transcribe")
@@ -327,6 +328,15 @@ def align_known_lyrics_local(vocals_path: str | Path, lines: List[Dict[str, Any]
                              language: str, out_dir: Path, source: str,
                              on_progress: ProgressCb = None) -> Dict[str, Any]:
     """在本机执行强制对齐（worker 进程直接调用这个函数）。"""
+    return with_retry(
+        lambda: _align_known_lyrics_local_once(vocals_path, lines, language, out_dir,
+                                               source, on_progress),
+        label="歌词对齐", on_progress=on_progress)
+
+
+def _align_known_lyrics_local_once(vocals_path: str | Path, lines: List[Dict[str, Any]],
+                                   language: str, out_dir: Path, source: str,
+                                   on_progress: ProgressCb = None) -> Dict[str, Any]:
     import whisperx  # 延迟导入，避免把 torch 载入 Web 进程
 
     _ensure_nltk_punkt()  # 预先确保切句资源就绪，避免对齐时 SSL 下载失败
@@ -419,7 +429,22 @@ def transcribe_local(
     language: Optional[str] = None,
     on_progress: ProgressCb = None,
 ) -> Dict[str, Any]:
-    """在本机执行识别（worker 进程直接调用这个函数）。"""
+    """在本机执行识别（worker 进程直接调用这个函数）。
+
+    whisperX 偶尔会原生崩溃（和分离器一样），重跑一次通常就好，所以带一次重试。
+    """
+    return with_retry(
+        lambda: _transcribe_local_once(audio_path, out_dir, model, language, on_progress),
+        label="歌词识别", on_progress=on_progress)
+
+
+def _transcribe_local_once(
+    audio_path: str | Path,
+    out_dir: Path,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    on_progress: ProgressCb = None,
+) -> Dict[str, Any]:
     # 定位 whisperx：优先 PATH；venv 未激活时（如 launchd 直接用 .venv/bin/python
     # 拉起 worker，PATH 里并没有 venv/bin）退回到解释器同目录找。
     # 这与 separate.py 定位 audio-separator 的做法保持一致。
