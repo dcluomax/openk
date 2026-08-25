@@ -89,6 +89,7 @@ openk/
 │   └── steps/
 │       ├── download.py       # yt-dlp（音频 + 字幕 + 元数据）
 │       ├── playlist.py       # 播放列表摊平（只读清单，不下载）
+│       ├── local_media.py    # 本地媒体导入（白名单目录 + ffmpeg 抽音轨）
 │       ├── separate.py       # audio-separator（人声/伴奏分离）
 │       ├── lyrics_sources.py # LRCLIB 查询 + VTT/SRT/LRC 解析 + 元数据清洗
 │       ├── lyrics.py         # 歌词来源编排（择优 + 逐词对齐）
@@ -187,8 +188,38 @@ python -m backend.main
 > 歌单链接的 list ID 有 30 多个字符，**很容易在聊天软件里被换行截断**——
 > 截断后 YouTube 的报错和「歌单不存在」一模一样，所以请从浏览器地址栏完整复制。
 
+### 导入服务器上已有的视频/音频
+
+如果你早就把 MV 下载在硬盘里了，不必再从网上下一遍。给服务配置白名单目录后，
+界面上会多出「📁 本地文件」按钮，扫描出来的文件同样是先挑后导：
+
+```bash
+# Docker：把媒体目录只读挂进去，再声明允许导入哪些目录
+docker run -d --name openk -p 8000:8000 \
+  -v ~/openk-data:/data \
+  -v /path/to/your/mv:/media/mv:ro \
+  -e OPENK_LOCAL_MEDIA_DIRS=/media/mv \
+  openk:slim
+```
+
+> 如果容器用 `--user` 以非 root 运行（分布式部署下需要，见
+> [docs/distributed.md](docs/distributed.md#共享存储的属主)），而媒体目录是靠**组权限**
+> 授权的，还得补一个 `--group-add <gid>`——否则容器里根本列不出这个目录，
+> 表现成扫描为空或导入后每首都报「路径不存在」。
+
+- **默认关闭**：`OPENK_LOCAL_MEDIA_DIRS` 不配置时，`/api/local/*` 一律返回 404，
+  等同于这个功能不存在——公网实例不会多出一个可探测的读文件入口。
+- **只认白名单**：所有路径都会先解析软链接再校验是否落在配置的目录内，
+  并且只接受 `.mp4/.mkv/.webm/.mov/.m4a/.mp3/.flac/.wav/.aac/.ogg/.opus`。
+- **只读原文件**：用 ffmpeg 抽出音轨到任务目录，能直接复制音频流就不重新编码，原文件不动。
+- **自动去重**：yt-dlp 下载的文件名里带 11 位视频 ID（`歌名 [dQw4w9WgXcQ].mp4`），
+  会据此认出曲库里已有的歌；文件名里没有 ID 时按路径去重。
+- 挂载时**务必加 `:ro`**——openk 没有任何删除原始文件的代码路径，但只读挂载让这件事由内核保证。
+
 分离和识别都是按分钟计的重活，默认 `OPENK_MAX_WORKERS=1` 串行处理，
 导入几十首后队列会慢慢消化，期间服务照常可用。
+一次导入几百首时整批会跑很久；服务重启（升级、断电）后没跑完的任务会自动接着排队，
+不需要重新导入（可用 `OPENK_RESUME_ON_START=false` 关掉）。
 
 ### 先体验界面（无需 ML 依赖）
 
@@ -246,6 +277,9 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 | `OPENK_COOKIEFILE` | 空 | cookies.txt 路径，用于绕过 YouTube 机器人校验 / 限流 |
 | `OPENK_PLAYLIST_MAX_ITEMS` | `100` | 批量导入播放列表时一次最多摊平多少首 |
 | `OPENK_PLAYLIST_SKIP_LONG` | `true` | 导入前按列表里的时长先筛掉超过 `OPENK_MAX_SONG_SECONDS` 的项 |
+| `OPENK_LOCAL_MEDIA_DIRS` | 空 | 允许导入的本地媒体目录，多个用 `:` 分隔；**留空＝完全关闭本地导入** |
+| `OPENK_LOCAL_MEDIA_MAX_ITEMS` | `1000` | 一次扫描最多列出多少个本地文件 |
+| `OPENK_RESUME_ON_START` | `true` | 重启后把没跑完的任务重新排队，而不是标记失败 |
 | `OPENK_PORT` | `8000` | 服务端口 |
 | `OPENK_HOST` | `127.0.0.1` | 监听地址；局域网访问填 `0.0.0.0` |
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
@@ -331,6 +365,9 @@ python -m backend.main
 | POST | `/api/jobs` | 提交任务 `{url, language?, whisper_model?}`（同视频已处理则直接复用） |
 | POST | `/api/playlists/preview` | 读取播放列表清单 `{url, limit?}`，标出每首在本地的状态；**不创建任务** |
 | POST | `/api/playlists/import` | 批量导入 `{url, video_ids?, language?, whisper_model?, limit?}`；`video_ids` 留空＝导入全部可导入项 |
+| GET | `/api/local/status` | 本地导入是否可用及允许的目录；未启用时 `enabled: false` |
+| POST | `/api/local/scan` | 扫描白名单目录 `{subdir?, limit?}`，标出每个文件的状态；**不创建任务** |
+| POST | `/api/local/import` | 批量导入本地文件 `{paths?, subdir?, language?, whisper_model?, limit?}` |
 | GET | `/api/jobs?q=` | 任务列表，`q` 可按标题搜索 |
 | GET | `/api/jobs/{id}` | 任务状态（含媒体 URL 与录音列表） |
 | DELETE | `/api/jobs/{id}` | 删除任务及其文件 |

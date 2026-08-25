@@ -82,6 +82,27 @@ PLAYLIST_MAX_ITEMS = int(os.environ.get("OPENK_PLAYLIST_MAX_ITEMS", "100"))
 PLAYLIST_SKIP_LONG = os.environ.get(
     "OPENK_PLAYLIST_SKIP_LONG", "true").strip().lower() in {"1", "true", "yes", "on"}
 
+# --- 本地媒体导入 ---
+# 允许从本地磁盘导入媒体文件的白名单目录，用 os.pathsep（Linux/macOS 上是 ":"）分隔。
+# **留空＝该功能完全关闭**，相关接口一律 404。
+#
+# 这是唯一一处让 HTTP 接口接触本地文件系统的地方，所以边界必须由部署者划定：
+# 接口收到的路径都会 resolve() 之后检查是不是这些目录的子孙，
+# ".." 和指向外部的软链都会被拒。不配置就等于没有这个功能。
+LOCAL_MEDIA_DIRS = [
+    p.strip() for p in os.environ.get("OPENK_LOCAL_MEDIA_DIRS", "").split(os.pathsep)
+    if p.strip()
+]
+# 一次扫描最多列出多少个文件。
+LOCAL_MEDIA_MAX_ITEMS = int(os.environ.get("OPENK_LOCAL_MEDIA_MAX_ITEMS", "1000"))
+
+# --- 重启续跑 ---
+# 服务重启时，把还在排队/处理中的任务重新排进队列，而不是标记成失败。
+# 批量导入几百首时这条很关键：整批要跑十几个小时，中途任何一次重启
+# 都不该把没轮到的任务全部作废。
+RESUME_ON_START = os.environ.get(
+    "OPENK_RESUME_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # 分离完成后是否保留原始下载音频。默认删除以节省磁盘（已按视频去重，不会重复分离）。
 KEEP_SOURCE = os.environ.get("OPENK_KEEP_SOURCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 

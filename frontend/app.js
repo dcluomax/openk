@@ -55,6 +55,26 @@ const api = {
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '读取播放列表失败');
     return r.json();
   },
+  async localStatus() {
+    const r = await fetch('/api/local/status');
+    return r.ok ? r.json() : { enabled: false, roots: [] };
+  },
+  async scanLocal(payload) {
+    const r = await fetch('/api/local/scan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '扫描本地目录失败');
+    return r.json();
+  },
+  async importLocal(payload) {
+    const r = await fetch('/api/local/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '导入失败');
+    return r.json();
+  },
   async importPlaylist(payload) {
     const r = await fetch('/api/playlists/import', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -92,7 +112,8 @@ const state = {
   recTimer: null,
   recStart: 0,
   micStream: null,
-  playlist: null,    // 播放列表预览结果
+  picker: null,      // 批量导入面板的当前数据（歌单或本地扫描结果）
+  pickMode: 'playlist',
   plAsked: false,    // 本次输入是否已问过「要不要批量导入」
 };
 
@@ -127,7 +148,7 @@ async function onCreate() {
   }
 }
 
-/* ---------------- 播放列表批量导入 ---------------- */
+/* ---------------- 批量导入（播放列表 / 本地文件共用一套选择面板）---------------- */
 const PL_STATUS = {
   new: ['可导入', 'new'],
   failed: ['上次失败·可重来', 'failed'],
@@ -143,20 +164,28 @@ function isPlaylistUrl(url) {
   return !!m && !/^(RD|UL|LL|WL)/.test(m[1]);
 }
 
+// 两种来源的「一条记录」用不同字段做标识：歌单用视频 ID，本地用文件路径。
+const entryKey = (e) => (state.pickMode === 'local' ? e.path : e.video_id);
+
+function openPanel(titleText) {
+  $('#plPanel').classList.remove('hidden');
+  $('#plList').innerHTML = '';
+  $('#plTitle').textContent = titleText;
+  $('#plCount').textContent = '';
+  $('#plHint').textContent = '';
+}
+
 async function openPlaylist() {
   const url = $('#url').value.trim();
   if (!url) { $('#url').focus(); return; }
   const btn = $('#plGo');
   btn.disabled = true; btn.textContent = '读取中…';
-  $('#plPanel').classList.remove('hidden');
-  $('#plList').innerHTML = '';
-  $('#plTitle').textContent = '正在读取播放列表…';
-  $('#plCount').textContent = '';
-  $('#plHint').textContent = '';
+  state.pickMode = 'playlist';
+  openPanel('正在读取播放列表…');
   try {
     const data = await api.previewPlaylist({ url });
-    state.playlist = data;
-    renderPlaylist(data);
+    state.picker = data;
+    renderPicker(data);
   } catch (e) {
     $('#plTitle').textContent = '读取失败';
     $('#plHint').textContent = e.message || '读取播放列表失败';
@@ -165,12 +194,37 @@ async function openPlaylist() {
   }
 }
 
-function renderPlaylist(data) {
-  $('#plTitle').textContent = data.title || '播放列表';
+async function openLocal() {
+  const btn = $('#lcGo');
+  btn.disabled = true; btn.textContent = '扫描中…';
+  state.pickMode = 'local';
+  openPanel('正在扫描本地媒体目录…');
+  try {
+    const data = await api.scanLocal({});
+    state.picker = data;
+    renderPicker(data);
+  } catch (e) {
+    $('#plTitle').textContent = '扫描失败';
+    $('#plHint').textContent = e.message || '扫描本地目录失败';
+  } finally {
+    btn.disabled = false; btn.textContent = '📁 本地文件';
+  }
+}
+
+function renderPicker(data) {
+  const local = state.pickMode === 'local';
+  $('#plTitle').textContent = local
+    ? `本地媒体（${(data.roots || []).join('、')}）`
+    : (data.title || '播放列表');
   $('#plCount').textContent = `共 ${data.total} 首 · ${data.importable} 首可导入`;
+
   const notes = [];
-  if (data.truncated) notes.push(`歌单更长，这里只列出前 ${data.limit} 首（可调 OPENK_PLAYLIST_MAX_ITEMS）`);
-  if (data.importable === 0) notes.push('没有需要新建的歌曲——这个歌单已经全部处理过了。');
+  if (data.truncated) {
+    notes.push(local
+      ? `目录里还有更多文件，这里只列出前 ${data.limit} 个（可调 OPENK_LOCAL_MEDIA_MAX_ITEMS）`
+      : `歌单更长，这里只列出前 ${data.limit} 首（可调 OPENK_PLAYLIST_MAX_ITEMS）`);
+  }
+  if (data.importable === 0) notes.push('没有需要新建的歌曲——这些已经全部处理过了。');
   else notes.push('默认勾选了还没做过的歌；取消勾选可以跳过。');
   $('#plHint').textContent = notes.join(' ');
 
@@ -181,12 +235,13 @@ function renderPlaylist(data) {
     const li = document.createElement('li');
     if (!e.importable) li.classList.add('off');
     li.innerHTML = `
-      <input type="checkbox" class="pl-pick" data-id="${e.video_id}"
+      <input type="checkbox" class="pl-pick"
              ${e.importable ? 'checked' : ''} ${e.importable ? '' : 'disabled'} />
       <div class="pl-info"><div class="pl-name"></div></div>
       <span class="pl-dur"></span>
       <span class="pl-tag ${cls}">${text}</span>`;
-    // 标题来自外部数据，用 textContent 赋值以免被当成 HTML 解析。
+    // 标题与路径都来自外部数据，一律用 textContent / dataset 赋值，不拼进 HTML。
+    li.querySelector('.pl-pick').dataset.key = entryKey(e);
     li.querySelector('.pl-name').textContent = e.title;
     li.querySelector('.pl-dur').textContent = e.duration ? fmt(e.duration) : '';
     ul.appendChild(li);
@@ -194,8 +249,8 @@ function renderPlaylist(data) {
   syncPlAll();
 }
 
-function pickedIds() {
-  return Array.from(document.querySelectorAll('.pl-pick:checked')).map((c) => c.dataset.id);
+function pickedKeys() {
+  return Array.from(document.querySelectorAll('.pl-pick:checked')).map((c) => c.dataset.key);
 }
 
 function syncPlAll() {
@@ -205,26 +260,37 @@ function syncPlAll() {
   all.checked = boxes.length > 0 && boxes.every((b) => b.checked);
 }
 
-async function onPlaylistImport() {
-  const data = state.playlist;
+async function onPickerImport() {
+  const data = state.picker;
   if (!data) return;
-  const ids = pickedIds();
-  if (!ids.length) { alert('没有勾选任何歌曲'); return; }
+  const keys = pickedKeys();
+  if (!keys.length) { alert('没有勾选任何歌曲'); return; }
+  const local = state.pickMode === 'local';
+  // 分离加识别是按分钟计的重活，几百首要跑很久，先说清楚再动手。
+  if (keys.length > 20 &&
+      !confirm(`要导入 ${keys.length} 首。分离和识别都很吃算力，会按顺序逐首处理，`
+               + `整批可能要跑很久（服务重启后会自动接着跑）。继续吗？`)) {
+    return;
+  }
   const btn = $('#plImport');
   btn.disabled = true; btn.textContent = '导入中…';
   try {
-    const res = await api.importPlaylist({
-      url: `https://www.youtube.com/playlist?list=${data.playlist_id}`,
-      video_ids: ids,
+    const payload = {
       language: $('#language').value || null,
       whisper_model: $('#model').value || null,
-    });
+    };
+    const res = local
+      ? await api.importLocal({ ...payload, paths: keys })
+      : await api.importPlaylist({
+        ...payload,
+        url: `https://www.youtube.com/playlist?list=${data.playlist_id}`,
+        video_ids: keys,
+      });
     $('#plPanel').classList.add('hidden');
-    $('#url').value = '';
-    state.plAsked = false;
+    if (!local) { $('#url').value = ''; state.plAsked = false; }
     await refreshList(true);
     const skipped = res.skipped_count ? `，跳过 ${res.skipped_count} 首` : '';
-    alert(`已加入队列 ${res.created_count} 首${skipped}。\n分离与识别很吃算力，会按顺序逐首处理。`);
+    alert(`已加入队列 ${res.created_count} 首${skipped}。`);
   } catch (e) {
     alert(e.message || '导入失败');
   } finally {
@@ -1034,8 +1100,9 @@ function init() {
   // 换了链接就重新问一次「要不要批量导入」
   $('#url').addEventListener('input', () => { state.plAsked = false; });
   $('#plGo').addEventListener('click', openPlaylist);
+  $('#lcGo').addEventListener('click', openLocal);
   $('#plClose').addEventListener('click', () => $('#plPanel').classList.add('hidden'));
-  $('#plImport').addEventListener('click', onPlaylistImport);
+  $('#plImport').addEventListener('click', onPickerImport);
   $('#plAll').addEventListener('change', (e) => {
     document.querySelectorAll('.pl-pick:not(:disabled)')
       .forEach((c) => { c.checked = e.target.checked; });
@@ -1053,6 +1120,10 @@ function init() {
   });
   bindPlayer();
   refreshList();
+  // 本地导入默认关闭（部署者不配白名单目录就当没这功能），所以入口按服务端答复决定显隐。
+  api.localStatus().then((s) => {
+    if (s.enabled) $('#lcGo').classList.remove('hidden');
+  }).catch(() => {});
   // 后台自适应刷新列表：有运行中任务时 3s，全部空闲时放慢到 15s；
   // 页面不可见、或正在逐帧轮询单个任务时跳过，避免无谓请求刷屏。
   const scheduleListRefresh = () => {

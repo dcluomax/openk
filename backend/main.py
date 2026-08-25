@@ -4,6 +4,9 @@
     POST /api/jobs              创建任务（提交链接，后台处理）
     POST /api/playlists/preview 读取播放列表清单（不建任务）
     POST /api/playlists/import  批量导入播放列表
+    GET  /api/local/status      本地媒体导入是否可用
+    POST /api/local/scan        扫描本地媒体目录（不建任务）
+    POST /api/local/import      批量导入本地媒体文件
     GET  /api/jobs              任务列表
     GET  /api/jobs/{id}         任务状态
     DELETE /api/jobs/{id}       删除任务及其文件
@@ -24,6 +27,7 @@ from pydantic import BaseModel
 
 from . import config, pipeline
 from .jobs import extract_video_id, manager
+from .steps import local_media
 from .steps import playlist as playlist_step
 
 config.ensure_dirs()
@@ -57,6 +61,27 @@ app.include_router(_worker_router, prefix="/api")
 _executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 
 
+def _resume_interrupted() -> None:
+    """把重启前没跑完的任务重新排进队列。
+
+    批量导入几百首时整批要跑十几个小时，中途一次重启（升级、断电、
+    OOM）不该让没轮到的任务全部作废。JobManager 在加载时已经把它们
+    的状态改回 queued，这里只负责重新提交执行。
+    """
+    if not config.RESUME_ON_START:
+        return
+    pending = manager.take_interrupted()
+    if not pending:
+        return
+    logging.getLogger("uvicorn.error").info(
+        "重启续跑：重新排入 %d 个未完成任务", len(pending))
+    for job_id in pending:
+        _executor.submit(pipeline.run, job_id)
+
+
+_resume_interrupted()
+
+
 class CreateJobRequest(BaseModel):
     url: str
     language: str | None = None      # 留空自动检测
@@ -82,6 +107,19 @@ class PlaylistPreviewRequest(BaseModel):
 class PlaylistImportRequest(BaseModel):
     url: str
     video_ids: list[str] | None = None  # 留空＝导入全部可导入项
+    language: str | None = None
+    whisper_model: str | None = None
+    limit: int | None = None
+
+
+class LocalScanRequest(BaseModel):
+    subdir: str | None = None         # 留空＝扫描全部白名单目录
+    limit: int | None = None
+
+
+class LocalImportRequest(BaseModel):
+    paths: list[str] | None = None    # 留空＝导入全部可导入项
+    subdir: str | None = None
     language: str | None = None
     whisper_model: str | None = None
     limit: int | None = None
@@ -266,6 +304,122 @@ def import_playlist(req: PlaylistImportRequest) -> dict:
     return {
         "playlist_id": data["playlist_id"],
         "title": data["title"],
+        "created": created,
+        "skipped": skipped,
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+    }
+
+
+# ---- 本地媒体导入 ----
+def _require_local_enabled() -> None:
+    """没配置白名单目录就当这个功能不存在。
+
+    返回 404 而不是 403：不暴露「这里有个功能只是没开」的信息，
+    对着公网跑的实例少一点可探测面。
+    """
+    if not local_media.enabled():
+        raise HTTPException(status_code=404, detail="未启用本地媒体导入")
+
+
+def _local_status(entry: dict) -> tuple[str, str | None]:
+    """本地文件的状态判定。
+
+    先按 YouTube ID 去重（yt-dlp 下载的文件名里带着），文件名里没有 ID 时
+    退回按路径去重——否则同一个文件每次扫描都会显示成「没做过」。
+    """
+    dur = entry.get("duration") or 0
+    if config.PLAYLIST_SKIP_LONG and config.MAX_SONG_SECONDS and dur > config.MAX_SONG_SECONDS:
+        return "too_long", None
+
+    existing = (manager.find_by_video(entry.get("video_id"))
+                or manager.find_by_local_path(entry.get("path")))
+    if existing:
+        state = existing.get("state")
+        if state == "done":
+            return "done", existing.get("id")
+        if state in {"queued", "running"}:
+            return "pending", existing.get("id")
+        return "failed", existing.get("id")
+    return "new", None
+
+
+def _local_scan(subdir: str | None, limit: int | None) -> dict:
+    cap = config.LOCAL_MEDIA_MAX_ITEMS
+    n = cap if limit is None else max(1, min(int(limit), cap))
+    try:
+        data = local_media.scan(subdir=subdir, limit=n)
+    except local_media.LocalMediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for entry in data["entries"]:
+        status, job_id = _local_status(entry)
+        entry["status"] = status
+        entry["job_id"] = job_id
+        entry["importable"] = status in _IMPORTABLE
+    data["importable"] = sum(1 for e in data["entries"] if e["importable"])
+    return data
+
+
+@app.get("/api/local/status")
+def local_status() -> dict:
+    """本地导入是否可用、允许哪些目录。前端据此决定要不要显示这个入口。"""
+    return {"enabled": local_media.enabled(),
+            "roots": [str(r) for r in local_media.allowed_roots()]}
+
+
+@app.post("/api/local/scan")
+def scan_local(req: LocalScanRequest) -> dict:
+    """列出白名单目录里的媒体文件，并标出每个在曲库里的状态。**不创建任务。**"""
+    _require_local_enabled()
+    return _local_scan(req.subdir, req.limit)
+
+
+@app.post("/api/local/import")
+def import_local(req: LocalImportRequest) -> dict:
+    """批量把本地文件加入队列。``paths`` 留空＝导入全部可导入项。"""
+    _require_local_enabled()
+    data = _local_scan(req.subdir, req.limit)
+    entries = data["entries"]
+
+    if req.paths is not None:
+        wanted = {p.strip() for p in req.paths if p and p.strip()}
+        entries = [e for e in entries if e["path"] in wanted or e["rel_path"] in wanted]
+
+    language = (req.language or "").strip() or None
+    whisper_model = (req.whisper_model or "").strip() or None
+
+    created: list[dict] = []
+    skipped: list[dict] = []
+    reason_text = {
+        "done": "曲库里已有",
+        "pending": "已在队列中",
+        "too_long": "时长超过单曲上限",
+    }
+    for entry in entries:
+        status = entry["status"]
+        if status not in _IMPORTABLE:
+            skipped.append({
+                "path": entry["rel_path"],
+                "title": entry["title"],
+                "reason": reason_text.get(status, status),
+                "job_id": entry.get("job_id"),
+            })
+            continue
+        job = manager.create(
+            entry["path"],
+            source_type="local",
+            local_path=entry["path"],
+            video_id=entry.get("video_id"),
+            title=entry.get("title"),
+            duration=entry.get("duration"),
+            language=language,
+            whisper_model=whisper_model,
+        )
+        _executor.submit(pipeline.run, job["id"])
+        created.append(_public_job(job))
+
+    return {
         "created": created,
         "skipped": skipped,
         "created_count": len(created),
