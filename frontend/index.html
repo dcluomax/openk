@@ -3,88 +3,201 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>openk · 卡拉OK</title>
+  <title>openk · 点歌台</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app">
-    <!-- 顶部栏 -->
+    <!-- 顶部栏：搜索是点歌台最高频的操作，所以常驻在最显眼的位置 -->
     <header class="topbar">
-      <div class="brand">
+      <div class="brand" id="homeBtn" title="回到点歌台">
         <span class="logo">🎤</span>
-        <div>
-          <h1>openk</h1>
-          <p>把任意视频变成专业卡拉OK · 人声分离 + 歌词自动对齐</p>
-        </div>
+        <h1>点歌台</h1>
+      </div>
+      <div class="search-wrap">
+        <input id="search" class="search-box" type="text"
+               placeholder="搜歌名 / 歌手 / 拼音首字母（如 pyzy）" autocomplete="off" />
+        <button id="searchClear" class="s-clear hidden" title="清空">✕</button>
+      </div>
+      <div class="top-actions">
+        <button id="queueBtn" class="top-btn" title="已点歌曲">
+          📋 已点 <span id="queueCount" class="pill">0</span>
+        </button>
+        <button id="adminBtn" class="top-btn" title="导入与处理进度（后台）">
+          ⚙️ 后台 <span id="adminBadge" class="pill busy hidden">0</span>
+        </button>
       </div>
     </header>
 
-    <!-- 新建任务 -->
-    <section class="card create">
-      <div class="row">
-        <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接，例如 https://www.youtube.com/watch?v=…" autocomplete="off" />
-        <button id="go" class="primary">开始制作</button>
-        <button id="plGo" title="粘贴歌单链接，一次把整个播放列表加入队列">🎵 导入歌单</button>
-        <button id="lcGo" class="hidden" title="从服务器上已有的媒体目录批量导入">📁 本地文件</button>
-      </div>
+    <!-- 点歌台：已完成的歌按 KTV 节目单的方式陈列 -->
+    <section id="browse" class="browse">
+      <nav class="tabs">
+        <button class="tab active" data-tab="all">全部</button>
+        <button class="tab" data-tab="artist">歌手</button>
+        <button class="tab" data-tab="new">最新</button>
+        <span class="tab-spacer"></span>
+        <span id="browseCount" class="muted small"></span>
+      </nav>
 
-      <!-- 批量导入（播放列表 / 本地文件共用）-->
-      <div id="plPanel" class="pl-panel hidden">
-        <div class="pl-head">
-          <strong id="plTitle">播放列表</strong>
-          <span id="plCount" class="muted small"></span>
-          <span class="pl-spacer"></span>
-          <label class="pl-all"><input type="checkbox" id="plAll" /> 全选可导入</label>
-          <button id="plImport" class="lyr-btn primary">导入选中</button>
-          <button id="plClose" class="lyr-btn">关闭</button>
+      <div id="letterBar" class="letter-bar hidden"></div>
+
+      <div id="grid" class="song-grid"></div>
+      <div id="artistList" class="artist-list hidden"></div>
+      <p id="browseEmpty" class="empty hidden"></p>
+    </section>
+
+    <!-- 演唱页 -->
+    <section id="stage" class="stage hidden">
+      <button id="backBtn" class="back-btn">‹ 返回点歌台</button>
+<div id="player" class="player hidden">
+        <div class="player-head">
+          <div class="ph-left">
+            <h3 id="playerTitle"></h3>
+            <span id="lyricSource" class="badge hidden"></span>
+          </div>
+          <a id="sourceLink" class="muted small" target="_blank" rel="noreferrer">原始视频 ↗</a>
         </div>
-        <p id="plHint" class="muted small"></p>
-        <ul id="plList" class="pl-list"></ul>
-      </div>
-      <div class="row options">
-        <label>
-          语言
-          <select id="language">
-            <option value="">自动检测</option>
-            <option value="zh">中文</option>
-            <option value="en">English</option>
-            <option value="ja">日本語</option>
-            <option value="ko">한국어</option>
-            <option value="es">Español</option>
-            <option value="fr">Français</option>
-          </select>
-        </label>
-        <label>
-          识别模型
-          <select id="model">
-            <option value="">默认 (small · 快)</option>
-            <option value="medium">medium · 更准</option>
-            <option value="large-v3">large-v3 · 最准 (慢)</option>
-            <option value="tiny">tiny · 最快</option>
-          </select>
-        </label>
-        <span class="hint">提示：请仅用于自有或授权 / 知识共享许可的内容。</span>
+
+        <div class="lyrics-tools">
+          <button id="editLyrics" class="lyr-btn hidden" title="识别不准时可逐行手动修改歌词">✏️ 编辑歌词</button>
+          <button id="searchLyrics" class="lyr-btn hidden" title="从歌词库搜索正确歌词并重新对齐（识别成拼音/英文时用）">🔍 搜歌词重对齐</button>
+          <div id="editBar" class="edit-bar hidden">
+            <span class="muted small">逐行修改文字，保存后自动重建逐字时间轴</span>
+            <button id="saveLyrics" class="lyr-btn primary">保存</button>
+            <button id="cancelLyrics" class="lyr-btn">取消</button>
+          </div>
+        </div>
+
+        <div id="lyricSearch" class="lyric-search hidden">
+          <div class="ls-bar">
+            <input id="lsQuery" type="text" placeholder="歌手 歌名，如：大壮 敬自己" autocomplete="off" />
+            <button id="lsGo" class="lyr-btn primary">搜索</button>
+            <button id="lsClose" class="lyr-btn">关闭</button>
+          </div>
+          <p id="lsHint" class="muted small">从 LRCLIB 歌词库搜索正确歌词，选一条即可重新对齐到人声（识别成拼音/英文时特别有用）。</p>
+          <ul id="lsResults" class="ls-results"></ul>
+        </div>
+
+        <div id="lyrics" class="lyrics"></div>
+
+        <div class="controls">
+          <button id="playBtn" class="round" title="播放/暂停">▶</button>
+          <span id="curTime" class="time">0:00</span>
+          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" />
+          <span id="durTime" class="time">0:00</span>
+        </div>
+
+        <div class="mixer">
+          <label class="mix">
+            🎸 伴奏
+            <input id="instVol" type="range" min="0" max="100" value="100" />
+          </label>
+          <label class="mix">
+            🎙️ 导唱人声
+            <input id="vocalVol" type="range" min="0" max="100" value="0" />
+          </label>
+          <label class="mix">
+            🌫️ 混响
+            <select id="reverb">
+              <option value="none">干声</option>
+              <option value="room">小房间</option>
+              <option value="ktv" selected>KTV</option>
+              <option value="hall">大厅</option>
+              <option value="church">教堂</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="recorder">
+          <button id="recBtn" class="rec">🎤 开始录唱</button>
+          <span id="recStatus" class="muted small"></span>
+          <label class="mon" title="边唱边从耳机听到自己的声音"><input type="checkbox" id="monitor" /> 耳机监听</label>
+          <span class="hint">录唱会把伴奏与你的歌声合成保存；建议戴耳机以避免啸叫。</span>
+        </div>
+
+        <div class="rec-list-wrap hidden" id="recListWrap">
+          <h4>🎵 我的录音</h4>
+          <ul id="recList" class="rec-list"></ul>
+        </div>
+
+        <audio id="instAudio" preload="auto"></audio>
+        <audio id="vocalAudio" preload="auto"></audio>
       </div>
     </section>
 
-    <div class="layout">
-      <!-- 点歌台 -->
-      <aside class="card jobs">
-        <div class="jobs-head">
-          <h2>🎤 点歌台</h2>
-          <div class="lib-modes">
-            <button class="lib-mode active" data-mode="recent">最近</button>
-            <button class="lib-mode" data-mode="artist">按歌手</button>
-          </div>
-        </div>
-        <input id="search" class="search-box" type="text" placeholder="🔍 搜歌名 / 歌手…" autocomplete="off" />
-        <ul id="jobList" class="job-list"></ul>
-        <p id="jobsEmpty" class="empty">还没有任务，粘贴链接开始吧。</p>
-      </aside>
+    <!-- 已点歌曲抽屉 -->
+    <aside id="queuePanel" class="drawer hidden">
+      <div class="drawer-head">
+        <strong>📋 已点歌曲</strong>
+        <span id="queueHint" class="muted small"></span>
+        <span class="drawer-spacer"></span>
+        <button id="queueClear" class="lyr-btn">清空</button>
+        <button id="queueClose" class="lyr-btn">关闭</button>
+      </div>
+      <ul id="queueList" class="queue-list"></ul>
+      <p id="queueEmpty" class="empty">还没点歌。在点歌台上点一首歌就会排到这里。</p>
+    </aside>
 
-      <!-- 播放器 / 处理进度 -->
-      <main class="card stage">
-        <!-- 处理进度 -->
+    <!-- 后台：导入与处理进度。日常唱歌用不到，所以收进抽屉 -->
+    <aside id="adminPanel" class="drawer wide hidden">
+      <div class="drawer-head">
+        <strong>⚙️ 后台</strong>
+        <span class="drawer-spacer"></span>
+        <button id="adminClose" class="lyr-btn">关闭</button>
+      </div>
+
+      <div class="admin-sec">
+        <h4>添加歌曲</h4>
+        <div class="row">
+          <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接…" autocomplete="off" />
+          <button id="go" class="primary">开始制作</button>
+          <button id="plGo" title="粘贴歌单链接，一次把整个播放列表加入队列">🎵 歌单</button>
+          <button id="lcGo" class="hidden" title="从服务器上已有的媒体目录批量导入">📁 本地文件</button>
+        </div>
+
+        <div id="plPanel" class="pl-panel hidden">
+          <div class="pl-head">
+            <strong id="plTitle">播放列表</strong>
+            <span id="plCount" class="muted small"></span>
+            <span class="pl-spacer"></span>
+            <label class="pl-all"><input type="checkbox" id="plAll" /> 全选可导入</label>
+            <button id="plImport" class="lyr-btn primary">导入选中</button>
+            <button id="plClose" class="lyr-btn">关闭</button>
+          </div>
+          <p id="plHint" class="muted small"></p>
+          <ul id="plList" class="pl-list"></ul>
+        </div>
+
+        <div class="row options">
+          <label>
+            识别语言
+            <select id="language">
+              <option value="">自动检测</option>
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+              <option value="yue">粵語</option>
+            </select>
+          </label>
+          <label>
+            识别模型
+            <select id="model">
+              <option value="">默认</option>
+              <option value="tiny">tiny（最快）</option>
+              <option value="base">base</option>
+              <option value="small">small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3">large-v3（最准）</option>
+            </select>
+          </label>
+          <span class="hint">提示：请仅用于自有或授权 / 知识共享许可的内容。</span>
+        </div>
+      </div>
+
+      <div class="admin-sec">
+        <h4>处理进度 <span id="procCount" class="muted small"></span></h4>
+
         <div id="progressPanel" class="progress-panel hidden">
           <div class="progress-head">
             <img id="progThumb" class="thumb" alt="" />
@@ -103,90 +216,12 @@
           <p id="progError" class="error hidden"></p>
         </div>
 
-        <!-- 空状态 -->
-        <div id="emptyStage" class="empty-stage">
-          <div class="big-emoji">🎶</div>
-          <h3>选择或新建一首歌开始演唱</h3>
-          <p class="muted">处理完成后，这里会显示同步高亮的歌词与卡拉OK播放器。</p>
-        </div>
+        <ul id="procList" class="proc-list"></ul>
+        <p id="procEmpty" class="empty">没有正在处理的任务。</p>
+      </div>
+    </aside>
 
-        <!-- 卡拉OK 播放器 -->
-        <div id="player" class="player hidden">
-          <div class="player-head">
-            <div class="ph-left">
-              <h3 id="playerTitle"></h3>
-              <span id="lyricSource" class="badge hidden"></span>
-            </div>
-            <a id="sourceLink" class="muted small" target="_blank" rel="noreferrer">原始视频 ↗</a>
-          </div>
-
-          <div class="lyrics-tools">
-            <button id="editLyrics" class="lyr-btn hidden" title="识别不准时可逐行手动修改歌词">✏️ 编辑歌词</button>
-            <button id="searchLyrics" class="lyr-btn hidden" title="从歌词库搜索正确歌词并重新对齐（识别成拼音/英文时用）">🔍 搜歌词重对齐</button>
-            <div id="editBar" class="edit-bar hidden">
-              <span class="muted small">逐行修改文字，保存后自动重建逐字时间轴</span>
-              <button id="saveLyrics" class="lyr-btn primary">保存</button>
-              <button id="cancelLyrics" class="lyr-btn">取消</button>
-            </div>
-          </div>
-
-          <div id="lyricSearch" class="lyric-search hidden">
-            <div class="ls-bar">
-              <input id="lsQuery" type="text" placeholder="歌手 歌名，如：大壮 敬自己" autocomplete="off" />
-              <button id="lsGo" class="lyr-btn primary">搜索</button>
-              <button id="lsClose" class="lyr-btn">关闭</button>
-            </div>
-            <p id="lsHint" class="muted small">从 LRCLIB 歌词库搜索正确歌词，选一条即可重新对齐到人声（识别成拼音/英文时特别有用）。</p>
-            <ul id="lsResults" class="ls-results"></ul>
-          </div>
-
-          <div id="lyrics" class="lyrics"></div>
-
-          <div class="controls">
-            <button id="playBtn" class="round" title="播放/暂停">▶</button>
-            <span id="curTime" class="time">0:00</span>
-            <input id="seek" class="seek" type="range" min="0" max="1000" value="0" />
-            <span id="durTime" class="time">0:00</span>
-          </div>
-
-          <div class="mixer">
-            <label class="mix">
-              🎸 伴奏
-              <input id="instVol" type="range" min="0" max="100" value="100" />
-            </label>
-            <label class="mix">
-              🎙️ 导唱人声
-              <input id="vocalVol" type="range" min="0" max="100" value="0" />
-            </label>
-            <label class="mix">
-              🌫️ 混响
-              <select id="reverb">
-                <option value="none">干声</option>
-                <option value="room">小房间</option>
-                <option value="ktv" selected>KTV</option>
-                <option value="hall">大厅</option>
-                <option value="church">教堂</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="recorder">
-            <button id="recBtn" class="rec">🎤 开始录唱</button>
-            <span id="recStatus" class="muted small"></span>
-            <label class="mon" title="边唱边从耳机听到自己的声音"><input type="checkbox" id="monitor" /> 耳机监听</label>
-            <span class="hint">录唱会把伴奏与你的歌声合成保存；建议戴耳机以避免啸叫。</span>
-          </div>
-
-          <div class="rec-list-wrap hidden" id="recListWrap">
-            <h4>🎵 我的录音</h4>
-            <ul id="recList" class="rec-list"></ul>
-          </div>
-
-          <audio id="instAudio" preload="auto"></audio>
-          <audio id="vocalAudio" preload="auto"></audio>
-        </div>
-      </main>
-    </div>
+    <div id="scrim" class="scrim hidden"></div>
 
     <footer class="foot">
       <span>基于 audio-separator（UVR 模型） · whisperX · yt-dlp 构建</span>

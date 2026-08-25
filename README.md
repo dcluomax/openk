@@ -28,13 +28,18 @@
 
 ## 界面预览
 
-**点歌台曲库** —— 干净的歌名 / 歌手、按歌手分组、支持搜歌名或歌手：
+**点歌台** —— 首页就是一整墙做好的歌（封面 + 歌名 + 歌手），像 KTV 机器一样点歌、排队、连播：
 
 <p align="center">
-  <img src="docs/screenshots/songboard.png" alt="点歌台式曲库：按歌手分组、可搜索" width="360" />
+  <img src="docs/screenshots/songboard.png" alt="点歌台式曲库：封面墙、按歌手分组、可搜索" width="860" />
 </p>
 
-**处理过程实时可见** —— 下载 → 人声分离 → 歌词对齐，三步流水线带进度：
+- **搜索**：歌名、歌手，或**拼音首字母**（`pfzl` → 平凡之路）。按 `/` 直接聚焦搜索框。
+- **分类**：全部（按拼音排序）/ 歌手（先选人再选歌）/ 最新。
+- **已点歌曲**：点一首就排进队列，可**置顶**、删除、清空；一首唱完自动接下一首。队列存在浏览器本地，刷新不丢。
+- **后台（⚙️）**：添加链接、导入歌单、导入本地文件、查看处理进度都收在这里，唱歌时不碍事；有任务在跑时按钮上会显示数量角标。
+
+**处理过程实时可见**（在「⚙️ 后台」里）—— 下载 → 人声分离 → 歌词对齐，三步流水线带进度：
 
 <p align="center">
   <img src="docs/screenshots/processing.png" alt="三步处理流水线，实时进度" width="860" />
@@ -94,7 +99,10 @@ openk/
 │       ├── lyrics_sources.py # LRCLIB 查询 + VTT/SRT/LRC 解析 + 元数据清洗
 │       ├── lyrics.py         # 歌词来源编排（择优 + 逐词对齐）
 │       └── transcribe.py     # whisperX 强制对齐 / 识别 → lyrics.json / .lrc
-├── frontend/              # 纯静态卡拉OK播放器 (HTML/CSS/JS)
+├── frontend/              # 纯静态前端 (HTML/CSS/JS)，无构建步骤
+│   ├── index.html        # 点歌台 + 演唱页 + 已点/后台两个抽屉
+│   ├── app.js            # 曲库渲染、拼音首字母检索、已点队列、播放器与录唱
+│   └── styles.css
 ├── worker/                # 可选：远程算力 worker（跑在算力机上）
 ├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）/ make_cert.py（自签证书）
 ├── deploy/                # 部署模板：环境变量、nginx TLS 反代、macOS 开机自启

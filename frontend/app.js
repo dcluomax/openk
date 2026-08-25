@@ -105,7 +105,9 @@ const state = {
   editing: false,    // 歌词编辑态
   lyricsUrl: null,   // 当前歌词 json 地址（保存后重新拉取）
   currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
-  libMode: 'recent', // 点歌台视图：recent 最近 / artist 按歌手
+  libMode: 'all',    // 点歌台视图：all 全部 / artist 按歌手 / new 最新
+  artistPick: null,  // 「按歌手」里点进了哪位歌手
+  queue: [],         // 已点歌曲（存的是 job id，落 localStorage）
   audioGraph: null,  // Web Audio 图（混响/录制）
   recorder: null,
   recording: false,
@@ -298,101 +300,309 @@ async function onPickerImport() {
   }
 }
 
-/* ---------------- 曲库列表 ---------------- */
-let _listSig = '';
-async function refreshList(force = false) {
-  state.allJobs = await api.listJobs();
-  renderJobs(force);
+/* ---------------- 拼音首字母检索 ----------------
+ * KTV 点歌的习惯是敲首字母（「世界因你」→ SJYN）。这里不带字库：
+ * 用 pinyin 排序规则把汉字和 23 个「边界字」比大小，落在哪一格就是哪个字母。
+ * 边界字必须正好 23 个，和 PY_LETTERS 一一对应（拼音里没有 I / U / V 打头）。 */
+const PY_BOUNDS = ['阿', '八', '嚓', '哒', '蛾', '发', '噶', '哈', '击', '喀', '垃', '妈',
+                   '拿', '哦', '啪', '期', '然', '撒', '塌', '挖', '昔', '压', '匝'];
+const PY_LETTERS = 'ABCDEFGHJKLMNOPQRSTWXYZ';
+let _collator;
+function pyCollator() {
+  if (_collator === undefined) {
+    try {
+      const c = new Intl.Collator('zh-Hans-CN-u-co-pinyin');
+      // 探一下这个环境到底认不认拼音排序，不认就退化成「只按原文搜」。
+      _collator = c.compare('啊', '波') < 0 && c.compare('波', '啊') > 0 ? c : null;
+    } catch { _collator = null; }
+  }
+  return _collator;
 }
 
+function initialsOf(text) {
+  const c = pyCollator();
+  let out = '';
+  for (const ch of String(text || '')) {
+    if (/[a-zA-Z0-9]/.test(ch)) { out += ch.toUpperCase(); continue; }
+    if (!c || ch.charCodeAt(0) < 0x2e80) continue;   // 非汉字（标点等）直接跳过
+    for (let i = PY_BOUNDS.length - 1; i >= 0; i--) {
+      if (c.compare(ch, PY_BOUNDS[i]) >= 0) { out += PY_LETTERS[i]; break; }
+    }
+  }
+  return out;
+}
+
+/* ---------------- 曲库 ---------------- */
 const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
+let _browseSig = '';
+
+/** 检索用的派生字段算一次就缓存在任务对象上：428 首歌逐字比对 collator 并不便宜。 */
+function songInfo(j) {
+  if (!j._si) {
+    const title = j.track || j.title || '未命名';
+    const artist = j.artist || '';
+    j._si = {
+      title, artist,
+      hay: (title + ' ' + artist + ' ' + (j.title || '')).toLowerCase(),
+      py: initialsOf(title + artist),
+      letter: (initialsOf(artist || title)[0] || '#'),
+    };
+  }
+  return j._si;
+}
 
 function jobMatches(j, kw) {
   if (!kw) return true;
-  return [j.track, j.artist, j.title, j.url].filter(Boolean).join(' ').toLowerCase().includes(kw);
+  const si = songInfo(j);
+  return si.hay.includes(kw) || si.py.includes(kw.toUpperCase());
 }
 
-function makeJobItem(j) {
+async function refreshList(force = false) {
+  try {
+    const jobs = await api.listJobs();
+    // 后端按时间倒序返回；派生字段挂在旧对象上，能复用就复用，别白算拼音。
+    const prev = new Map(state.allJobs.map((j) => [j.id, j._si]));
+    jobs.forEach((j) => { const si = prev.get(j.id); if (si) j._si = si; });
+    state.allJobs = jobs;
+  } catch { return; }
+  renderBrowse(force);
+  renderProcessing();
+  renderQueue();
+}
+
+function doneJobs() { return state.allJobs.filter((j) => j.state === 'done'); }
+
+function songCard(j) {
+  const si = songInfo(j);
   const li = document.createElement('li');
-  li.className = 'job-item' + (j.id === state.currentJobId ? ' active' : '');
-  const recBadge = (j.recordings && j.recordings.length)
-    ? `<span class="rec-badge" title="已录唱">🎤${j.recordings.length}</span>` : '';
-  const retryBtn = j.state === 'error'
-    ? '<button class="retry" title="重试；若自动检测语言有误，先在上方选好语言再点此">↻</button>' : '';
-  const primary = j.track || j.title || j.url || '未命名';
-  const sub = j.state === 'done'
-    ? (j.artist || '')
-    : `${STATE_TEXT[j.state] || j.state} · ${j.progress || 0}%`;
+  li.className = 'song-card';
+  li.dataset.id = j.id;
+  if (state.queue.includes(j.id)) li.classList.add('queued');
+  const cover = j.thumbnail
+    ? `<img class="cover" src="${escapeHtml(j.thumbnail)}" alt="" loading="lazy"
+            onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'cover ph',textContent:'🎵'}))" />`
+    : '<div class="cover ph">🎵</div>';
   li.innerHTML = `
-    <span class="dot ${j.state}"></span>
-    <div class="jt">
-      <div class="name">${escapeHtml(primary)}</div>
-      <div class="st">${escapeHtml(sub) || (STATE_TEXT[j.state] || '')}</div>
+    ${cover}
+    <div class="sc-body">
+      <p class="sc-title" title="${escapeHtml(si.title)}">${escapeHtml(si.title)}</p>
+      <p class="sc-artist">${escapeHtml(si.artist || '未知歌手')}</p>
     </div>
-    ${recBadge}${retryBtn}
-    <button class="del" title="删除">✕</button>`;
-  li.querySelector('.jt').addEventListener('click', () => selectJob(j.id));
-  li.querySelector('.dot').addEventListener('click', () => selectJob(j.id));
-  const retryEl = li.querySelector('.retry');
-  if (retryEl) {
-    retryEl.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      try {
-        await api.retryJob(j.id, { language: $('#language').value || null });
-        selectJob(j.id); refreshList(true);
-      } catch (e) { alert(e.message || '重试失败'); }
-    });
-  }
-  li.querySelector('.del').addEventListener('click', async (ev) => {
-    ev.stopPropagation();
-    if (!confirm('删除该任务及其文件（包括录音）？')) return;
-    await api.deleteJob(j.id);
-    if (state.currentJobId === j.id) resetStage();
-    refreshList(true);
-  });
+    <div class="sc-actions">
+      <button class="sc-pick" data-act="pick">＋ 点歌</button>
+      <button class="sc-play" data-act="play" title="马上唱">▶</button>
+    </div>
+    ${j.duration ? `<span class="sc-dur">${fmt(j.duration)}</span>` : ''}
+    <span class="sc-flag">已点</span>`;
   return li;
 }
 
-function renderJobs(force = false) {
+function renderBrowse(force = false) {
   const kw = state.search.trim().toLowerCase();
-  const jobs = state.allJobs.filter((j) => jobMatches(j, kw));
+  let list = doneJobs();
+  if (kw) list = list.filter((j) => jobMatches(j, kw));
 
-  // 仅在数据真正变化时才重绘，避免定时刷新造成闪烁或打断点击。
-  const sig = JSON.stringify([kw, state.libMode,
-    jobs.map((j) => [j.id, j.state, j.progress, j.track, j.artist, j.title, j.recordings?.length || 0, j.id === state.currentJobId])]);
-  if (!force && sig === _listSig) return;
-  _listSig = sig;
+  const grid = $('#grid'), artistBox = $('#artistList'), letterBar = $('#letterBar');
+  const mode = kw ? 'all' : state.libMode;   // 搜索时不分组，直接给结果
 
-  const ul = $('#jobList');
-  ul.innerHTML = '';
-  const empty = $('#jobsEmpty');
-  if (state.allJobs.length === 0) {
-    empty.textContent = '还没有任务，粘贴链接开始吧。'; empty.classList.remove('hidden');
-  } else if (jobs.length === 0) {
-    empty.textContent = '未找到匹配的歌曲。'; empty.classList.remove('hidden');
-  } else {
-    empty.classList.add('hidden');
-  }
-
-  if (state.libMode === 'artist') {
-    // 按歌手分组（点歌台式浏览）
+  // 「歌手」页：先列歌手，点进去再看这位歌手的歌
+  if (mode === 'artist' && !state.artistPick) {
+    const sig = `A:${list.length}:${kw}`;
+    if (!force && sig === _browseSig) return;
+    _browseSig = sig;
+    grid.classList.add('hidden'); artistBox.classList.remove('hidden');
+    letterBar.classList.add('hidden');
     const groups = new Map();
-    for (const j of jobs) {
-      const key = (j.artist || '').trim() || '未知歌手';
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(j);
-    }
-    const names = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
-    for (const name of names) {
-      const head = document.createElement('li');
-      head.className = 'artist-group';
-      head.innerHTML = `<span class="ag-name">${escapeHtml(name)}</span><span class="ag-count">${groups.get(name).length} 首</span>`;
-      ul.appendChild(head);
-      for (const j of groups.get(name)) ul.appendChild(makeJobItem(j));
-    }
-  } else {
-    for (const j of jobs) ul.appendChild(makeJobItem(j));
+    list.forEach((j) => {
+      const a = songInfo(j).artist || '未知歌手';
+      if (!groups.has(a)) groups.set(a, []);
+      groups.get(a).push(j);
+    });
+    const names = [...groups.keys()].sort((a, b) =>
+      (pyCollator() || undefined) ? pyCollator().compare(a, b) : a.localeCompare(b));
+    artistBox.innerHTML = '';
+    names.forEach((n) => {
+      const li = document.createElement('li');
+      li.className = 'artist-chip';
+      li.dataset.artist = n;
+      li.innerHTML = `<span>${escapeHtml(n)}</span><em>${groups.get(n).length}</em>`;
+      artistBox.appendChild(li);
+    });
+    $('#browseCount').textContent = `${names.length} 位歌手 · ${list.length} 首`;
+    $('#browseEmpty').classList.toggle('hidden', names.length > 0);
+    $('#browseEmpty').textContent = '曲库还是空的，去「⚙️ 后台」添加歌曲。';
+    return;
   }
+
+  if (mode === 'artist' && state.artistPick) {
+    list = list.filter((j) => (songInfo(j).artist || '未知歌手') === state.artistPick);
+  }
+  if (mode === 'new') list = list.slice(0, 60);
+  else if (mode === 'all') {
+    const c = pyCollator();
+    list = [...list].sort((a, b) => {
+      const x = songInfo(a).title, y = songInfo(b).title;
+      return c ? c.compare(x, y) : x.localeCompare(y);
+    });
+  }
+
+  const sig = `${mode}:${state.artistPick || ''}:${kw}:${list.map((j) => j.id).join(',')}:${state.queue.join(',')}`;
+  if (!force && sig === _browseSig) return;
+  _browseSig = sig;
+
+  artistBox.classList.add('hidden');
+  grid.classList.remove('hidden');
+  grid.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  list.forEach((j) => frag.appendChild(songCard(j)));
+  grid.appendChild(frag);
+
+  $('#browseCount').textContent = state.artistPick
+    ? `${state.artistPick} · ${list.length} 首（点「歌手」返回）`
+    : `${list.length} 首`;
+  $('#browseEmpty').classList.toggle('hidden', list.length > 0);
+  $('#browseEmpty').textContent = kw
+    ? `没搜到「${state.search.trim()}」。可以试试歌名首字母，比如 pyzy。`
+    : '曲库还是空的，去「⚙️ 后台」添加歌曲。';
+}
+
+/* ---------------- 已点歌曲（KTV 的核心交互） ---------------- */
+const QUEUE_KEY = 'openk.queue';
+
+function saveQueue() { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue)); } catch {} }
+function loadQueue() {
+  try { state.queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').filter(Boolean); }
+  catch { state.queue = []; }
+}
+
+function jobById(id) { return state.allJobs.find((j) => j.id === id); }
+
+function addToQueue(id, playNow = false) {
+  if (playNow) {
+    state.queue = state.queue.filter((q) => q !== id);
+    state.queue.unshift(id);
+    saveQueue(); renderQueue(); renderBrowse(true);
+    playFromQueue();
+    return;
+  }
+  if (state.queue.includes(id)) { toast('这首已经在已点列表里了'); return; }
+  state.queue.push(id);
+  saveQueue(); renderQueue(); renderBrowse(true);
+  // 没在唱歌就直接开唱，符合「点了就响」的预期
+  if (!state.currentJobId) playFromQueue();
+  else toast(`已点：${songInfo(jobById(id) || {}).title || ''}（第 ${state.queue.length} 位）`);
+}
+
+function removeFromQueue(id) {
+  state.queue = state.queue.filter((q) => q !== id);
+  saveQueue(); renderQueue(); renderBrowse(true);
+}
+
+function topQueue(id) {
+  state.queue = [id, ...state.queue.filter((q) => q !== id)];
+  saveQueue(); renderQueue();
+}
+
+/** 取出队首开唱。当前这首会从队列里移除——KTV 机器就是这个行为。 */
+function playFromQueue() {
+  const id = state.queue.shift();
+  saveQueue(); renderQueue(); renderBrowse(true);
+  if (!id) { showBrowse(); return; }
+  selectJob(id);
+}
+
+function renderQueue() {
+  const ul = $('#queueList');
+  ul.innerHTML = '';
+  state.queue.forEach((id, i) => {
+    const j = jobById(id);
+    const si = j ? songInfo(j) : { title: '（已删除）', artist: '' };
+    const li = document.createElement('li');
+    li.className = 'q-item';
+    li.dataset.id = id;
+    li.innerHTML = `
+      <span class="q-no">${i + 1}</span>
+      <div class="q-body">
+        <p class="q-title">${escapeHtml(si.title)}</p>
+        <p class="q-artist">${escapeHtml(si.artist || '未知歌手')}</p>
+      </div>
+      <button class="lyr-btn" data-act="top" title="置顶，下一首就唱它">⇧ 置顶</button>
+      <button class="lyr-btn" data-act="del" title="从已点里删掉">✕</button>`;
+    ul.appendChild(li);
+  });
+  $('#queueCount').textContent = String(state.queue.length);
+  $('#queueEmpty').classList.toggle('hidden', state.queue.length > 0);
+  $('#queueHint').textContent = state.queue.length ? '唱完自动接下一首' : '';
+}
+
+/* ---------------- 后台：处理中的任务 ---------------- */
+function renderProcessing() {
+  const pending = state.allJobs.filter((j) => j.state !== 'done');
+  const ul = $('#procList');
+  ul.innerHTML = '';
+  pending.slice(0, 50).forEach((j) => {
+    const li = document.createElement('li');
+    li.className = `proc-item ${j.state}`;
+    li.dataset.id = j.id;
+    const pct = Math.round((j.progress || 0) * 100);
+    li.innerHTML = `
+      <div class="p-body">
+        <p class="p-title">${escapeHtml(j.title || j.url || j.id)}</p>
+        <p class="p-msg muted small">${STATE_TEXT[j.state] || j.state} · ${escapeHtml(j.message || '')}</p>
+      </div>
+      ${j.state === 'error'
+        ? '<button class="lyr-btn" data-act="retry">重试</button>'
+        : `<span class="p-pct">${pct}%</span>`}`;
+    ul.appendChild(li);
+  });
+  $('#procEmpty').classList.toggle('hidden', pending.length > 0);
+  const running = pending.filter((j) => j.state === 'running').length;
+  $('#procCount').textContent = pending.length
+    ? `（${pending.length} 个待处理，${running} 个进行中）` : '';
+  const badge = $('#adminBadge');
+  badge.textContent = String(pending.length);
+  badge.classList.toggle('hidden', pending.length === 0);
+}
+
+/* ---------------- 视图切换 ---------------- */
+function showBrowse() {
+  state.currentJobId = null;
+  stopPolling();
+  stopAudio();
+  $('#stage').classList.add('hidden');
+  $('#browse').classList.remove('hidden');
+  renderBrowse(true);
+}
+
+function showStage() {
+  $('#browse').classList.add('hidden');
+  $('#stage').classList.remove('hidden');
+}
+
+function openDrawer(which) {
+  const q = which === 'queue';
+  $('#queuePanel').classList.toggle('hidden', !q);
+  $('#adminPanel').classList.toggle('hidden', q);
+  $('#scrim').classList.remove('hidden');
+}
+function closeDrawers() {
+  $('#queuePanel').classList.add('hidden');
+  $('#adminPanel').classList.add('hidden');
+  $('#scrim').classList.add('hidden');
+}
+
+let _toastTimer;
+function toast(msg) {
+  let el = $('#toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast'; el.className = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
 }
 
 function escapeHtml(s) {
@@ -404,24 +614,17 @@ function escapeHtml(s) {
 async function selectJob(id) {
   state.currentJobId = id;
   stopPolling();
-  refreshList();
   let job;
-  try { job = await api.getJob(id); } catch { resetStage(); return; }
+  try { job = await api.getJob(id); } catch { showBrowse(); return; }
   if (job.state === 'done') {
+    showStage();
     showPlayer(job);
   } else {
+    // 还没做好的歌不该占着舞台，进度归后台管
+    openDrawer('admin');
     showProgress(job);
     startPolling(id);
   }
-}
-
-function resetStage() {
-  state.currentJobId = null;
-  stopPolling();
-  $('#player').classList.add('hidden');
-  $('#progressPanel').classList.add('hidden');
-  $('#emptyStage').classList.remove('hidden');
-  stopAudio();
 }
 
 /* ---------------- 进度轮询 ---------------- */
@@ -439,8 +642,6 @@ function startPolling(id) {
 function stopPolling() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
 
 function showProgress(job) {
-  $('#emptyStage').classList.add('hidden');
-  $('#player').classList.add('hidden');
   $('#progressPanel').classList.remove('hidden');
   updateProgressUI(job);
 }
@@ -477,11 +678,11 @@ const inst = $('#instAudio');
 const vocal = $('#vocalAudio');
 
 async function showPlayer(job) {
-  $('#emptyStage').classList.add('hidden');
   $('#progressPanel').classList.add('hidden');
   $('#player').classList.remove('hidden');
 
-  $('#playerTitle').textContent = job.title || '未命名';
+  const si = songInfo(job);
+  $('#playerTitle').textContent = si.artist ? `${si.title} — ${si.artist}` : (si.title || '未命名');
   const link = $('#sourceLink');
   if (job.webpage_url) { link.href = job.webpage_url; link.style.display = ''; }
   else { link.style.display = 'none'; }
@@ -1095,6 +1296,62 @@ function bindPlayer() {
 
 /* ---------------- 初始化 ---------------- */
 function init() {
+  loadQueue();
+
+  /* 顶部：搜索 / 已点 / 后台 */
+  const onSearch = () => {
+    state.search = $('#search').value;
+    $('#searchClear').classList.toggle('hidden', !state.search);
+    renderBrowse(true);
+  };
+  $('#search').addEventListener('input', onSearch);
+  $('#searchClear').addEventListener('click', () => { $('#search').value = ''; onSearch(); $('#search').focus(); });
+  $('#homeBtn').addEventListener('click', () => { closeDrawers(); showBrowse(); });
+  $('#backBtn').addEventListener('click', showBrowse);
+  $('#queueBtn').addEventListener('click', () => openDrawer('queue'));
+  $('#adminBtn').addEventListener('click', () => openDrawer('admin'));
+  $('#queueClose').addEventListener('click', closeDrawers);
+  $('#adminClose').addEventListener('click', closeDrawers);
+  $('#scrim').addEventListener('click', closeDrawers);
+  $('#queueClear').addEventListener('click', () => {
+    if (!state.queue.length || !confirm('清空已点歌曲？')) return;
+    state.queue = []; saveQueue(); renderQueue(); renderBrowse(true);
+  });
+
+  /* 分类页签 */
+  document.querySelectorAll('.tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.libMode = btn.dataset.tab;
+      state.artistPick = null;
+      document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b === btn));
+      renderBrowse(true);
+    });
+  });
+
+  /* 曲库网格：整卡点一下就是点歌，右下角 ▶ 是「插队马上唱」 */
+  $('#grid').addEventListener('click', (e) => {
+    const card = e.target.closest('.song-card');
+    if (!card) return;
+    addToQueue(card.dataset.id, e.target.dataset.act === 'play');
+  });
+  $('#artistList').addEventListener('click', (e) => {
+    const chip = e.target.closest('.artist-chip');
+    if (!chip) return;
+    state.artistPick = chip.dataset.artist;
+    renderBrowse(true);
+  });
+
+  /* 已点列表：置顶 / 删除 / 直接唱 */
+  $('#queueList').addEventListener('click', (e) => {
+    const li = e.target.closest('.q-item');
+    if (!li) return;
+    const act = e.target.dataset.act;
+    if (act === 'top') topQueue(li.dataset.id);
+    else if (act === 'del') removeFromQueue(li.dataset.id);
+    else { closeDrawers(); addToQueue(li.dataset.id, true); }
+  });
+
+  /* 后台：添加歌曲 */
   $('#go').addEventListener('click', onCreate);
   $('#url').addEventListener('keydown', (e) => { if (e.key === 'Enter') onCreate(); });
   // 换了链接就重新问一次「要不要批量导入」
@@ -1110,16 +1367,28 @@ function init() {
   $('#plList').addEventListener('change', (e) => {
     if (e.target.classList.contains('pl-pick')) syncPlAll();
   });
-  $('#search').addEventListener('input', (e) => { state.search = e.target.value; renderJobs(true); });
-  document.querySelectorAll('.lib-mode').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      state.libMode = btn.dataset.mode;
-      document.querySelectorAll('.lib-mode').forEach((b) => b.classList.toggle('active', b === btn));
-      renderJobs(true);
-    });
+  $('#procList').addEventListener('click', async (e) => {
+    const li = e.target.closest('.proc-item');
+    if (!li) return;
+    if (e.target.dataset.act === 'retry') {
+      try { await api.retryJob(li.dataset.id); await refreshList(true); }
+      catch (err) { alert(err.message || '重试失败'); }
+    } else {
+      showProgress(state.allJobs.find((j) => j.id === li.dataset.id) || {});
+      startPolling(li.dataset.id);
+    }
   });
+
   bindPlayer();
-  refreshList();
+  // 一首唱完自动接下一首，这是 KTV 机器最基本的行为
+  inst.addEventListener('ended', () => { setTimeout(playFromQueue, 800); });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeDrawers();
+    if (e.key === '/' && document.activeElement !== $('#search')) { e.preventDefault(); $('#search').focus(); }
+  });
+
+  refreshList(true);
   // 本地导入默认关闭（部署者不配白名单目录就当没这功能），所以入口按服务端答复决定显隐。
   api.localStatus().then((s) => {
     if (s.enabled) $('#lcGo').classList.remove('hidden');

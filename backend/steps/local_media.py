@@ -281,7 +281,11 @@ def _extract_audio(src: Path, out_dir: Path, on_progress: ProgressCb) -> Path:
 
 
 def _grab_thumbnail(src: Path, out_dir: Path, duration: Optional[float]) -> Optional[str]:
-    """截一帧当封面。纯装饰，失败就算了。"""
+    """截一帧当封面。纯装饰，失败就算了。
+
+    返回相对作业目录的路径（而不是绝对路径）：封面要经 ``/media/{id}/...``
+    暴露给浏览器，存绝对路径的话前端拿到的是容器内路径，根本加载不了。
+    """
     dst = out_dir / "thumb.jpg"
     seek = max(1.0, min(10.0, (duration or 20) * 0.1))
     try:
@@ -290,7 +294,7 @@ def _grab_thumbnail(src: Path, out_dir: Path, duration: Optional[float]) -> Opti
              "-frames:v", "1", "-vf", "scale=480:-1", str(dst)],
             capture_output=True, text=True, errors="replace", timeout=60, check=False)
         if res.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
-            return str(dst)
+            return f"{out_dir.name}/{dst.name}"
     except (OSError, subprocess.SubprocessError):
         pass
     return None
