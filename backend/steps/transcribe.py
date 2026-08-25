@@ -9,6 +9,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -419,7 +420,14 @@ def transcribe_local(
     on_progress: ProgressCb = None,
 ) -> Dict[str, Any]:
     """在本机执行识别（worker 进程直接调用这个函数）。"""
-    if shutil.which("whisperx") is None:
+    # 定位 whisperx：优先 PATH；venv 未激活时（如 launchd 直接用 .venv/bin/python
+    # 拉起 worker，PATH 里并没有 venv/bin）退回到解释器同目录找。
+    # 这与 separate.py 定位 audio-separator 的做法保持一致。
+    whisperx_cli = shutil.which("whisperx")
+    if not whisperx_cli:
+        cand = Path(sys.executable).parent / "whisperx"
+        whisperx_cli = str(cand) if cand.exists() else None
+    if not whisperx_cli:
         raise RuntimeError(
             "未找到 whisperx，请先安装 ML 依赖：\n"
             "  pip install -r requirements-ml.txt"
@@ -436,7 +444,7 @@ def transcribe_local(
         on_progress(5, "正在加载语音识别模型…")
 
     cmd = [
-        "whisperx",
+        whisperx_cli,
         str(audio_path),
         "--model", model,
         "--output_format", "json",
@@ -452,7 +460,7 @@ def transcribe_local(
     def _run(extra_args: List[str]) -> tuple[int, str]:
         proc = subprocess.Popen(
             cmd + extra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=config.ca_env(),
+            text=True, errors="replace", bufsize=1, env=config.ca_env(),
         )
         assert proc.stdout is not None
         last = ""
