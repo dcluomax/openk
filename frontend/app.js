@@ -107,6 +107,9 @@ const state = {
   currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
   libMode: 'all',    // 点歌台视图：all 全部 / artist 按歌手 / new 最新
   artistPick: null,  // 「按歌手」里点进了哪位歌手
+  view: 'list',      // 曲库呈现：list 文字列表（默认，找歌快）/ grid 封面墙
+  lang: '',          // 语种筛选，空串表示全部
+  singMode: 'inst',  // 伴唱 inst / 原唱 orig
   queue: [],         // 已点歌曲（存的是 job id，落 localStorage）
   audioGraph: null,  // Web Audio 图（混响/录制）
   recorder: null,
@@ -336,6 +339,25 @@ function initialsOf(text) {
 const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
 let _browseSig = '';
 
+/* 语种：曲库里的标题大多自带 (國語)/(粵語)/(日語) 这类标记，直接拿来用，
+ * 比让 whisper 猜语言可靠得多（它把不少中文歌识别成了 en）。认不出就归「其他」。 */
+const LANG_TAGS = [
+  [/粤语|粵語|廣東話|广东话|cantonese/i, '粤语'],
+  [/国语|國語|普通话|普通話|华语|華語|mandarin/i, '国语'],
+  [/日语|日語|japanese|j-?pop/i, '日语'],
+  [/韩语|韓語|korean|k-?pop/i, '韩语'],
+  [/闽南|閩南|台语|台語|hokkien/i, '闽南语'],
+];
+function guessLang(j) {
+  const raw = j.title || '';
+  for (const [re, name] of LANG_TAGS) if (re.test(raw)) return name;
+  // 没有标记时用字符构成兜底：整条标题没有汉字就当英文歌
+  const cjk = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
+  if (cjk === 0 && /[a-zA-Z]/.test(raw)) return '英语';
+  if (cjk > 0) return '国语';
+  return '其他';
+}
+
 /** 检索用的派生字段算一次就缓存在任务对象上：428 首歌逐字比对 collator 并不便宜。 */
 function songInfo(j) {
   if (!j._si) {
@@ -343,8 +365,13 @@ function songInfo(j) {
     const artist = j.artist || '';
     j._si = {
       title, artist,
+      lang: guessLang(j),
+      chars: (title.match(/[\u4e00-\u9fff]/g) || []).length,   // 字数检索用
       hay: (title + ' ' + artist + ' ' + (j.title || '')).toLowerCase(),
-      py: initialsOf(title + artist),
+      // 首字母只取汉字部分：像「A-Lin 有一種悲傷」这种混排，用户敲的是
+      // yyzbs 而不是 alinyyzbs，把 ASCII 混进来反而搜不到。
+      pyTitle: initialsOf(title.replace(/[^\u2e80-\u9fff]/g, '')),
+      pyArtist: initialsOf(artist.replace(/[^\u2e80-\u9fff]/g, '')),
       letter: (initialsOf(artist || title)[0] || '#'),
     };
   }
@@ -354,7 +381,11 @@ function songInfo(j) {
 function jobMatches(j, kw) {
   if (!kw) return true;
   const si = songInfo(j);
-  return si.hay.includes(kw) || si.py.includes(kw.toUpperCase());
+  if (si.hay.includes(kw)) return true;
+  // 首字母必须从头匹配。用子串会串味：搜 dx（稻香）会把「淚的小雨」
+  // LDXY 也捞出来，曲库一大就全是噪声。
+  const up = kw.toUpperCase();
+  return si.pyTitle.startsWith(up) || si.pyArtist.startsWith(up);
 }
 
 async function refreshList(force = false) {
@@ -397,12 +428,53 @@ function songCard(j) {
   return li;
 }
 
+function songRow(j, idx) {
+  const si = songInfo(j);
+  const li = document.createElement('li');
+  li.className = 'song-row';
+  li.dataset.id = j.id;
+  if (state.queue.includes(j.id)) li.classList.add('queued');
+  li.innerHTML = `
+    <span class="sr-no">${idx + 1}</span>
+    <span class="sr-title">${escapeHtml(si.title)}</span>
+    <span class="sr-artist">${escapeHtml(si.artist || '未知歌手')}</span>
+    <span class="sr-lang">${escapeHtml(si.lang)}</span>
+    <span class="sr-dur">${j.duration ? fmt(j.duration) : ''}</span>
+    <button class="sr-pick" data-act="pick">点歌</button>`;
+  return li;
+}
+
+/** 语种筛选条：一屏之内就能把 400 多首按语言切开，比进二级菜单快。 */
+function renderLangBar(all) {
+  const bar = $('#langBar');
+  const counts = new Map();
+  all.forEach((j) => {
+    const l = songInfo(j).lang;
+    counts.set(l, (counts.get(l) || 0) + 1);
+  });
+  const names = [...counts.entries()].sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+  const sig = names.join(',') + '|' + state.lang;
+  if (bar.dataset.sig === sig) return;
+  bar.dataset.sig = sig;
+  bar.innerHTML = '';
+  [['', '全部语种'], ...names.map((n) => [n, `${n} ${counts.get(n)}`])].forEach(([v, label]) => {
+    const b = document.createElement('button');
+    b.className = 'lang-btn' + (state.lang === v ? ' active' : '');
+    b.dataset.lang = v;
+    b.textContent = label;
+    bar.appendChild(b);
+  });
+}
+
 function renderBrowse(force = false) {
   const kw = state.search.trim().toLowerCase();
-  let list = doneJobs();
+  const all = doneJobs();
+  renderLangBar(all);
+  let list = all;
+  if (state.lang) list = list.filter((j) => songInfo(j).lang === state.lang);
   if (kw) list = list.filter((j) => jobMatches(j, kw));
 
-  const grid = $('#grid'), artistBox = $('#artistList'), letterBar = $('#letterBar');
+  const grid = $('#grid'), artistBox = $('#artistList'), rows = $('#songList');
   const mode = kw ? 'all' : state.libMode;   // 搜索时不分组，直接给结果
 
   // 「歌手」页：先列歌手，点进去再看这位歌手的歌
@@ -410,8 +482,8 @@ function renderBrowse(force = false) {
     const sig = `A:${list.length}:${kw}`;
     if (!force && sig === _browseSig) return;
     _browseSig = sig;
-    grid.classList.add('hidden'); artistBox.classList.remove('hidden');
-    letterBar.classList.add('hidden');
+    grid.classList.add('hidden'); rows.classList.add('hidden');
+    artistBox.classList.remove('hidden');
     const groups = new Map();
     list.forEach((j) => {
       const a = songInfo(j).artist || '未知歌手';
@@ -446,16 +518,21 @@ function renderBrowse(force = false) {
     });
   }
 
-  const sig = `${mode}:${state.artistPick || ''}:${kw}:${list.map((j) => j.id).join(',')}:${state.queue.join(',')}`;
+  const sig = `${mode}:${state.view}:${state.lang}:${state.artistPick || ''}:${kw}:${list.map((j) => j.id).join(',')}:${state.queue.join(',')}`;
   if (!force && sig === _browseSig) return;
   _browseSig = sig;
 
   artistBox.classList.add('hidden');
-  grid.classList.remove('hidden');
-  grid.innerHTML = '';
+  // 默认走高密度文字列表：一屏十几首、扫一眼就能找到，比封面墙翻半天快。
+  // 封面墙留作可选视图（曲库小、或者想按 MV 画面认歌的时候好用）。
+  const useGrid = state.view === 'grid';
+  grid.classList.toggle('hidden', !useGrid);
+  rows.classList.toggle('hidden', useGrid);
+  const box = useGrid ? grid : rows;
+  box.innerHTML = '';
   const frag = document.createDocumentFragment();
-  list.forEach((j) => frag.appendChild(songCard(j)));
-  grid.appendChild(frag);
+  list.forEach((j, i) => frag.appendChild(useGrid ? songCard(j) : songRow(j, i)));
+  box.appendChild(frag);
 
   $('#browseCount').textContent = state.artistPick
     ? `${state.artistPick} · ${list.length} 首（点「歌手」返回）`
@@ -503,12 +580,15 @@ function topQueue(id) {
   saveQueue(); renderQueue();
 }
 
-/** 取出队首开唱。当前这首会从队列里移除——KTV 机器就是这个行为。 */
-function playFromQueue() {
+/** 取出队首开唱。当前这首会从队列里移除——KTV 机器就是这个行为。
+ *
+ *  keepView：自动接下一首时用。别人正在翻歌选下一首，结果上一首唱完了
+ *  界面自己跳走，很烦人；所以只有用户主动点歌 / 切歌时才切到歌词页。 */
+function playFromQueue(keepView = false) {
   const id = state.queue.shift();
   saveQueue(); renderQueue(); renderBrowse(true);
-  if (!id) { showBrowse(); return; }
-  selectJob(id);
+  if (!id) { endPlayback(); return; }   // 队列空了才真正停下来
+  selectJob(id, keepView);
 }
 
 function renderQueue() {
@@ -531,6 +611,7 @@ function renderQueue() {
     ul.appendChild(li);
   });
   $('#queueCount').textContent = String(state.queue.length);
+  $('#nbQueueCount').textContent = String(state.queue.length);
   $('#queueEmpty').classList.toggle('hidden', state.queue.length > 0);
   $('#queueHint').textContent = state.queue.length ? '唱完自动接下一首' : '';
 }
@@ -565,10 +646,9 @@ function renderProcessing() {
 }
 
 /* ---------------- 视图切换 ---------------- */
+/** 回到曲库。注意**不停音乐**——点歌台最核心的一条：
+ *  别人在唱的时候，其他人得能继续翻歌、继续点。 */
 function showBrowse() {
-  state.currentJobId = null;
-  stopPolling();
-  stopAudio();
   $('#stage').classList.add('hidden');
   $('#browse').classList.remove('hidden');
   renderBrowse(true);
@@ -577,6 +657,44 @@ function showBrowse() {
 function showStage() {
   $('#browse').classList.add('hidden');
   $('#stage').classList.remove('hidden');
+}
+
+/** 彻底停止播放（只有清空队列 / 没有下一首时才走这里）。 */
+function endPlayback() {
+  state.currentJobId = null;
+  stopPolling();
+  stopAudio();
+  renderNowBar();
+  showBrowse();
+}
+
+/* ---------------- 常驻控制条 ---------------- */
+function renderNowBar() {
+  const bar = $('#nowbar');
+  const j = state.currentJobId ? jobById(state.currentJobId) : null;
+  if (!j) { bar.classList.add('hidden'); document.body.classList.remove('has-nowbar'); return; }
+  const si = songInfo(j);
+  bar.classList.remove('hidden');
+  document.body.classList.add('has-nowbar');
+  const cover = $('#nbCover');
+  if (j.thumbnail) { cover.src = j.thumbnail; cover.classList.remove('hidden'); }
+  else cover.classList.add('hidden');
+  $('#nbTitle').textContent = si.title;
+  $('#nbArtist').textContent = si.artist || '未知歌手';
+  $('#nbQueueCount').textContent = String(state.queue.length);
+  $('#nbPlay').textContent = inst.paused ? '▶' : '⏸';
+}
+
+/** 原唱 / 伴唱切换。KTV 里默认永远是伴唱——原唱是拿来学的，不是拿来唱的。 */
+function setSingMode(mode) {
+  state.singMode = mode;
+  prefs.singMode = mode;
+  savePrefs();
+  $('#modeInst').classList.toggle('active', mode === 'inst');
+  $('#modeOrig').classList.toggle('active', mode === 'orig');
+  // 原唱模式下把导唱人声推满，伴唱模式下压到 0
+  $('#vocalVol').value = mode === 'orig' ? 100 : 0;
+  applyVolumes();
 }
 
 function openDrawer(which) {
@@ -611,13 +729,13 @@ function escapeHtml(s) {
 }
 
 /* ---------------- 选择任务 ---------------- */
-async function selectJob(id) {
+async function selectJob(id, keepView = false) {
   state.currentJobId = id;
   stopPolling();
   let job;
-  try { job = await api.getJob(id); } catch { showBrowse(); return; }
+  try { job = await api.getJob(id); } catch { endPlayback(); return; }
   if (job.state === 'done') {
-    showStage();
+    if (!keepView) showStage();
     showPlayer(job);
   } else {
     // 还没做好的歌不该占着舞台，进度归后台管
@@ -687,8 +805,8 @@ async function showPlayer(job) {
   if (job.webpage_url) { link.href = job.webpage_url; link.style.display = ''; }
   else { link.style.display = 'none'; }
 
-  // 载入音轨
-  stopAudio();
+  // 载入音轨（换歌不掉麦）
+  stopAudio(true);
   inst.src = job.media?.instrumental || '';
   if (job.media?.vocals) {
     vocal.src = job.media.vocals;
@@ -698,6 +816,11 @@ async function showPlayer(job) {
     document.querySelector('label.mix:nth-child(2)').style.display = 'none';
   }
   applyVolumes();
+
+  // 开唱先把麦克风接上（点歌那一下就是用户手势，此时申请授权才会被允许）
+  autoEnableMic();
+  setSingMode(state.singMode);
+  renderNowBar();
 
   // 录音状态重置 + 载入该歌的历史录音
   $('#recStatus').textContent = '';
@@ -949,6 +1072,20 @@ const REVERB_PRESETS = {
 // 只作用于监听支路，不影响录音总线的电平，避免录音文件削幅。
 const MONITOR_GAIN = 1.8;
 
+/* ---------- 用户偏好（存浏览器本地，换台设备互不影响） ---------- */
+const PREF_KEY = 'openk.prefs';
+const PREF_DEFAULTS = {
+  micMonitor: true,   // 默认把麦克风外放——真正的 KTV 就是插上麦就有声
+  micVol: 80,
+  reverb: 'ktv',
+  singMode: 'inst',   // KTV 默认伴唱
+};
+const prefs = (() => {
+  try { return { ...PREF_DEFAULTS, ...JSON.parse(localStorage.getItem(PREF_KEY) || '{}') }; }
+  catch { return { ...PREF_DEFAULTS }; }
+})();
+function savePrefs() { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} }
+
 function makeIR(actx, seconds, decay) {
   const rate = actx.sampleRate;
   const len = Math.max(1, Math.floor(rate * seconds));
@@ -1042,10 +1179,15 @@ function seekTo(t) {
   if (hasVocal()) vocal.currentTime = t;
 }
 
-function stopAudio() {
+function stopAudio(keepMic = false) {
   if (state.recording) stopRecording();
-  $('#monitor').checked = false;
-  cleanupMic();
+  // 连唱下一首时保留麦克风：每首歌都重新申请一次授权、重建音频图，
+  // 中间会有一两秒没声音，唱的人会以为麦克风坏了。
+  if (!keepMic) {
+    $('#monitor').checked = false;
+    cleanupMic();
+    micHint('');
+  }
   try { inst.pause(); vocal.pause(); } catch {}
   inst.removeAttribute('src'); vocal.removeAttribute('src');
   inst.load(); vocal.load();
@@ -1081,11 +1223,11 @@ function micUnavailableReason() {
 }
 
 // 建立麦克风支路（监听/录音共用，仅建一次）。需在用户手势内调用以取得授权。
-async function ensureMic() {
+async function ensureMic(quiet = false) {
   const g = ensureAudioGraph();
   if (g.mic) return g;
   const why = micUnavailableReason();
-  if (why) { alert(why); throw new Error('no mic'); }
+  if (why) { if (quiet) { micHint(why.split('\n')[0]); } else { alert(why); } throw new Error('no mic'); }
   if (g.actx.state === 'suspended') await g.actx.resume();
   let stream;
   try {
@@ -1096,7 +1238,12 @@ async function ensureMic() {
       // 前提是戴耳机（伴奏走耳机、不串入麦克风），所以本就不需要回声消除。
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
-  } catch (e) { alert('无法获取麦克风权限：' + (e.message || e)); throw e; }
+  } catch (e) {
+    const msg = '无法获取麦克风权限：' + (e.message || e);
+    if (quiet) micHint('麦克风未授权，外放已关闭（点上面的复选框可重试）');
+    else alert(msg);
+    throw e;
+  }
   state.micStream = stream;
 
   // 麦克风支路：始终进「录音总线」；勾选“耳机监听”后经 monitorGain 进扬声器（建议戴耳机防啸叫）。
@@ -1108,18 +1255,50 @@ async function ensureMic() {
   const micWet = g.actx.createGain();
   const monitorGain = g.actx.createGain();
   monitorGain.gain.value = $('#monitor').checked ? MONITOR_GAIN : 0;
+  // 外放时麦克风必然会拾到音箱里的声音，形成正反馈。限幅器压不住成因，但能
+  // 把啸叫锁在「难听」而不是「刺耳到伤耳朵」的范围内，是外放的必要保险。
+  const limiter = g.actx.createDynamicsCompressor();
+  limiter.threshold.value = -12;
+  limiter.knee.value = 0;
+  limiter.ratio.value = 20;
+  limiter.attack.value = 0.003;
+  limiter.release.value = 0.15;
 
   micSrc.connect(micGain);
   micGain.connect(micDry); micDry.connect(g.recordBus);
   micGain.connect(micSend); micSend.connect(micConv); micConv.connect(micWet); micWet.connect(g.recordBus);
-  micDry.connect(monitorGain); micWet.connect(monitorGain); monitorGain.connect(g.speakerBus);
+  micDry.connect(monitorGain); micWet.connect(monitorGain);
+  monitorGain.connect(limiter); limiter.connect(g.speakerBus);
 
   g.mic = { micSrc, micGain, micDry, micSend, micConv, micWet };
   g.monitorGain = monitorGain;
+  g.limiter = limiter;
+  micGain.gain.value = prefs.micVol / 100;
   const p = REVERB_PRESETS[$('#reverb').value] || REVERB_PRESETS.none;
   micConv.buffer = makeIR(g.actx, p.seconds, p.decay);
   micWet.gain.value = p.wet; micSend.gain.value = p.send;
   return g;
+}
+
+function micHint(msg) {
+  const el = $('#micHint');
+  if (el) el.textContent = msg || '';
+}
+
+/** 开唱时按偏好自动把麦克风外放接上。
+ *  必须在用户手势（点播放 / 点歌）之后调用，否则浏览器不给授权。 */
+async function autoEnableMic() {
+  if (!prefs.micMonitor) return;
+  const box = $('#monitor');
+  if (!box) return;
+  box.checked = true;
+  try {
+    const g = await ensureMic(true);          // quiet：失败不弹窗，免得打断唱歌
+    g.monitorGain.gain.value = MONITOR_GAIN;
+    micHint('麦克风已接通；若啸叫请调低麦克风音量或让麦远离音箱');
+  } catch {
+    box.checked = false;                       // 授权失败就老实关掉，但保留偏好，下首歌再试
+  }
 }
 
 // 仅在既不监听也不录音时释放麦克风。
@@ -1265,7 +1444,12 @@ function bindPlayer() {
 
   $('#instVol').addEventListener('input', applyVolumes);
   $('#vocalVol').addEventListener('input', applyVolumes);
-  $('#reverb').addEventListener('change', () => setReverb($('#reverb').value));
+  $('#reverb').value = prefs.reverb;
+  $('#reverb').addEventListener('change', () => {
+    prefs.reverb = $('#reverb').value;
+    savePrefs();
+    setReverb(prefs.reverb);
+  });
   $('#editLyrics').addEventListener('click', enterLyricsEdit);
   $('#saveLyrics').addEventListener('click', saveLyricsEdit);
   $('#cancelLyrics').addEventListener('click', exitLyricsEdit);
@@ -1274,8 +1458,20 @@ function bindPlayer() {
   $('#lsClose').addEventListener('click', () => toggleLyricSearch(false));
   $('#lsQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLyricSearch(); });
   $('#recBtn').addEventListener('click', () => (state.recording ? stopRecording() : startRecording()));
+  $('#micVol').value = prefs.micVol;
+  $('#micVol').addEventListener('input', (e) => {
+    prefs.micVol = Number(e.target.value);
+    savePrefs();
+    const g = state.audioGraph;
+    if (g && g.mic) g.mic.micGain.gain.value = prefs.micVol / 100;
+  });
+
+  $('#monitor').checked = prefs.micMonitor;
   $('#monitor').addEventListener('change', async () => {
     const on = $('#monitor').checked;
+    prefs.micMonitor = on;
+    savePrefs();
+    micHint(on ? '' : '麦克风已静音');
     if (on) {
       // 勾选即请求麦克风并接入监听，无需先点“开始录唱”。
       try { await ensureMic(); } catch { $('#monitor').checked = false; return; }
@@ -1306,7 +1502,7 @@ function init() {
   };
   $('#search').addEventListener('input', onSearch);
   $('#searchClear').addEventListener('click', () => { $('#search').value = ''; onSearch(); $('#search').focus(); });
-  $('#homeBtn').addEventListener('click', () => { closeDrawers(); showBrowse(); });
+  $('#homeBtn').addEventListener('click', () => { closeDrawers(); showBrowse(); });   // 只切视图，歌照唱
   $('#backBtn').addEventListener('click', showBrowse);
   $('#queueBtn').addEventListener('click', () => openDrawer('queue'));
   $('#adminBtn').addEventListener('click', () => openDrawer('admin'));
@@ -1379,9 +1575,46 @@ function init() {
     }
   });
 
+  /* 曲库视图切换 + 语种筛选 */
+  $('#viewToggle').addEventListener('click', () => {
+    state.view = state.view === 'list' ? 'grid' : 'list';
+    $('#viewToggle').textContent = state.view === 'list' ? '🖼 大图' : '📃 列表';
+    prefs.view = state.view; savePrefs();
+    renderBrowse(true);
+  });
+  $('#songList').addEventListener('click', (e) => {
+    const row = e.target.closest('.song-row');
+    if (row) addToQueue(row.dataset.id);
+  });
+  $('#langBar').addEventListener('click', (e) => {
+    const b = e.target.closest('.lang-btn');
+    if (!b) return;
+    state.lang = b.dataset.lang;
+    $('#langBar').dataset.sig = '';      // 强制重画选中态
+    renderBrowse(true);
+  });
+
+  /* 常驻控制条 */
+  $('#nbOpen').addEventListener('click', () => { if (state.currentJobId) showStage(); });
+  $('#nbCover').addEventListener('click', () => { if (state.currentJobId) showStage(); });
+  $('#nbPlay').addEventListener('click', () => { togglePlay(); renderNowBar(); });
+  $('#nbReplay').addEventListener('click', () => { seekTo(0); if (inst.paused) togglePlay(); renderNowBar(); });
+  $('#nbSkip').addEventListener('click', () => {
+    if (state.queue.length) playFromQueue();
+    else { toast('已点列表空了，没有下一首'); endPlayback(); }
+  });
+  $('#nbQueue').addEventListener('click', () => openDrawer('queue'));
+  $('#modeInst').addEventListener('click', () => setSingMode('inst'));
+  $('#modeOrig').addEventListener('click', () => setSingMode('orig'));
+  state.singMode = prefs.singMode;
+  state.view = prefs.view || 'list';
+  $('#viewToggle').textContent = state.view === 'list' ? '🖼 大图' : '📃 列表';
+
   bindPlayer();
+  inst.addEventListener('play', renderNowBar);
+  inst.addEventListener('pause', renderNowBar);
   // 一首唱完自动接下一首，这是 KTV 机器最基本的行为
-  inst.addEventListener('ended', () => { setTimeout(playFromQueue, 800); });
+  inst.addEventListener('ended', () => { setTimeout(() => playFromQueue(true), 800); });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeDrawers();

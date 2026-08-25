@@ -33,3 +33,7 @@ nltk_data/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 前端冒烟测试用的 jsdom（按需安装，不进仓库）
+node_modules/
+package-lock.json

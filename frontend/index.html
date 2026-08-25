@@ -37,11 +37,13 @@
         <button class="tab" data-tab="new">最新</button>
         <span class="tab-spacer"></span>
         <span id="browseCount" class="muted small"></span>
+        <button id="viewToggle" class="view-toggle" title="在文字列表和封面墙之间切换">🖼 大图</button>
       </nav>
 
-      <div id="letterBar" class="letter-bar hidden"></div>
+      <div id="langBar" class="lang-bar"></div>
 
-      <div id="grid" class="song-grid"></div>
+      <ul id="songList" class="song-list"></ul>
+      <div id="grid" class="song-grid hidden"></div>
       <div id="artistList" class="artist-list hidden"></div>
       <p id="browseEmpty" class="empty hidden"></p>
     </section>
@@ -97,6 +99,10 @@
             <input id="vocalVol" type="range" min="0" max="100" value="0" />
           </label>
           <label class="mix">
+            🎤 麦克风
+            <input id="micVol" type="range" min="0" max="100" value="80" />
+          </label>
+          <label class="mix">
             🌫️ 混响
             <select id="reverb">
               <option value="none">干声</option>
@@ -109,10 +115,12 @@
         </div>
 
         <div class="recorder">
+          <label class="mon" title="把麦克风的声音一起放出来（和真正的 KTV 一样）">
+            <input type="checkbox" id="monitor" checked /> 麦克风外放
+          </label>
           <button id="recBtn" class="rec">🎤 开始录唱</button>
           <span id="recStatus" class="muted small"></span>
-          <label class="mon" title="边唱边从耳机听到自己的声音"><input type="checkbox" id="monitor" /> 耳机监听</label>
-          <span class="hint">录唱会把伴奏与你的歌声合成保存；建议戴耳机以避免啸叫。</span>
+          <span id="micHint" class="hint"></span>
         </div>
 
         <div class="rec-list-wrap hidden" id="recListWrap">
@@ -220,6 +228,25 @@
         <p id="procEmpty" class="empty">没有正在处理的任务。</p>
       </div>
     </aside>
+
+    <!-- 常驻控制条：唱歌时不挡浏览区，切歌/重唱/原伴唱都在这一层 -->
+    <div id="nowbar" class="nowbar hidden">
+      <img id="nbCover" class="nb-cover" alt="" />
+      <div class="nb-meta" id="nbOpen" title="展开歌词页">
+        <p class="nb-title" id="nbTitle">—</p>
+        <p class="nb-artist" id="nbArtist"></p>
+      </div>
+      <div class="nb-mode">
+        <button id="modeInst" class="mode-btn active" title="只放伴奏，自己唱">伴唱</button>
+        <button id="modeOrig" class="mode-btn" title="放原唱，跟着学">原唱</button>
+      </div>
+      <div class="nb-ctrl">
+        <button id="nbPlay" class="nb-btn" title="播放 / 暂停">⏸</button>
+        <button id="nbReplay" class="nb-btn" title="从头再唱">↺ 重唱</button>
+        <button id="nbSkip" class="nb-btn" title="切到下一首">⏭ 切歌</button>
+        <button id="nbQueue" class="nb-btn strong" title="已点歌曲">📋 <span id="nbQueueCount">0</span></button>
+      </div>
+    </div>
 
     <div id="scrim" class="scrim hidden"></div>
 
