@@ -540,3 +540,105 @@ button.rec.recording { animation: recpulse 1s infinite; }
 .rec-list .rdel:hover { color: var(--bad); background: rgba(255, 107, 122, 0.1); }
 
 .hidden { display: none !important; }
+
+/* ---------------- 高密度曲目列表 ----------------
+ * 商业点歌台的默认形态就是文字列表而不是封面墙：一屏能看十几首，
+ * 扫一眼找歌远快于翻图；行高按触屏习惯给到 64px 左右。 */
+.song-list { list-style: none; margin: 0; padding: 0; }
+.song-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) minmax(0, 190px) 68px 56px 92px;
+  align-items: center; gap: 12px;
+  min-height: 64px; padding: 0 14px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer; transition: background 0.12s;
+}
+.song-row:hover { background: var(--card-2); }
+.song-row.queued { background: rgba(55, 211, 155, 0.09); }
+.song-row.queued .sr-title::after {
+  content: '已点'; margin-left: 8px; font-size: 11px; font-weight: 700;
+  color: var(--good); border: 1px solid var(--good);
+  padding: 0 5px; border-radius: 4px; vertical-align: middle;
+}
+.sr-no { color: var(--muted); font-size: 13px; text-align: right; }
+.sr-title {
+  font-size: 17px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sr-artist {
+  font-size: 14px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sr-lang {
+  font-size: 12px; color: var(--accent-2);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 2px 0; text-align: center;
+}
+.sr-dur { font-size: 13px; color: var(--muted); text-align: right; }
+.sr-pick {
+  min-height: 40px; border: none; border-radius: 9px; cursor: pointer;
+  background: var(--accent-grad); color: #fff; font-size: 15px; font-weight: 600;
+}
+.song-row.queued .sr-pick { background: var(--card-2); color: var(--muted); }
+
+/* 语种筛选条 */
+.lang-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.lang-btn {
+  background: var(--card); border: 1px solid var(--line); color: var(--muted);
+  padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: 13px;
+}
+.lang-btn.active { background: var(--accent); color: #fff; border-color: transparent; }
+.view-toggle {
+  background: var(--card); border: 1px solid var(--line); color: var(--muted);
+  padding: 7px 13px; border-radius: 999px; cursor: pointer; font-size: 13px;
+}
+.view-toggle:hover { color: var(--text); border-color: var(--accent); }
+
+/* ---------------- 常驻控制条 ----------------
+ * 唱歌时它一直在，浏览区照常可用——「一个人唱、其他人接着点歌」
+ * 是点歌台最主要的使用方式，播放页不能把整个界面占掉。 */
+.nowbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 18px; min-height: 76px;
+  background: rgba(18, 23, 34, 0.97);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -10px 34px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+}
+body.has-nowbar .app { padding-bottom: 112px; }
+.nb-cover {
+  width: 84px; height: 48px; object-fit: cover;
+  border-radius: 8px; background: var(--card-2); cursor: pointer; flex: 0 0 auto;
+}
+.nb-meta { flex: 1; min-width: 0; cursor: pointer; }
+.nb-title {
+  margin: 0; font-size: 16px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.nb-artist { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
+.nb-mode { display: flex; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.mode-btn {
+  background: none; border: none; color: var(--muted);
+  padding: 10px 18px; cursor: pointer; font-size: 15px; min-height: 44px;
+}
+.mode-btn.active { background: var(--accent-grad); color: #fff; font-weight: 700; }
+.nb-ctrl { display: flex; gap: 8px; flex: 0 0 auto; }
+.nb-btn {
+  background: var(--card); border: 1px solid var(--line); color: var(--text);
+  border-radius: 10px; cursor: pointer; font-size: 15px;
+  min-height: 44px; padding: 0 16px;
+}
+.nb-btn:hover { border-color: var(--accent); }
+.nb-btn.strong { background: var(--accent-grad); border-color: transparent; color: #fff; font-weight: 600; }
+
+@media (max-width: 760px) {
+  .song-row { grid-template-columns: minmax(0, 1fr) 62px 76px; gap: 10px; }
+  .sr-no, .sr-artist, .sr-dur { display: none; }
+  .sr-title { font-size: 16px; }
+  .song-row { padding: 10px 12px; }
+  .sr-artist { display: block; grid-column: 1; font-size: 12px; }
+  .nowbar { flex-wrap: wrap; min-height: 0; padding: 10px 12px; }
+  .nb-cover { width: 56px; height: 34px; }
+  .nb-ctrl { width: 100%; justify-content: space-between; }
+}
