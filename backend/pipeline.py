@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import config
 from .jobs import manager
-from .steps import download, lyrics, separate
+from .steps import download, local_media, lyrics, separate
 
 # 各阶段在总进度中的区间划分
 _DOWNLOAD_RANGE = (2, 20)
@@ -34,15 +34,25 @@ def run(job_id: str) -> None:
     lyrics_dir = job_dir  # lyrics.json 直接放在任务根目录
 
     try:
-        # 1) 下载
-        manager.update(job_id, state="running", step="download", progress=2, message="正在下载音频…")
-        info = download.download_audio(
-            url, src_dir,
-            on_progress=lambda p, m: manager.update(
-                job_id, progress=_scaled(_DOWNLOAD_RANGE, p), message=m
-            ),
-            cookiefile=config.COOKIEFILE,
-        )
+        # 1) 取得音频：本地文件抽音轨，否则走下载。
+        if job.get("source_type") == "local":
+            manager.update(job_id, state="running", step="download", progress=2,
+                           message="正在读取本地文件…")
+            info = local_media.ingest(
+                job.get("local_path") or url, src_dir,
+                on_progress=lambda p, m: manager.update(
+                    job_id, progress=_scaled(_DOWNLOAD_RANGE, p), message=m
+                ),
+            )
+        else:
+            manager.update(job_id, state="running", step="download", progress=2, message="正在下载音频…")
+            info = download.download_audio(
+                url, src_dir,
+                on_progress=lambda p, m: manager.update(
+                    job_id, progress=_scaled(_DOWNLOAD_RANGE, p), message=m
+                ),
+                cookiefile=config.COOKIEFILE,
+            )
         manager.update(
             job_id,
             title=info.get("title"),

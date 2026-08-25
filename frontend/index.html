@@ -25,9 +25,10 @@
         <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接，例如 https://www.youtube.com/watch?v=…" autocomplete="off" />
         <button id="go" class="primary">开始制作</button>
         <button id="plGo" title="粘贴歌单链接，一次把整个播放列表加入队列">🎵 导入歌单</button>
+        <button id="lcGo" class="hidden" title="从服务器上已有的媒体目录批量导入">📁 本地文件</button>
       </div>
 
-      <!-- 播放列表批量导入 -->
+      <!-- 批量导入（播放列表 / 本地文件共用）-->
       <div id="plPanel" class="pl-panel hidden">
         <div class="pl-head">
           <strong id="plTitle">播放列表</strong>
