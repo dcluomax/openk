@@ -18,12 +18,13 @@ const D = require('path').join(__dirname, 'frontend');
 const jobs = [
   { id:'a1', state:'done', title:'周杰倫 Jay Chou - 稻香 (Official MV)', duration:223,
     thumbnail:'/media/a1/source/thumb.jpg', media:{instrumental:'/m/i.mp3', vocals:'/m/v.mp3', lyrics:'/m/l.json'},
-    artist:'周杰倫', track:'稻香' },
+    artist:'周杰倫', track:'稻香', line_count:42, lyrics_status:'ok' },
   { id:'a2', state:'done', title:'NO -240 淚的小雨- 高勝美(國語) (娛己娛人卡拉OK)', duration:250,
     thumbnail:'/media/a2/source/thumb.jpg', media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'},
-    artist:'高勝美', track:'淚的小雨' },
+    artist:'高勝美', track:'淚的小雨', line_count:30, lyrics_status:'ok' },
   { id:'a3', state:'done', title:'Beyond - 海闊天空 (粵語)', duration:326,
-    thumbnail:null, media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'}, artist:'Beyond', track:'海闊天空' },
+    thumbnail:null, media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'}, artist:'Beyond', track:'海闊天空',
+    line_count:0, lyrics_status:'none' },
   { id:'b1', state:'running', title:'处理中的歌', progress:0.4, message:'人声分离' },
 ];
 
@@ -118,6 +119,15 @@ setTimeout(() => {
       `拼音首字母 dx 搜到稻香（${$$('.song-row').length} 条）`);
     $('#search').value = '';
     $('#search').dispatchEvent(new w.Event('input', {bubbles:true}));
+
+    // 无歌词的伴奏带要挂「无词」标记：能唱，但点之前得知道没字幕
+    const rows = $$('.song-row');
+    const noLrc = rows.filter((r) => r.querySelector('.sr-nolrc'));
+    T(noLrc.length === 1 && noLrc[0].querySelector('.sr-title').textContent === '海闊天空',
+      `没有歌词的歌挂上「无词」标记（${noLrc.length} 条）`);
+    T(rows.find((r) => r.querySelector('.sr-title').textContent === '稻香')
+        .querySelector('.sr-nolrc') === null,
+      '有歌词的歌不挂「无词」标记');
 
     // 语种筛选
     const yue = $$('.lang-btn').find(b => b.textContent.includes('粤语'));

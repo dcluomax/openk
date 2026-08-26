@@ -327,6 +327,46 @@ def fetch_lrclib(meta: Dict[str, Optional[str]], duration: Optional[float]) -> O
     return None
 
 
+def _match_key(s: Optional[str]) -> str:
+    """歌名/歌手的宽松比较用键：去掉空白标点、统一简体与大小写。"""
+    s = _to_simp((s or "").strip()) or ""
+    return re.sub(r"[\s\-_·,，.。'’\"“”!！?？()（）\[\]【】]", "", s).lower()
+
+
+def fetch_lrclib_relaxed(meta: Dict[str, Optional[str]],
+                         duration: Optional[float]) -> Optional[Dict[str, Any]]:
+    """名字完全对得上就采信，不卡时长。
+
+    ``fetch_lrclib`` 要求时长相差不超过 8 秒，这对卡拉OK版本太苛刻——
+    同一首歌的 KTV 伴奏带前奏尾奏跟原唱本来就不一样，动辄差二三十秒，
+    于是一大批名曲明明歌词库里有，却因为时长对不上被判为「查不到」。
+
+    这里换一个更强的证据：歌名与歌手**逐字对上**。名字精确匹配的误配概率，
+    远低于时长接近但名字不同的情况。时间轴对不齐可以靠对齐步骤补救，
+    歌词完全没有则无从补救。
+    """
+    track, artist = meta.get("track"), meta.get("artist")
+    if not track:
+        return None
+    tk, ak = _match_key(track), _match_key(artist)
+    try:
+        cands = search_lrclib(track=track, artist=artist)
+    except Exception:  # noqa: BLE001
+        return None
+
+    hits = [c for c in cands
+            if c.get("synced") and _match_key(c.get("trackName")) == tk
+            and (not ak or _match_key(c.get("artistName")) == ak)]
+    if not hits:
+        return None
+    hits.sort(key=lambda c: abs((c.get("duration") or 0) - (duration or 0)))
+    for c in hits:
+        rec = get_lrclib_by_id(c["id"])
+        if rec and rec.get("syncedLyrics"):
+            return rec
+    return None
+
+
 def _to_simp(s: Optional[str]) -> Optional[str]:
     """转简体（装了 zhconv 才生效，否则原样返回）。
 
@@ -410,6 +450,9 @@ def spread_plain(plain: str, duration: Optional[float]) -> List[Dict[str, Any]]:
 def from_lrclib(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     meta = guess_meta(info)
     rec = fetch_lrclib(meta, info.get("duration"))
+    if not rec:
+        # 时长闸门挡掉的，再用「名字逐字对上」这条更强的证据试一次。
+        rec = fetch_lrclib_relaxed(meta, info.get("duration"))
     if not rec:
         return None
     lines = parse_lrc(rec["syncedLyrics"])
