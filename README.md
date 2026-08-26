@@ -14,6 +14,11 @@
   2. **YouTube 自带字幕**（官方 > 自动）—— 很多 MV 自带逐行时间戳歌词。
   3. 拿到歌词后交给 [whisperX](https://github.com/m-bain/whisperX) **强制对齐纯人声**，把逐行细化为**逐词**时间戳（卡拉OK级精度）。
   4. 若前面都没有，再用 whisperX **自动识别**兜底。
+  - 查歌词库前会**先把歌手/歌名定下来**（LRCLIB 反查校正）——直接拿 YouTube 标题
+    （`似是故人來 梅艷芳 Karaoke MP4_AAC Stereo` 这种）去查是查不中的。
+  - 名字逐字对得上就采信，**不卡时长**：KTV 伴奏带的前奏尾奏跟原唱本来就不一样。
+  - 实在没有歌词的（伴奏带 + 歌词库未收录）标记为**无词**，点歌台上标出来，
+    伴奏照样能唱，只是没字幕，也不会被反复重试。
 - ⬇️ **下载**：基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)。
 - 🎚️ **卡拉OK播放器**：伴奏 / 导唱人声独立音量、进度拖动、逐字高亮、点歌词跳转、自动滚动、歌词来源标注。
 - 🎙️ **录唱与回放**：麦克风 + 伴奏实时合成录制，内置多种**混响**（KTV / 小房间 / 大厅 / 教堂）；录音自动保存，可回放、下载、删除。
@@ -213,6 +218,29 @@ docker run -d --name openk -p 8000:8000 \
   openk:slim
 ```
 
+### 统一归档：下载的歌也进曲库
+
+默认情况下 YouTube 下载的音频落在 `data/jobs/<id>/source/`，没有歌名，分离完还会被删掉
+——想换个 Whisper 模型重跑就得重新下载一遍，备份时也容易漏掉。配置 `OPENK_LIBRARY_DIR`
+之后，下载的源文件会在定名之后归档成 `歌手 - 歌名 [videoID].ext`，和本地导入的片子放在
+同一个目录里，并写回 `local_path`，重跑不再需要联网。
+
+归档目录**必须可写**，而既有的媒体目录通常是只读挂载的（对外服务不该能改你的媒体库）。
+推荐单独开一个可写目录，两个都放进 `OPENK_LOCAL_MEDIA_DIRS` 一起扫描：
+
+```bash
+docker run -d --name openk -p 8000:8000 \
+  -v ~/openk-data:/data \
+  -v /path/to/your/mv:/media/mv:ro \
+  -v ~/openk-library:/library \
+  -e OPENK_LOCAL_MEDIA_DIRS=/media/mv:/library \
+  -e OPENK_LIBRARY_DIR=/library \
+  openk:slim
+```
+
+同名文件**绝不覆盖**：曲库里常有同名不同版本的歌，文件名尾部的 `[videoID]` 就是用来
+区分它们的；万一还是撞名，归档会放弃并保留原状，而不是悄悄吃掉一首歌。
+
 > 如果容器用 `--user` 以非 root 运行（分布式部署下需要，见
 > [docs/distributed.md](docs/distributed.md#共享存储的属主)），而媒体目录是靠**组权限**
 > 授权的，还得补一个 `--group-add <gid>`——否则容器里根本列不出这个目录，
@@ -290,6 +318,8 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 | `OPENK_PLAYLIST_SKIP_LONG` | `true` | 导入前按列表里的时长先筛掉超过 `OPENK_MAX_SONG_SECONDS` 的项 |
 | `OPENK_LOCAL_MEDIA_DIRS` | 空 | 允许导入的本地媒体目录，多个用 `:` 分隔；**留空＝完全关闭本地导入** |
 | `OPENK_LOCAL_MEDIA_MAX_ITEMS` | `1000` | 一次扫描最多列出多少个本地文件 |
+| `OPENK_LIBRARY_DIR` | 取 `OPENK_LOCAL_MEDIA_DIRS` 的第一项 | 归档目录：下载来的源文件统一命名成 `歌手 - 歌名 [videoID].ext` 放这里，和本地导入的片子归到一处 |
+| `OPENK_LIBRARY_ARCHIVE_DOWNLOADS` | `true` | 是否归档 YouTube 下载的源音频；关掉则分离完就删（旧行为） |
 | `OPENK_RESUME_ON_START` | `true` | 重启后把没跑完的任务重新排队，而不是标记失败 |
 | `OPENK_PORT` | `8000` | 服务端口 |
 | `OPENK_HOST` | `127.0.0.1` | 监听地址；局域网访问填 `0.0.0.0` |
