@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Optional
 # YouTube 的列表 ID 形态不止一种（PL/UU/OL/RD/FL/LL…，长度也不统一），
 # 所以这里不去猜格式，只要是 list= 后面那串合法字符就交给 yt-dlp 判断真伪。
 _LIST_ID = re.compile(r"[?&]list=([0-9A-Za-z_-]+)")
+# 观看链接里的视频 ID。电台列表虽然摊不平，但用户贴过来的链接上通常带着
+# `v=`——那首歌是能导的，没必要让人回去手工删参数。
+_VIDEO_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([0-9A-Za-z_-]{11})")
 
 # 这几类是 YouTube 动态生成的「推荐/电台」列表，内容因人而异且可能上百首，
 # 摊平它们没有意义（也不是用户「收藏的那个歌单」），直接拒掉更不容易误操作。
@@ -32,6 +35,12 @@ class PlaylistError(RuntimeError):
 def extract_playlist_id(url: str) -> Optional[str]:
     """从链接里取出播放列表 ID；不是播放列表则返回 ``None``。"""
     m = _LIST_ID.search(url or "")
+    return m.group(1) if m else None
+
+
+def extract_video_id(url: str) -> Optional[str]:
+    """从观看链接里取出视频 ID；取不到返回 ``None``。"""
+    m = _VIDEO_ID.search(url or "")
     return m.group(1) if m else None
 
 
@@ -99,6 +108,27 @@ def fetch_entries(
     if not playlist_id:
         raise PlaylistError("这不是播放列表链接（缺少 list= 参数）。")
     if is_dynamic_playlist(playlist_id):
+        # 电台列表本身摊不平，但链接上那首歌是实打实的，直接当成「一首歌的列表」
+        # 返回，用户点一下就导入了，不用回去手工删 &list= 参数。
+        solo = extract_video_id(url)
+        if solo:
+            return {
+                "playlist_id": playlist_id,
+                "title": "YouTube 电台链接（只能导入当前这一首）",
+                "uploader": None,
+                "total": 1,
+                "truncated": False,
+                "dynamic": True,
+                "note": ("这是 YouTube 自动生成的电台列表，内容因账号而异、无法整份导入；"
+                         "下面是链接里的这首歌，可以直接导入。"),
+                "entries": [{
+                    "video_id": solo,
+                    "title": None,
+                    "duration": None,
+                    "url": video_url(solo),
+                    "unavailable": False,
+                }],
+            }
         raise PlaylistError(
             "这是 YouTube 自动生成的电台 / 稍后观看列表，内容因账号而异，"
             "无法批量导入。请打开你自己创建的歌单再复制链接。")
