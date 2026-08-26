@@ -643,3 +643,16 @@ body.has-nowbar .app { padding-bottom: 112px; }
   .nb-cover { width: 56px; height: 34px; }
   .nb-ctrl { width: 100%; justify-content: space-between; }
 }
+
+/* 无歌词标记：伴奏带能唱，但没有字幕，点歌前先让人看见 */
+.sc-nolrc {
+  position: absolute; left: 8px; top: 8px;
+  padding: 1px 6px; border-radius: 6px;
+  background: rgba(0, 0, 0, .62); color: #ffd479;
+  font-size: 11px; line-height: 1.6; letter-spacing: .5px;
+}
+.sr-nolrc {
+  margin-left: 6px; padding: 0 5px; border-radius: 5px;
+  background: rgba(255, 212, 121, .16); color: #ffd479;
+  font-size: 11px; font-style: normal; align-self: center;
+}

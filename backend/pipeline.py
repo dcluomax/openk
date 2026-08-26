@@ -9,12 +9,41 @@ from pathlib import Path
 
 from . import config
 from .jobs import manager
-from .steps import download, local_media, lyrics, separate
+from .steps import download, library, local_media, lyrics, meta_fix, separate
 
 # 各阶段在总进度中的区间划分
 _DOWNLOAD_RANGE = (2, 20)
 _SEPARATE_RANGE = (20, 70)
 _TRANSCRIBE_RANGE = (70, 99)
+
+
+def _settle_meta(job_id: str, job: dict, info: dict) -> dict:
+    """在查歌词之前先把「歌手 / 歌名」定下来。
+
+    歌词库是按歌手歌名查的，而 YouTube 标题常常是
+    「似是故人來 梅艷芳 Karaoke MP4_AAC Stereo」这种。名字没定准就去查，
+    必然查不到，于是退回语音识别；偏偏这类源本身就是伴奏带，没有人声可认，
+    最后落得一行歌词都没有。所以定名必须排在取歌词前面。
+    """
+    merged = dict(info)
+    artist = (job.get("artist") or "").strip()
+    track = (job.get("track") or "").strip()
+    if not track:
+        try:
+            plan = meta_fix.plan_fix({**job, "title": info.get("title") or job.get("title"),
+                                      "duration": info.get("duration")})
+        except Exception:  # noqa: BLE001 - 定名失败不该拖垮整条流水线
+            traceback.print_exc()
+            plan = None
+        if plan:
+            artist = plan.get("artist") or artist
+            track = plan.get("track") or track
+            manager.update(job_id, artist=artist or None, track=track or None)
+    if artist:
+        merged["artist"] = artist
+    if track:
+        merged["track"] = track
+    return merged
 
 
 def _scaled(rng: tuple[int, int], pct: int) -> int:
@@ -72,6 +101,9 @@ def run(job_id: str) -> None:
                 "（如需处理长音频，可调高环境变量 OPENK_MAX_SONG_SECONDS）"
             )
 
+        # 定名要排在分离和取歌词前面：归档需要名字来命名文件，歌词库也是按名字查的。
+        info = _settle_meta(job_id, manager.get(job_id) or job, info)
+
         # 2) 人声分离（已有有效分离结果则复用，避免重复分离——8GB 机器上分离最耗时/易超时，
         #    重试只想换语言重识别时尤其不该再分离一遍）
         prev_stems = job.get("stems") or {}
@@ -98,10 +130,17 @@ def run(job_id: str) -> None:
             )
             manager.update(job_id, stems=stems, progress=_SEPARATE_RANGE[1])
 
-        # 分离完成后，默认删除原始下载音频以节省空间（已去重，不会再次分离）。
-        if not config.KEEP_SOURCE:
+        # 分离完成后处理原始音频：下载来的归档进媒体库，和本地导入的片子放一起，
+        # 这样一份曲库既能备份也能重跑；没配媒体库时维持旧行为，删掉省空间。
+        src_audio = Path(info["audio_path"])
+        archived = None
+        if job.get("source_type") != "local" and config.LIBRARY_ARCHIVE_DOWNLOADS:
+            archived = library.archive_job_source(manager.get(job_id) or job, src_audio)
+            if archived:
+                manager.update(job_id, local_path=str(archived))
+        if archived is None and not config.KEEP_SOURCE:
             try:
-                Path(info["audio_path"]).unlink(missing_ok=True)
+                src_audio.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -117,16 +156,21 @@ def run(job_id: str) -> None:
             ),
         )
 
+        # 歌词库没有、人声里也认不出字，多半这个源本身就是伴奏带（KTV 版没有原唱）。
+        # 这不是失败——伴奏照样能唱，只是没字幕。标记出来，避免反复重试。
+        got_lyrics = (result.get("line_count") or 0) > 0
         manager.update(
             job_id,
             state="done",
             step="done",
             progress=100,
-            message="处理完成，可以开始唱了！",
+            message="处理完成，可以开始唱了！" if got_lyrics
+                    else "处理完成（此源没有可用歌词，只有伴奏）",
             language=result.get("language"),
             lyrics_file=result.get("lyrics_file"),
             line_count=result.get("line_count"),
             lyrics_source=result.get("source"),
+            lyrics_status="ok" if got_lyrics else "none",
         )
     except Exception as exc:  # noqa: BLE001 - 需要把任何异常反馈给前端
         traceback.print_exc()
