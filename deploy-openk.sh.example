@@ -1,0 +1,49 @@
+#!/bin/bash
+# openk 容器的完整启动参数。重建容器一律走这个脚本，不要手敲 docker run
+# ——漏掉任何一行都会以难以定位的方式坏掉：
+#   --user 3000:3000  漏了 → 作业目录变 root 属主，mini 经 SMB 全部读不到
+#   --group-add 1000  漏了 → 容器列不出 ktv 目录，导入后每首都报「路径不存在」
+#   --network openk-net 漏了 → 落到默认 bridge，nginx 解析不到 openk，8443 报 502
+set -e
+
+NAME=openk
+NET=openk-net
+DATA=/mnt/MainPool/Media/openk/data
+MEDIA=/mnt/MainPool/Media/ktv
+# 下载归档目录：单独可写，/media/ktv 保持只读，对外服务碰不到既有媒体库
+LIB=/mnt/MainPool/Media/openk/library
+
+# token 等敏感变量从现有容器继承，不落到脚本或命令行里。
+if docker inspect "$NAME" >/dev/null 2>&1; then
+  mapfile -t ENVS < <(docker inspect "$NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    | grep -E '^(OPENK_WORKER_TOKEN|OPENK_REMOTE_STEPS)=')
+  docker rm -f "$NAME" >/dev/null
+elif [ -n "$OPENK_WORKER_TOKEN" ]; then
+  ENVS=("OPENK_WORKER_TOKEN=$OPENK_WORKER_TOKEN" "OPENK_REMOTE_STEPS=${OPENK_REMOTE_STEPS:-separate,transcribe,align}")
+else
+  echo "找不到现有容器，也没有 OPENK_WORKER_TOKEN；无法确定 worker 令牌。" >&2
+  exit 1
+fi
+EXTRA=(); for e in "${ENVS[@]}"; do EXTRA+=(-e "$e"); done
+
+docker run -d --name "$NAME" --restart unless-stopped \
+  --network "$NET" \
+  --user 3000:3000 --group-add 1000 \
+  -p 8100:8000 \
+  -v "$DATA":/data \
+  -v "$MEDIA":/media/ktv:ro \
+  -v "$LIB":/library \
+  -e HOME=/data \
+  -e OPENK_LOCAL_MEDIA_DIRS=/media/ktv:/library \
+  -e OPENK_LIBRARY_DIR=/library \
+  -e OPENK_LOCAL_MEDIA_MAX_ITEMS=1000 \
+  -e OPENK_MAX_SONG_SECONDS=780 \
+  "${EXTRA[@]}" openk:slim >/dev/null
+
+sleep 8
+echo "容器：$(docker ps --filter name=$NAME --format '{{.Status}}')"
+echo "网络：$(docker inspect $NAME --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}({{$v.IPAddress}}){{end}}')"
+echo "媒体目录可见文件数：$(docker exec $NAME sh -c 'ls /media/ktv 2>/dev/null | wc -l')"
+echo "归档库可写：$(docker exec $NAME sh -c 'touch /library/.w 2>/dev/null && echo 是 && rm -f /library/.w || echo 否')"
+docker exec openk-tls nginx -s reload 2>/dev/null || true
+echo "HTTPS 入口：$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 https://localhost:8443/)"
