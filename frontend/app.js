@@ -1082,18 +1082,29 @@ const REVERB_PRESETS = {
 // 耳机监听增益：略高于 1，让戴耳机时能清楚听到自己与混响尾音（伴奏走耳机不会啸叫）。
 // 只作用于监听支路，不影响录音总线的电平，避免录音文件削幅。
 const MONITOR_GAIN = 1.8;
+// 限幅后的补偿增益。限幅器把峰值压到 -3dB 附近，乘回来刚好接近满刻度而不削顶。
+const MIC_MAKEUP = 1.4;
 
 /* ---------- 用户偏好（存浏览器本地，换台设备互不影响） ---------- */
 const PREF_KEY = 'openk.prefs';
 const PREF_DEFAULTS = {
   micMonitor: true,   // 默认把麦克风外放——真正的 KTV 就是插上麦就有声
-  micVol: 80,
+  micVol: 110,        // 裸麦（关掉 AGC）电平远低于成品伴奏，得给到 1 以上才压得住
   reverb: 'ktv',
   singMode: 'inst',   // KTV 默认伴唱
+  v: 2,               // 偏好版本，用来做一次性迁移
 };
 const prefs = (() => {
-  try { return { ...PREF_DEFAULTS, ...JSON.parse(localStorage.getItem(PREF_KEY) || '{}') }; }
+  let p;
+  try { p = { ...PREF_DEFAULTS, ...JSON.parse(localStorage.getItem(PREF_KEY) || '{}') }; }
   catch { return { ...PREF_DEFAULTS }; }
+  // v1 时代限幅器把人声焊死在音乐的四分之一，大家只好把滑块推到顶还嫌小。
+  // 限幅器修好后那些旧数值反而偏低，做一次性抬升，免得升级完还是「怎么推都小」。
+  if (!(p.v >= 2)) {
+    p.micVol = Math.max(Number(p.micVol) || 0, PREF_DEFAULTS.micVol);
+    p.v = 2;
+  }
+  return p;
 })();
 function savePrefs() { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} }
 
@@ -1281,22 +1292,30 @@ async function ensureMic(quiet = false) {
   monitorGain.gain.value = $('#monitor').checked ? MONITOR_GAIN : 0;
   // 外放时麦克风必然会拾到音箱里的声音，形成正反馈。限幅器压不住成因，但能
   // 把啸叫锁在「难听」而不是「刺耳到伤耳朵」的范围内，是外放的必要保险。
+  //
+  // 注意阈值别设太低：伴奏是直连 speakerBus 的，只有麦克风这一路过限幅器。
+  // 早先 -12dB/20:1/硬拐点等于给人声焊了堵砖墙，峰值被摁在音乐的四分之一，
+  // 滑块推到头也顶不动。现在只拦真正的峰值，正常演唱原样放过。
   const limiter = g.actx.createDynamicsCompressor();
-  limiter.threshold.value = -12;
-  limiter.knee.value = 0;
-  limiter.ratio.value = 20;
+  limiter.threshold.value = -3;
+  limiter.knee.value = 3;
+  limiter.ratio.value = 12;
   limiter.attack.value = 0.003;
   limiter.release.value = 0.15;
+  // 限幅必然削掉一截响度，补偿回来，否则「限幅器一开人声就沉下去」。
+  const micMakeup = g.actx.createGain();
+  micMakeup.gain.value = MIC_MAKEUP;
 
   micSrc.connect(micGain);
   micGain.connect(micDry); micDry.connect(g.recordBus);
   micGain.connect(micSend); micSend.connect(micConv); micConv.connect(micWet); micWet.connect(g.recordBus);
   micDry.connect(monitorGain); micWet.connect(monitorGain);
-  monitorGain.connect(limiter); limiter.connect(g.speakerBus);
+  monitorGain.connect(limiter); limiter.connect(micMakeup); micMakeup.connect(g.speakerBus);
 
   g.mic = { micSrc, micGain, micDry, micSend, micConv, micWet };
   g.monitorGain = monitorGain;
   g.limiter = limiter;
+  g.micMakeup = micMakeup;
   micGain.gain.value = prefs.micVol / 100;
   const p = REVERB_PRESETS[$('#reverb').value] || REVERB_PRESETS.none;
   micConv.buffer = makeIR(g.actx, p.seconds, p.decay);
@@ -1483,9 +1502,12 @@ function bindPlayer() {
   $('#lsQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLyricSearch(); });
   $('#recBtn').addEventListener('click', () => (state.recording ? stopRecording() : startRecording()));
   $('#micVol').value = prefs.micVol;
+  const showMicVol = () => { $('#micVolVal').textContent = prefs.micVol + '%'; };
+  showMicVol();
   $('#micVol').addEventListener('input', (e) => {
     prefs.micVol = Number(e.target.value);
     savePrefs();
+    showMicVol();
     const g = state.audioGraph;
     if (g && g.mic) g.mic.micGain.gain.value = prefs.micVol / 100;
   });

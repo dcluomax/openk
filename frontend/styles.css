@@ -476,6 +476,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .mix { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text); }
 .mix input[type="range"] { width: 120px; }
+.mix-val { min-width: 40px; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
 
 .foot { margin-top: 26px; text-align: center; color: var(--muted); font-size: 12px; }
 
