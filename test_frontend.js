@@ -25,6 +25,13 @@ const jobs = [
   { id:'a3', state:'done', title:'Beyond - 海闊天空 (粵語)', duration:326,
     thumbnail:null, media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'}, artist:'Beyond', track:'海闊天空',
     line_count:0, lyrics_status:'none' },
+  // 同一位歌手的两种写法：歌手页要合成一位，不能劈成两个
+  { id:'a4', state:'done', title:'夢然 - 少年', duration:240,
+    thumbnail:null, media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'}, artist:'夢然', track:'少年',
+    line_count:20, lyrics_status:'ok' },
+  { id:'a5', state:'done', title:'梦然 - 没有你陪伴真的好孤单', duration:250,
+    thumbnail:null, media:{instrumental:'/m/i.mp3', lyrics:'/m/l.json'}, artist:'梦然',
+    track:'没有你陪伴真的好孤单', line_count:22, lyrics_status:'ok' },
   { id:'b1', state:'running', title:'处理中的歌', progress:0.4, message:'人声分离' },
 ];
 
@@ -53,6 +60,7 @@ w.fetch = (u) => Promise.resolve({
     const m = String(u).match(/\/api\/jobs\/([\w]+)$/);
     if (m) return jobs.find(j => j.id === m[1]);
     if (String(u).includes('/api/jobs')) return jobs;
+    if (String(u).includes('/api/zh-map')) return { '闊':'阔', '權':'权', '夢':'梦', '沒':'没' };
     if (String(u).includes('/api/local/status')) return { enabled:true };
     if (String(u).includes('/api/recordings')) return [];
     return { language:'zh', lines:[] };
@@ -77,7 +85,7 @@ setTimeout(() => {
   let fails = 0;
   const T = (c, n) => { out.push((c ? '  ✓ ' : '  ✗ ') + n); if (!c) fails++; };
 
-  T($$('.song-row').length === 3, `默认渲染高密度列表（${$$('.song-row').length} 行，期望 3）`);
+  T($$('.song-row').length === 5, `默认渲染高密度列表（${$$('.song-row').length} 行，期望 5）`);
   T($('#songList').classList.contains('hidden') === false, '列表可见');
   T($('#grid').classList.contains('hidden'), '封面墙默认隐藏');
   T($$('.lang-btn').length >= 3, `语种筛选条有按钮（${$$('.lang-btn').length} 个）`);
@@ -120,6 +128,18 @@ setTimeout(() => {
     $('#search').value = '';
     $('#search').dispatchEvent(new w.Event('input', {bubbles:true}));
 
+    // 繁简互通：曲库里是「海闊天空」，用户打简体的「海阔天空」也要搜得到
+    $('#search').value = '海阔天空';
+    $('#search').dispatchEvent(new w.Event('input', {bubbles:true}));
+    T($$('.song-row').length === 1
+        && $$('.song-row')[0].querySelector('.sr-title').textContent === '海闊天空',
+      `简体关键词搜到繁体曲名（${$$('.song-row').length} 条）`);
+    $('#search').value = '海闊天空';
+    $('#search').dispatchEvent(new w.Event('input', {bubbles:true}));
+    T($$('.song-row').length === 1, `繁体关键词照样搜得到（${$$('.song-row').length} 条）`);
+    $('#search').value = '';
+    $('#search').dispatchEvent(new w.Event('input', {bubbles:true}));
+
     // 无歌词的伴奏带要挂「无词」标记：能唱，但点之前得知道没字幕
     const rows = $$('.song-row');
     const noLrc = rows.filter((r) => r.querySelector('.sr-nolrc'));
@@ -137,13 +157,20 @@ setTimeout(() => {
 
     // 视图切换
     $('#viewToggle').dispatchEvent(new w.Event('click', {bubbles:true}));
-    T($$('.song-card').length === 3, `切到封面墙（${$$('.song-card').length} 张卡）`);
+    T($$('.song-card').length === 5, `切到封面墙（${$$('.song-card').length} 张卡）`);
     $('#viewToggle').dispatchEvent(new w.Event('click', {bubbles:true}));
-    T($$('.song-row').length === 3, '切回文字列表');
+    T($$('.song-row').length === 5, '切回文字列表');
 
     // 歌手页
     $$('.tab').find(t => t.dataset.tab === 'artist').dispatchEvent(new w.Event('click', {bubbles:true}));
-    T($$('.artist-chip').length === 3, `按歌手分组（${$$('.artist-chip').length} 位）`);
+    T($$('.artist-chip').length === 4, `按歌手分组（${$$('.artist-chip').length} 位）`);
+    // 夢然 / 梦然 是同一位，必须合成一张卡片、两首歌，显示写法取占多数的那个
+    const meng = $$('.artist-chip').filter((c) => /[夢梦]然/.test(c.textContent));
+    T(meng.length === 1 && meng[0].querySelector('em').textContent === '2',
+      `繁简两种写法的歌手合成一位（${meng.length} 张卡 / ${meng[0] && meng[0].querySelector('em').textContent} 首）`);
+    meng[0].dispatchEvent(new w.Event('click', {bubbles:true}));
+    T($$('.song-row').length === 2, `点进该歌手能看到两种写法下的歌（${$$('.song-row').length} 首）`);
+    $$('.tab').find(t => t.dataset.tab === 'artist').dispatchEvent(new w.Event('click', {bubbles:true}));
 
     // 连唱：这首放完自动接队列里的下一首（KTV 的命根子）
     const before = $('#nbTitle').textContent;

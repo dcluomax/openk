@@ -106,7 +106,8 @@ const state = {
   lyricsUrl: null,   // 当前歌词 json 地址（保存后重新拉取）
   currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
   libMode: 'all',    // 点歌台视图：all 全部 / artist 按歌手 / new 最新
-  artistPick: null,  // 「按歌手」里点进了哪位歌手
+  artistPick: null,  // 「按歌手」里点进了哪位歌手（存归一后的简体键）
+  artistLabel: null, // 该歌手在曲库里的实际写法，用于标题显示
   view: 'list',      // 曲库呈现：list 文字列表（默认，找歌快）/ grid 封面墙
   lang: '',          // 语种筛选，空串表示全部
   singMode: 'inst',  // 伴唱 inst / 原唱 orig
@@ -224,6 +225,7 @@ function renderPicker(data) {
   $('#plCount').textContent = `共 ${data.total} 首 · ${data.importable} 首可导入`;
 
   const notes = [];
+  if (data.note) notes.push(data.note);
   if (data.truncated) {
     notes.push(local
       ? `目录里还有更多文件，这里只列出前 ${data.limit} 个（可调 OPENK_LOCAL_MEDIA_MAX_ITEMS）`
@@ -247,7 +249,7 @@ function renderPicker(data) {
       <span class="pl-tag ${cls}">${text}</span>`;
     // 标题与路径都来自外部数据，一律用 textContent / dataset 赋值，不拼进 HTML。
     li.querySelector('.pl-pick').dataset.key = entryKey(e);
-    li.querySelector('.pl-name').textContent = e.title;
+    li.querySelector('.pl-name').textContent = e.title || e.path || e.video_id || '(未知曲目)';
     li.querySelector('.pl-dur').textContent = e.duration ? fmt(e.duration) : '';
     ul.appendChild(li);
   });
@@ -358,6 +360,26 @@ function guessLang(j) {
   return '其他';
 }
 
+/** 曲库繁简混排，搜索前把两边都折成简体，免得打「梦然」搜不到「夢然」。
+ *  对照表由后端按曲库实际用字生成（/api/zh-map），拿不到就退化成原样比对。 */
+const zh = { map: null };
+function toSimp(s) {
+  if (!zh.map || !s) return s || '';
+  let out = '';
+  for (const ch of s) out += zh.map[ch] || ch;
+  return out;
+}
+
+async function loadZhMap() {
+  try {
+    const r = await fetch('/api/zh-map');
+    if (r.ok) {
+      zh.map = await r.json();
+      state.allJobs.forEach((j) => { delete j._si; });   // 缓存的 hay 要重算
+    }
+  } catch { /* 没有对照表也能搜，只是繁简不互通 */ }
+}
+
 /** 检索用的派生字段算一次就缓存在任务对象上：428 首歌逐字比对 collator 并不便宜。 */
 function songInfo(j) {
   if (!j._si) {
@@ -368,6 +390,7 @@ function songInfo(j) {
       lang: guessLang(j),
       chars: (title.match(/[\u4e00-\u9fff]/g) || []).length,   // 字数检索用
       hay: (title + ' ' + artist + ' ' + (j.title || '')).toLowerCase(),
+      hays: toSimp((title + ' ' + artist + ' ' + (j.title || '')).toLowerCase()),
       // 首字母只取汉字部分：像「A-Lin 有一種悲傷」这种混排，用户敲的是
       // yyzbs 而不是 alinyyzbs，把 ASCII 混进来反而搜不到。
       pyTitle: initialsOf(title.replace(/[^\u2e80-\u9fff]/g, '')),
@@ -381,7 +404,7 @@ function songInfo(j) {
 function jobMatches(j, kw) {
   if (!kw) return true;
   const si = songInfo(j);
-  if (si.hay.includes(kw)) return true;
+  if (si.hay.includes(kw) || si.hays.includes(toSimp(kw))) return true;
   // 首字母必须从头匹配。用子串会串味：搜 dx（稻香）会把「淚的小雨」
   // LDXY 也捞出来，曲库一大就全是噪声。
   const up = kw.toUpperCase();
@@ -499,17 +522,30 @@ function renderBrowse(force = false) {
     const groups = new Map();
     list.forEach((j) => {
       const a = songInfo(j).artist || '未知歌手';
-      if (!groups.has(a)) groups.set(a, []);
-      groups.get(a).push(j);
+      // 同一位歌手在曲库里可能繁简两种写法（夢然 / 梦然），按简体归组合成一位；
+      // 显示时沿用该写法里出现最多的那个，不擅自把港台歌手改成简体。
+      const key = toSimp(a);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(j);
+    });
+    const label = new Map();
+    groups.forEach((js, key) => {
+      const tally = new Map();
+      js.forEach((j) => {
+        const a = songInfo(j).artist || '未知歌手';
+        tally.set(a, (tally.get(a) || 0) + 1);
+      });
+      label.set(key, [...tally.entries()].sort((x, y) => y[1] - x[1])[0][0]);
     });
     const names = [...groups.keys()].sort((a, b) =>
-      (pyCollator() || undefined) ? pyCollator().compare(a, b) : a.localeCompare(b));
+      (pyCollator() || undefined) ? pyCollator().compare(label.get(a), label.get(b))
+                                  : label.get(a).localeCompare(label.get(b)));
     artistBox.innerHTML = '';
     names.forEach((n) => {
       const li = document.createElement('li');
       li.className = 'artist-chip';
       li.dataset.artist = n;
-      li.innerHTML = `<span>${escapeHtml(n)}</span><em>${groups.get(n).length}</em>`;
+      li.innerHTML = `<span>${escapeHtml(label.get(n))}</span><em>${groups.get(n).length}</em>`;
       artistBox.appendChild(li);
     });
     $('#browseCount').textContent = `${names.length} 位歌手 · ${list.length} 首`;
@@ -519,7 +555,7 @@ function renderBrowse(force = false) {
   }
 
   if (mode === 'artist' && state.artistPick) {
-    list = list.filter((j) => (songInfo(j).artist || '未知歌手') === state.artistPick);
+    list = list.filter((j) => toSimp(songInfo(j).artist || '未知歌手') === state.artistPick);
   }
   if (mode === 'new') list = list.slice(0, 60);
   else if (mode === 'all') {
@@ -547,7 +583,7 @@ function renderBrowse(force = false) {
   box.appendChild(frag);
 
   $('#browseCount').textContent = state.artistPick
-    ? `${state.artistPick} · ${list.length} 首（点「歌手」返回）`
+    ? `${state.artistLabel || state.artistPick} · ${list.length} 首（点「歌手」返回）`
     : `${list.length} 首`;
   $('#browseEmpty').classList.toggle('hidden', list.length > 0);
   $('#browseEmpty').textContent = kw
@@ -1587,6 +1623,7 @@ function init() {
     const chip = e.target.closest('.artist-chip');
     if (!chip) return;
     state.artistPick = chip.dataset.artist;
+    state.artistLabel = chip.querySelector('span').textContent;
     renderBrowse(true);
   });
 
@@ -1675,6 +1712,8 @@ function init() {
   });
 
   refreshList(true);
+  // 繁简对照表跟曲库走，晚一步到也没关系——到了就把检索字段重算一遍。
+  loadZhMap().then(() => renderBrowse(true));
   // 本地导入默认关闭（部署者不配白名单目录就当没这功能），所以入口按服务端答复决定显隐。
   api.localStatus().then((s) => {
     if (s.enabled) $('#lcGo').classList.remove('hidden');

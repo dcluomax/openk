@@ -94,12 +94,30 @@ def test_extract_id() -> None:
 
 
 def test_dynamic_rejected() -> None:
-    """YouTube 自动生成的电台列表因人而异，批量导入没有意义。"""
+    """电台列表摊不平；链接上没带具体视频时只能报错。"""
     try:
-        playlist.fetch_entries(f"https://www.youtube.com/watch?v=x&list=RD{PL}")
+        playlist.fetch_entries(f"https://www.youtube.com/playlist?list=RD{PL}")
         check("拒绝自动生成的电台列表", False, "本应抛错")
     except playlist.PlaylistError as exc:
         check("拒绝自动生成的电台列表", "电台" in str(exc), str(exc)[:60])
+
+
+def test_dynamic_falls_back_to_single_video() -> None:
+    """电台链接上带着 v= 时，退化成「导入这一首」，而不是让用户手工删参数。"""
+    res = playlist.fetch_entries(
+        "https://www.youtube.com/watch?v=NR7IlJ2AkYE&list=RDxyH9FikBRk8&index=5")
+    check("电台链接退化为单曲", res["total"] == 1 and res.get("dynamic") is True,
+          repr(res.get("total")))
+    check("退化后取到正确的视频 ID",
+          res["entries"][0]["video_id"] == "NR7IlJ2AkYE",
+          repr(res["entries"][0]["video_id"]))
+    check("退化后给出的是干净的单曲链接",
+          "list=" not in res["entries"][0]["url"], res["entries"][0]["url"])
+    check("退化时附带说明原因", "电台" in (res.get("note") or ""), repr(res.get("note")))
+    check("youtu.be 短链也能取到视频 ID",
+          playlist.extract_video_id("https://youtu.be/tY-fL7qisOo?list=RDMM") == "tY-fL7qisOo")
+    check("非观看链接取不到视频 ID",
+          playlist.extract_video_id(PL_URL) is None)
 
 
 def test_truncated_link_message() -> None:
@@ -275,6 +293,7 @@ def main_() -> int:
     print("=== 播放列表批量导入自检 ===\n")
     test_extract_id()
     test_dynamic_rejected()
+    test_dynamic_falls_back_to_single_video()
     test_truncated_link_message()
     test_private_message()
     test_entries_normalised()

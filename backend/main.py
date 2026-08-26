@@ -450,6 +450,43 @@ def list_jobs(q: str | None = Query(None)) -> list[dict]:
     return [_public_job(j) for j in jobs]
 
 
+_ZH_CACHE: dict = {"sig": None, "map": {}}
+
+
+@app.get("/api/zh-map")
+def zh_map() -> dict:
+    """曲库里出现过的繁体字 → 简体字对照表。
+
+    曲库是繁简混排的（港台卡拉OK带多为繁体，内地歌手多为简体），用户打
+    「梦然」搜不到「夢然」、打「曾经的你」搜不到「曾經的你」。前端搜索因此
+    需要做繁简归一，但把整张 OpenCC 表塞进前端太重——这里只导出曲库**实际
+    用到**的那些字，通常几百条、几 KB。
+
+    逐字转换而不是整串转换：zhconv 的词组规则可能改变长度，那样就没法把
+    结果跟原字一一对上了。
+    """
+    jobs = manager.list()
+    sig = (len(jobs), sum(len((j.get("track") or "") + (j.get("artist") or "")) for j in jobs))
+    if _ZH_CACHE["sig"] == sig:
+        return _ZH_CACHE["map"]
+
+    chars = set()
+    for j in jobs:
+        for field in ("track", "artist", "title"):
+            chars.update(ch for ch in (j.get(field) or "") if "\u3400" <= ch <= "\u9fff")
+    try:
+        import zhconv
+    except Exception:  # noqa: BLE001 - 没装就退化成空表，搜索仍可用
+        return {}
+    table = {}
+    for ch in chars:
+        simp = zhconv.convert(ch, "zh-hans")
+        if simp != ch and len(simp) == 1:
+            table[ch] = simp
+    _ZH_CACHE["sig"], _ZH_CACHE["map"] = sig, table
+    return table
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     job = manager.get(job_id)
