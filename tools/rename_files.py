@@ -20,36 +20,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend import config                            # noqa: E402
-from backend.steps.lyrics_sources import guess_meta   # noqa: E402
-from backend.steps.meta_fix import strip_junk         # noqa: E402
-
-_VIDEO_ID = re.compile(r"\s*\[([A-Za-z0-9_-]{6,})\]\s*$")
-_BAD = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
-
-
-def safe_name(s: str) -> str:
-    s = _BAD.sub(" ", s or "")
-    s = re.sub(r"\s+", " ", s).strip(" .")
-    return s[:120]
+from backend.steps import library                      # noqa: E402
+from backend.steps.lyrics_sources import guess_meta    # noqa: E402
+from backend.steps.meta_fix import strip_junk          # noqa: E402
 
 
 def target_name(job: dict, old: Path) -> str | None:
+    """命名规则统一由 backend.steps.library 提供，避免两处各写一套。"""
     artist = (job.get("artist") or "").strip()
     track = (job.get("track") or "").strip()
     if not track:
         meta = guess_meta({"title": job.get("title") or ""})
         artist = artist or (meta.get("artist") or "")
         track = meta.get("track") or ""
-    track = strip_junk(track)
-    artist = strip_junk(artist)
-    if not track:
-        return None
-
-    stem = old.stem
-    m = _VIDEO_ID.search(stem)
-    suffix = f" [{m.group(1)}]" if m else ""
-    base = f"{artist} - {track}" if artist else track
-    return safe_name(base) + suffix + old.suffix
+    return library.canonical_name(
+        strip_junk(artist), strip_junk(track),
+        library.extract_video_id(old.name) or job.get("video_id"), old.suffix)
 
 
 def main() -> int:

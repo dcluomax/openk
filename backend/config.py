@@ -100,6 +100,17 @@ LOCAL_MEDIA_DIRS = [
 # 一次扫描最多列出多少个文件。
 LOCAL_MEDIA_MAX_ITEMS = int(os.environ.get("OPENK_LOCAL_MEDIA_MAX_ITEMS", "1000"))
 
+# --- 统一媒体库 ---
+# 以前本地导入的片子留在原目录，YouTube 下载的音频却埋在 data/jobs/<id>/source/ 里，
+# 处理完还会被删掉。同一批歌散在两处、其中一处还没有名字，既难备份也难复用。
+# 配置这个目录之后，两条来路都会以「歌手 - 歌名 [videoID].ext」归档到同一个地方。
+# 不配置则取 LOCAL_MEDIA_DIRS 的第一个目录，也就是沿用现在的媒体目录。
+LIBRARY_DIR = (os.environ.get("OPENK_LIBRARY_DIR", "").strip()
+               or (LOCAL_MEDIA_DIRS[0] if LOCAL_MEDIA_DIRS else ""))
+# 归档 YouTube 下载的源音频。关掉则维持旧行为（分离完就删）。
+LIBRARY_ARCHIVE_DOWNLOADS = os.environ.get(
+    "OPENK_LIBRARY_ARCHIVE_DOWNLOADS", "1").lower() not in ("0", "false", "no")
+
 # --- 重启续跑 ---
 # 服务重启时，把还在排队/处理中的任务重新排进队列，而不是标记成失败。
 # 批量导入几百首时这条很关键：整批要跑十几个小时，中途任何一次重启

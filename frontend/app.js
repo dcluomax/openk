@@ -408,6 +408,11 @@ async function refreshList(force = false) {
 
 function doneJobs() { return state.allJobs.filter((j) => j.state === 'done'); }
 
+/** 伴奏带没有原唱人声、歌词库也没收录，就是唱得了但没字幕。点歌前先说清楚。 */
+function noLyrics(j) {
+  return j.lyrics_status === 'none' || !(j.line_count > 0);
+}
+
 function songCard(j) {
   const si = songInfo(j);
   const li = document.createElement('li');
@@ -429,6 +434,7 @@ function songCard(j) {
       <button class="sc-play" data-act="play" title="马上唱">▶</button>
     </div>
     ${j.duration ? `<span class="sc-dur">${fmt(j.duration)}</span>` : ''}
+    ${noLyrics(j) ? '<span class="sc-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}
     <span class="sc-flag">已点</span>`;
   return li;
 }
@@ -442,6 +448,7 @@ function songRow(j, idx) {
   li.innerHTML = `
     <span class="sr-no">${idx + 1}</span>
     <span class="sr-title">${escapeHtml(si.title)}</span>
+    ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}
     <span class="sr-artist">${escapeHtml(si.artist || '未知歌手')}</span>
     <span class="sr-lang">${escapeHtml(si.lang)}</span>
     <span class="sr-dur">${j.duration ? fmt(j.duration) : ''}</span>
