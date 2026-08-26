@@ -31,9 +31,12 @@ const dom = new JSDOM(fs.readFileSync(D + '/index.html', 'utf8'), {
   url: 'https://localhost:8443/', runScripts: 'outside-only', pretendToBeVisual: true,
 });
 const w = dom.window;
+const plays = [];
 w.HTMLMediaElement.prototype.load = () => {};
-w.HTMLMediaElement.prototype.play = function () { this.paused = false; return Promise.resolve(); };
-w.HTMLMediaElement.prototype.pause = function () { this.paused = true; };
+w.HTMLMediaElement.prototype.play = function () {
+  plays.push(this.id || '?'); this._playing = true; return Promise.resolve();
+};
+w.HTMLMediaElement.prototype.pause = function () { this._playing = false; };
 w.AudioContext = w.webkitAudioContext = function () {
   const node = () => ({ connect(){}, disconnect(){}, gain:{value:1}, buffer:null,
     threshold:{value:0}, knee:{value:0}, ratio:{value:0}, attack:{value:0}, release:{value:0} });
@@ -82,8 +85,10 @@ setTimeout(() => {
   T($('#adminBadge').textContent === '1', `后台角标显示待处理数（${$('#adminBadge').textContent}）`);
 
   // 点歌
+  plays.length = 0;
   $$('.song-row')[0].querySelector('.sr-pick').dispatchEvent(new w.Event('click', {bubbles:true}));
   return void setTimeout(() => {
+    T(plays.includes('instAudio'), `点歌后自动起播，无需再按 ▶（play 调用：${plays.join(',') || '无'}）`);
     T(w.document.querySelector('#nowbar').classList.contains('hidden') === false, '点歌后常驻控制条出现');
     T($('#nbTitle').textContent === '稻香', `控制条显示歌名（${$('#nbTitle').textContent}）`);
     T($('#modeInst').classList.contains('active'), '默认伴唱模式');
@@ -130,11 +135,22 @@ setTimeout(() => {
     $$('.tab').find(t => t.dataset.tab === 'artist').dispatchEvent(new w.Event('click', {bubbles:true}));
     T($$('.artist-chip').length === 3, `按歌手分组（${$$('.artist-chip').length} 位）`);
 
-    T(errs.length === 0, '运行期无 JS 报错' + (errs.length ? '：' + errs.join('; ') : ''));
+    // 连唱：这首放完自动接队列里的下一首（KTV 的命根子）
+    const before = $('#nbTitle').textContent;
+    plays.length = 0;
+    $('#instAudio').dispatchEvent(new w.Event('ended'));
+    return void setTimeout(() => {
+      T(plays.includes('instAudio'), `唱完自动接下一首（play 调用：${plays.join(',') || '无'}）`);
+      T($('#nbTitle').textContent !== before,
+        `控制条换成下一首（${before} → ${$('#nbTitle').textContent}）`);
+      T($('#nbQueueCount').textContent === '0', `接歌后队列减一（${$('#nbQueueCount').textContent}）`);
 
-    console.log('== 前端冒烟 ==');
-    console.log(out.join('\n'));
-    console.log(fails ? `\n✗ ${fails} 项失败` : '\n✓ 全部通过');
-    process.exit(fails ? 1 : 0);
+      T(errs.length === 0, '运行期无 JS 报错' + (errs.length ? '：' + errs.join('; ') : ''));
+
+      console.log('== 前端冒烟 ==');
+      console.log(out.join('\n'));
+      console.log(fails ? `\n✗ ${fails} 项失败` : '\n✓ 全部通过');
+      process.exit(fails ? 1 : 0);
+    }, 1100);
   }, 120);
 }, 150);

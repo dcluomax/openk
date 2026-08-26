@@ -396,9 +396,14 @@ async function refreshList(force = false) {
     jobs.forEach((j) => { const si = prev.get(j.id); if (si) j._si = si; });
     state.allJobs = jobs;
   } catch { return; }
-  renderBrowse(force);
-  renderProcessing();
-  renderQueue();
+  // 渲染异常不能往外抛：调用方是自递归的定时器，一次抛出就再也不会续上。
+  try {
+    renderBrowse(force);
+    renderProcessing();
+    renderQueue();
+  } catch (e) {
+    console.error('渲染列表失败', e);
+  }
 }
 
 function doneJobs() { return state.allJobs.filter((j) => j.state === 'done'); }
@@ -751,8 +756,13 @@ function startPolling(id) {
   state.pollTimer = setInterval(async () => {
     let job;
     try { job = await api.getJob(id); } catch { return; }
-    updateProgressUI(job);
-    refreshList();
+    // UI 出错不能挡住下面的状态跳转，否则任务已完成却永远卡在进度页。
+    try {
+      updateProgressUI(job);
+      refreshList();
+    } catch (e) {
+      console.error('更新进度失败', e);
+    }
     if (job.state === 'done') { stopPolling(); showPlayer(job); }
     else if (job.state === 'error') { stopPolling(); }
   }, 1200);
@@ -820,6 +830,7 @@ async function showPlayer(job) {
   // 开唱先把麦克风接上（点歌那一下就是用户手势，此时申请授权才会被允许）
   autoEnableMic();
   setSingMode(state.singMode);
+  startPlayback();
   renderNowBar();
 
   // 录音状态重置 + 载入该歌的历史录音
@@ -1174,11 +1185,24 @@ function togglePlay() {
   }
 }
 
+/** 点歌即开唱：KTV 点歌台不会让人再按一次播放键。
+ *
+ *  点歌那一下是用户手势，浏览器允许带声播放；但自动接下一首时没有新手势，
+ *  个别浏览器会拦下来——那就提示一句，绝不能默默停在暂停状态让人干等。 */
+function startPlayback() {
+  const g = ensureAudioGraph();
+  if (g.actx.state === 'suspended') g.actx.resume().catch(() => {});
+  const p = inst.play();
+  if (hasVocal()) { vocal.currentTime = inst.currentTime; vocal.play().catch(() => {}); }
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => toast('浏览器拦下了自动播放，点一下 ▶ 开始'));
+  }
+}
+
 function seekTo(t) {
   inst.currentTime = t;
   if (hasVocal()) vocal.currentTime = t;
 }
-
 function stopAudio(keepMic = false) {
   if (state.recording) stopRecording();
   // 连唱下一首时保留麦克风：每首歌都重新申请一次授权、重建音频图，
@@ -1629,13 +1653,25 @@ function init() {
   // 后台自适应刷新列表：有运行中任务时 3s，全部空闲时放慢到 15s；
   // 页面不可见、或正在逐帧轮询单个任务时跳过，避免无谓请求刷屏。
   const scheduleListRefresh = () => {
+    if (state.listTimer) clearTimeout(state.listTimer);
     const busy = state.allJobs.some((j) => j.state === 'running' || j.state === 'queued');
     state.listTimer = setTimeout(async () => {
-      if (!state.pollTimer && !document.hidden) await refreshList();
-      scheduleListRefresh();
+      // finally 保证无论如何都续上下一轮，否则页面会静默停更、只能手动刷新。
+      try {
+        if (!state.pollTimer && !document.hidden) await refreshList();
+      } catch (e) {
+        console.error('刷新列表失败', e);
+      } finally {
+        scheduleListRefresh();
+      }
     }, busy ? 3000 : 15000);
   };
   scheduleListRefresh();
+  // 息屏/切走时浏览器会暂停定时器，回来后立刻补一次并重新排期，
+  // 免得长时间挂着的标签页显示的是过期曲库。
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { refreshList(); scheduleListRefresh(); }
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);
