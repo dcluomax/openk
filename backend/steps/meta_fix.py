@@ -35,6 +35,16 @@ _JUNK_TRACK = re.compile(
     r"(官方|官方版|完整版|高清|字幕|歌词|歌詞|插曲|片尾|主題曲|主题曲|廣告|广告|"
     r"预告|預告|现场|現場|live版|official|music\s*video|\bmv\b|lyric|karaoke|"
     r"audio\b|version|feat\.)", re.I)
+# 只在歌名**尾巴**上出现的噪声：画质、版本标注之类，跟歌名本身无关。
+# 单独一张表是因为这些词太常见，塞进 _JUNK_TRACK 会让 score() 误杀正常候选。
+_TAIL_JUNK = re.compile(
+    r"\s*[-–—·,、]?\s*(動態歌詞版?|动态歌词版?|歌詞版|歌词版|純享版?|纯享版?|"
+    r"無損音質|无损音质|高音質|高音质|高畫質|高画质|完整版|超清|"
+    r"hd|hq|4k|1080p|720p)\s*$", re.I)
+# 歌手字段整个就是这种词的，等于没填。
+_ARTIST_ONLY_JUNK = re.compile(
+    r"^(官方|官方版|完整版|高清|超清|字幕|歌詞|歌词|動態歌詞|动态歌词|純享|纯享|"
+    r"現場|现场|live|official|lyrics?|karaoke|mv|hd|hq|audio|video|unknown|未知)$", re.I)
 # 歌手字段是唱片公司/频道时同样不可信。
 _LABEL = re.compile(
     r"(唱片|音樂|音乐|娛樂|娱乐|傳媒|传媒|文化|工作室|频道|頻道|records?|"
@@ -153,6 +163,11 @@ def clean_track(name: Optional[str]) -> str:
         return ""
     # （原唱：黃義達）、(未眠版)、(去人聲) 之类的注解
     s = re.sub(r"[（(][^）)]*[）)]", " ", s)
+    # 【動態歌詞】、「往後餘生 風雪是你」这类方括号注解。剥完不能什么都不剩，
+    # 否则整首歌就没名字了。
+    unbracketed = re.sub(r"[【「『〖\[][^】」』〗\]]*[】」』〗\]]", " ", s)
+    if unbracketed.strip(" -–—_·,、"):
+        s = unbracketed
     # 破折号后的宣传尾巴：`Love More - 三立東森偶像劇插曲`
     parts = re.split(r"\s+[-–—]\s+", s)
     if len(parts) > 1 and _JUNK_TRACK.search(parts[-1]):
@@ -162,6 +177,12 @@ def clean_track(name: Optional[str]) -> str:
         m = re.match(r"^(.*?[\u3400-\u9FFF\uF900-\uFAFF][^A-Za-z]*)\s*[A-Za-z][A-Za-z'’,.\s!?&-]*$", s)
         if m and has_cjk(m.group(1)):
             s = m.group(1)
+    # 尾巴上的版本／画质标注，可能叠了好几层：`女人的一生 HD 完整版`
+    while True:
+        stripped = _TAIL_JUNK.sub("", s)
+        if stripped == s or not stripped.strip(" -–—_·,、"):
+            break
+        s = stripped
     return re.sub(r"\s+", " ", s).strip(" -–—_·,、")
 
 
@@ -176,7 +197,9 @@ def clean_artist(name: Optional[str]) -> str:
         cjk = [p for p in parts if has_cjk(p)]
         if cjk:
             s = cjk[0]
-    return re.sub(r"\s+", " ", s).strip(" -–—_·,、")
+    s = re.sub(r"\s+", " ", s).strip(" -–—_·,、")
+    # `完整版`、`官方`这种当不了歌手名，留着还不如空着——空的至少会被补全流程捡起来
+    return "" if _ARTIST_ONLY_JUNK.match(s) else s
 
 
 def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any]]:
