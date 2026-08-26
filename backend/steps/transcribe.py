@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
 from .retry import with_retry
+from .lyrics_layout import split_long_lines
 from ..remote import client as remote
 
 log = logging.getLogger("openk.transcribe")
@@ -103,6 +104,11 @@ def _write_lyrics(lyrics: Dict[str, Any], source: str, out_dir: Path,
     """写出 lyrics.json 与 lyrics.lrc，返回结果摘要。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Whisper 输出的是「语音段」不是「歌词行」，一段常常四五十个字，点歌台上
+    # 一行放不下。这里按演唱停顿切成短句——所有歌词来源都从这个出口写盘，
+    # 放在这里能一次覆盖转写、对齐、LRCLIB 与用户手改。
+    lyrics = dict(lyrics)
+    lyrics["lines"] = split_long_lines(lyrics.get("lines") or [], config.LYRIC_MAX_WIDTH)
     lyrics["source"] = source
     (out_dir / "lyrics.json").write_text(
         json.dumps(lyrics, ensure_ascii=False, indent=2), encoding="utf-8")

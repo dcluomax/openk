@@ -63,6 +63,10 @@ LYRICS_OFFSET_MIN = float(os.environ.get("OPENK_LYRICS_OFFSET_MIN", "0.5"))
 LYRICS_OFFSET_BLOCK = float(os.environ.get("OPENK_LYRICS_OFFSET_BLOCK", "2.0"))
 # 送进 whisperX 的窗口左右各留出的余量（秒）。留一点余量，词才不会被窗口边缘夹住。
 LYRICS_ALIGN_PAD = float(os.environ.get("OPENK_LYRICS_ALIGN_PAD", "0.35"))
+# 单行歌词的最大显示宽度（一个汉字算 2）。Whisper 吐的是「语音段」不是「歌词行」，
+# 一段常有四五十个字，点歌台上一行放不下。超过就按演唱停顿切成短句。
+# 32 ≈ 16 个汉字，接近商业点歌台的习惯；设成 0 表示不切。
+LYRIC_MAX_WIDTH = int(os.environ.get("OPENK_LYRIC_MAX_WIDTH", "32"))
 
 # --- 下载 ---
 # 可选：cookies.txt 路径，用于绕过 YouTube "确认你不是机器人" 校验。
