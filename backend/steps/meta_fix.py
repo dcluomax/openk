@@ -178,6 +178,9 @@ def _queries(title: str, parsed: Dict[str, Optional[str]]) -> List[str]:
     """生成检索词，按可靠度排序，去重。查询次数要克制——LRCLIB 是免费公共服务。"""
     out: List[str] = []
     cands = [parsed.get("track"), strip_junk(_clean_title(title)), parsed.get("artist")]
+    # 头段要在**剥掉括号注解之后**再切，否则 `下山 要不要買菜【創作MV】chinese
+    # dance/...` 会在 `【創作` 处断开，切出来的还是个查不到的脏词。
+    cands += _head_segments(clean_track(title))
     cands += _head_segments(strip_junk(title))
     for q in cands:
         q = strip_junk(q)
@@ -253,6 +256,15 @@ def _local_only_fix(cur_a: Optional[str], cur_t: Optional[str]) -> Optional[Dict
     track = clean_track(cur_t, artist) or None
     if track is None:
         track = cur_t          # 洗没了就别改，有个脏名字也好过没名字
+    # 洗完还超长，说明这压根不是歌名而是一整条介绍语（模块里 MAX_TRACK_LEN
+    # 就是这么定义的）。退一步只留逗号／斜杠前的头段：
+    # `武家坡2021，身騎白馬，國粹戲腔與流行業的完美結合` → `武家坡2021`。
+    # 这一步没有曲库背书，所以只在「已经确定是脏标题」时才做。
+    if track and len(track) > MAX_TRACK_LEN:
+        for head in _head_segments(track):
+            if 2 <= len(head) <= MAX_TRACK_LEN:
+                track = head
+                break
     if (artist or None) == (cur_a or None) and (track or None) == (cur_t or None):
         return None
     return {
