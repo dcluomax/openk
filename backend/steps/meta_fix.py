@@ -28,6 +28,14 @@ _EMOJI = re.compile(
 )
 _FILE_EXT = re.compile(r"\.(mpg|mpeg|mp4|m4v|avi|mkv|wmv|flv|mov|rmvb|ts|webm)\b", re.I)
 _CJK = re.compile(r"[\u3400-\u9FFF\uF900-\uFAFF]")
+# 双向文本控制符（U+202A–202E、U+200E/200F、U+2066–2069）。它们**完全不可见**，
+# 却会让字符串比对、去重、排序全部失效——`來個蹦蹦 Ft. Ella` 看着正常，
+# 实际中间夹了三个 U+202D/U+202C。YouTube 标题里混进这些多半是复制粘贴带来的。
+_BIDI = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# 频道页抓下来的播放量／订阅数：`王琪 • 49M plays`。这不是歌手名的一部分。
+_CHANNEL_STATS = re.compile(
+    r"\s*[•·|]\s*[\d.,]+\s*[KMB]?\s*(plays?|views?|subscribers?|"
+    r"次播放|次观看|次觀看|位订阅者|位訂閱者)\s*$", re.I)
 
 # 曲库里混着一批「把整条 YouTube 标题当歌名」的脏记录，认出来直接否决，
 # 否则校正反而会把干净的歌名换成一长串宣传语。
@@ -40,6 +48,7 @@ _JUNK_TRACK = re.compile(
 _TAIL_JUNK = re.compile(
     r"\s*[-–—·,、]?\s*(動態歌詞版?|动态歌词版?|歌詞版|歌词版|純享版?|纯享版?|"
     r"無損音質|无损音质|高音質|高音质|高畫質|高画质|完整版|超清|"
+    r"官方頻道|官方频道|官方mv|官方版?|official\s*(hd\s*)?mv|official\s*video|"
     r"hd|hq|4k|1080p|720p)\s*$", re.I)
 # 歌手字段整个就是这种词的，等于没填。
 _ARTIST_ONLY_JUNK = re.compile(
@@ -54,9 +63,10 @@ MAX_TRACK_LEN = 24
 
 
 def strip_junk(s: Optional[str]) -> str:
-    """去掉表情符号与文件扩展名——这两样在标题里纯属噪声。"""
+    """去掉表情符号、双向控制符与文件扩展名——这几样在标题里纯属噪声。"""
     if not s:
         return ""
+    s = _BIDI.sub("", s)
     s = _EMOJI.sub(" ", s)
     s = _FILE_EXT.sub(" ", s)
     return re.sub(r"\s+", " ", s).strip()
@@ -141,26 +151,60 @@ def score(cand: Dict[str, Any], title_norm: str, duration: Optional[float],
     return pts
 
 
+def _head_segments(title: str) -> List[str]:
+    """把过长的标题按分隔符切出可能的「歌名头段」。
+
+    YouTube 上常见 `武家坡2021，身騎白馬，國粹戲腔與流行業的完美結合` 这种
+    「歌名＋一长串介绍」的标题，整条拿去检索必然落空。这里退而求其次，
+    只把逗号／斜杠／换行前的头段也当成检索词——真正的采纳门槛仍在 score()：
+    候选名必须本来就出现在原标题里，所以猜错了最坏也只是查不到。
+    """
+    if len(title) <= MAX_TRACK_LEN:
+        return []
+    out: List[str] = []
+    for sep in ("，", ",", "、", "/", "／", "|", "｜", "\n"):
+        head = title.split(sep, 1)[0].strip()
+        if 2 <= len(head) < len(title) and head not in out:
+            out.append(head)
+    # 中文和拉丁字母的交界处也常是「歌名｜频道名」的接缝：
+    # `易燃易爆炸 陳粒chinese dance/...` → `易燃易爆炸 陳粒`
+    m = re.match(r"^(.*[\u3400-\u9FFF\uF900-\uFAFF])\s*[A-Za-z]", title)
+    if m and 2 <= len(m.group(1)) < len(title) and m.group(1) not in out:
+        out.append(m.group(1).strip())
+    return out
+
+
 def _queries(title: str, parsed: Dict[str, Optional[str]]) -> List[str]:
     """生成检索词，按可靠度排序，去重。查询次数要克制——LRCLIB 是免费公共服务。"""
     out: List[str] = []
-    for q in (parsed.get("track"), strip_junk(_clean_title(title)), parsed.get("artist")):
+    cands = [parsed.get("track"), strip_junk(_clean_title(title)), parsed.get("artist")]
+    cands += _head_segments(strip_junk(title))
+    for q in cands:
         q = strip_junk(q)
         # 太短的词（一两个字）检索噪声极大，跳过
         if q and len(q) >= 2 and q not in out:
             out.append(q)
-    return out[:3]
+    return out[:5]
 
 
-def clean_track(name: Optional[str]) -> str:
+def clean_track(name: Optional[str], artist: Optional[str] = None) -> str:
     """清掉歌名尾巴上的英文译名、括号注解与宣传语。
 
     只在**剥完还剩中文**时才剥英文——否则 `Shape of You`、`Love More`
     这类本来就是英文的歌名会被整个抹掉。
+
+    给了 ``artist`` 时还会去掉歌名里重复的歌手前缀：`OneRepublic` +
+    `OneRepublic - Counting Stars` → `Counting Stars`。这种重复来自
+    「标题里带歌手、元数据里也有歌手」，点歌台上显示成两遍很难看。
     """
     s = strip_junk(name)
     if not s:
         return ""
+    if artist:
+        a = re.escape(strip_junk(artist))
+        stripped = re.sub(r"^\s*%s\s*[-–—:：|]\s*" % a, "", s, flags=re.I)
+        if stripped.strip():
+            s = stripped
     # （原唱：黃義達）、(未眠版)、(去人聲) 之类的注解
     s = re.sub(r"[（(][^）)]*[）)]", " ", s)
     # 【動態歌詞】、「往後餘生 風雪是你」这类方括号注解。剥完不能什么都不剩，
@@ -191,6 +235,7 @@ def clean_artist(name: Optional[str]) -> str:
     s = strip_junk(name)
     if not s:
         return ""
+    s = _CHANNEL_STATS.sub("", s)
     if has_cjk(s):
         s = re.sub(r"[（(][A-Za-z .'’-]+[）)]", " ", s)
         parts = re.split(r"\s+[-–—]\s+", s)
@@ -200,6 +245,24 @@ def clean_artist(name: Optional[str]) -> str:
     s = re.sub(r"\s+", " ", s).strip(" -–—_·,、")
     # `完整版`、`官方`这种当不了歌手名，留着还不如空着——空的至少会被补全流程捡起来
     return "" if _ARTIST_ONLY_JUNK.match(s) else s
+
+
+def _local_only_fix(cur_a: Optional[str], cur_t: Optional[str]) -> Optional[Dict[str, Any]]:
+    """不靠曲库、只做本地清洗的兜底方案。没洗出变化就返回 None。"""
+    artist = clean_artist(cur_a) or None
+    track = clean_track(cur_t, artist) or None
+    if track is None:
+        track = cur_t          # 洗没了就别改，有个脏名字也好过没名字
+    if (artist or None) == (cur_a or None) and (track or None) == (cur_t or None):
+        return None
+    return {
+        "artist": artist,
+        "track": track,
+        "score": 0,
+        "matched": "（本地清洗，未匹配曲库）",
+        "before": f"{cur_a or '?'} - {cur_t or '?'}",
+        "changed": True,
+    }
 
 
 def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any]]:
@@ -215,6 +278,11 @@ def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any
                          "artist": job.get("artist"), "track": job.get("track")})
     title_norm = _norm(title)
     duration = job.get("duration")
+
+    cur_a = (job.get("artist") or "").strip() or None
+    cur_t = (job.get("track") or "").strip() or None
+    if cur_t is None:
+        cur_a, cur_t = parsed.get("artist"), parsed.get("track")
 
     best: Optional[Dict[str, Any]] = None
     best_pts = -10**9
@@ -235,15 +303,13 @@ def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any
             time.sleep(sleep)
 
     if not best or best_pts < ACCEPT_SCORE:
-        return None
+        # 曲库里查不到（冷门歌、翻唱、纯伴奏带）也别就这么放着——起码把标题里
+        # 明摆着的噪声洗掉：播放量、画质标注、不可见的双向控制符、重复的歌手前缀。
+        # 这类脏名字不只是难看，还会让除重认不出同一首歌。
+        return _local_only_fix(cur_a, cur_t)
 
     track = (best.get("trackName") or "").strip() or None
     artist = (best.get("artistName") or "").strip() or None
-
-    cur_a = (job.get("artist") or "").strip() or None
-    cur_t = (job.get("track") or "").strip() or None
-    if cur_t is None:
-        cur_a, cur_t = parsed.get("artist"), parsed.get("track")
 
     # 中文歌绝不把中文歌手名换成罗马音：王傑→Dave Wang、陳淑樺→Sarah Chen
     # 这种「修正」在点歌台上是纯粹的倒退，中文用户根本搜不到。
@@ -274,6 +340,11 @@ def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any
         cd, d = best.get("duration"), duration
         if not (cd and d and abs(float(cd) - float(d)) <= ARTIST_DURATION_TOLERANCE):
             artist = strip_junk(parsed.get("artist")) or None
+
+    # 曲库给的名字同样要过一遍清洗：LRCLIB 里也有带画质标注的脏记录。
+    artist = clean_artist(artist) or None
+    cleaned_track = clean_track(track, artist)
+    track = cleaned_track or track
 
     return {
         "artist": artist,
