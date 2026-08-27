@@ -62,17 +62,16 @@ def norm(s: Optional[str]) -> str:
 
 
 def load_jobs() -> List[Dict[str, Any]]:
-    jobs = []
-    for name in sorted(os.listdir(os.path.join(DATA, "jobs"))):
-        p = os.path.join(DATA, "jobs", name, "status.json")
-        if not os.path.exists(p):
-            continue
-        try:
-            with open(p, encoding="utf-8") as f:
-                jobs.append(json.load(f))
-        except Exception:  # noqa: BLE001 - 单个坏文件不该中断整轮扫描
-            pass
-    return jobs
+    """走接口读，而不是直接读 status.json。
+
+    点歌台上显示的歌手／歌名有一部分是**算出来的**——status.json 里没存
+    `track` 时，`_public_job` 会从 `lyrics_source` 或标题现推。直接读盘就看
+    不到这些名字，于是《武家坡2021》两条里有一条的 track 是空的，永远配不上
+    对、也就永远除不掉。除重必须和用户看到的是同一份名字。
+    """
+    with urllib.request.urlopen("%s/api/jobs" % API, timeout=120) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data["jobs"] if isinstance(data, dict) else data
 
 
 def group_duplicates(jobs: List[Dict[str, Any]]) -> Dict[tuple, List[Dict[str, Any]]]:
