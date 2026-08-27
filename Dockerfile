@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 COPY scripts/ ./scripts/
+COPY tools/ ./tools/
 COPY worker/ ./worker/
 COPY run.sh README.md ./
 
