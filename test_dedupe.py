@@ -62,11 +62,13 @@ jobs = [
     job("j8", "張學友", "慢慢", 10, state="running"),               # 还在跑，不参与
 ]
 g = dedupe.group_duplicates(jobs)
-check("繁简写法的同一首歌归到一组", len(g) == 1 and len(list(g.values())[0]) == 2,
+check("繁简写法的同一首歌归到一组", g.get(("张学友", "慢慢")) is not None and len(g[("张学友", "慢慢")]) == 2,
       str({k: [x["id"] for x in v] for k, v in g.items()}))
 check("同歌名不同歌手不算重复（翻唱要分开点）",
       all("如愿" not in k[1] for k in g))
-check("没有歌手的不参与除重", all(x["id"] not in ("j6", "j7") for v in g.values() for x in v))
+check("两条都没歌手时退而按歌名分组（报告里会打标提醒）",
+      any(k[0] == "" and {x["id"] for x in v} == {"j6", "j7"} for k, v in g.items()),
+      str({k: [x["id"] for x in v] for k, v in g.items()}))
 check("还在处理的任务不参与除重",
       all(x["id"] != "j8" for v in g.values() for x in v))
 

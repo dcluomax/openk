@@ -76,12 +76,18 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 
 def group_duplicates(jobs: List[Dict[str, Any]]) -> Dict[tuple, List[Dict[str, Any]]]:
+    """按「歌手＋歌名」分组。歌手都为空时退而只按歌名分，但会打标提醒。
+
+    同名不同歌手当作翻唱，各自保留——点歌台上 譚詠麟 和 周華健 的《朋友》
+    是两首不同的歌。但两条都没歌手时没法这么区分，只能凭歌名判；这种组在
+    报告里标成「歌手未知」，让人过一眼再决定要不要 --apply。
+    """
     groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
     for j in jobs:
         if j.get("state") != "done":
             continue          # 还在跑的、失败的都不参与，免得删掉正在处理的
         t, a = norm(j.get("track")), norm(j.get("artist"))
-        if t and a:           # 没歌手的判不准是不是同一首，宁可放过
+        if t:
             groups[(a, t)].append(j)
     return {k: v for k, v in groups.items() if len(v) > 1}
 
@@ -184,10 +190,12 @@ def main() -> int:
              len(groups), sum(len(v) for v in groups.values())))
 
     dropped, skipped, freed = 0, 0, 0
-    for (_, _), members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+    for (grp_artist, _), members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         ranked = pick_best([measure(j, cache) for j in members])
         head = ranked[0]["job"]
-        print("· %s - %s  ×%d" % (head.get("artist"), head.get("track"), len(members)))
+        warn = "" if grp_artist else "   ⚠️ 歌手未知，仅凭歌名判定为同一首"
+        print("· %s - %s  ×%d%s"
+              % (head.get("artist") or "?", head.get("track"), len(members), warn))
         for i, c in enumerate(ranked):
             j, m = c["job"], c["m"]
             q = ("截止%.1fk 高频%.1fdB 削波%.2f%%"
