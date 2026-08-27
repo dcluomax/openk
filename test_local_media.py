@@ -55,7 +55,10 @@ NO_ID = MEDIA / "手动命名的歌.mp4"
 NESTED = MEDIA / "sub" / "另一首 [ABCDEFGHIJK].mp4"
 NOTES = MEDIA / "readme.txt"
 SECRET = OUTSIDE / "secret.mp4"
-for p in (SONG, NO_ID, NESTED, NOTES, SECRET):
+# 除重挪走的旧版本。扫描必须跳过，否则下次导入又回到曲库，等于白删。
+(MEDIA / "_重复").mkdir()
+STASHED = MEDIA / "_重复" / "某某乐队 - 某首歌 [zzzzzzzzzzy].mp4"
+for p in (SONG, NO_ID, NESTED, NOTES, SECRET, STASHED):
     p.write_bytes(b"fake-media")
 
 ESCAPE_LINK = MEDIA / "看起来很正常 [zzzzzzzzzzz].mp4"
@@ -168,6 +171,14 @@ def test_scan() -> None:
 
     sub = local_media.scan(subdir="sub")
     check("可以只扫某个子目录", len(sub["entries"]) == 1, str(len(sub["entries"])))
+
+    # 除重把淘汰版本挪进了 `_重复/`，扫描不能再把它们当新歌列出来
+    check("`_` 开头的目录不参与扫描",
+          all("_重复" not in e["path"] for e in data["entries"]),
+          str([e["path"] for e in data["entries"] if "_重复" in e["path"]]))
+    stash = local_media.scan(subdir="_重复")
+    check("但明确点进去还是看得到（留个后悔药）",
+          len(stash["entries"]) == 1, str(len(stash["entries"])))
 
     try:
         local_media.scan(subdir="../outside")

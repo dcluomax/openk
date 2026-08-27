@@ -33,6 +33,20 @@ ProgressCb = Optional[Callable[[int, str], None]]
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".ts"}
 AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".aac", ".wma"}
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
+# 以 `_` 或 `.` 开头的子目录一律不参与扫描。除重时被淘汰的版本会挪进
+# `_重复/`，如果扫描还把它们列出来，下次导入又原样回到曲库，等于白删。
+HIDDEN_PREFIXES = ("_", ".")
+
+
+def _in_hidden_dir(path: Path, roots: List[Path]) -> bool:
+    """判断文件是否落在某个 `_`／`.` 开头的子目录里。"""
+    for root in roots:
+        try:
+            parts = path.relative_to(root).parts[:-1]
+        except ValueError:
+            continue
+        return any(p.startswith(HIDDEN_PREFIXES) for p in parts)
+    return False
 
 # yt-dlp 默认的命名模板是 ``%(title)s [%(id)s].%(ext)s``，所以下载来的文件名
 # 结尾大多带着 11 位视频 ID。能认出来就白捡两样东西：跟已有任务去重，
@@ -168,6 +182,8 @@ def scan(subdir: str | None = None, limit: int = 1000) -> Dict[str, Any]:
                 truncated = True
                 break
             if not path.is_file() or path.suffix.lower() not in MEDIA_EXTS:
+                continue
+            if _in_hidden_dir(path, search_roots):
                 continue
             try:
                 st = path.stat()
