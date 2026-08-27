@@ -185,5 +185,29 @@ for title, want in [
 T(_head_segments("海闊天空") == [], "短标题不产生额外检索词")
 T(_head_segments("Never Gonna Give You Up") == [], "纯英文短标题也不切")
 
+# ---- 批量修正时的保守策略（tools/fix_meta.py）----
+# LRCLIB 是模糊搜索，同名歌与翻唱都会命中，批量替换歌手实测错得比对得多。
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("_fm", "tools/fix_meta.py")
+_fm = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_fm)
+for name, job, plan, want_a, want_changed in [
+    ("已有正确歌手不被顶掉", {"artist": "王菲", "track": "但願人長久"},
+     {"artist": "詹雯婷", "track": "但願人長久", "changed": True}, "王菲", False),
+    ("也不接受硬塞英文别名", {"artist": "五月天", "track": "射手"},
+     {"artist": "Mayday 五月天", "track": "射手", "changed": True}, "五月天", False),
+    ("但自己的清洗结果照单全收", {"artist": "王琪 • 49M plays", "track": "可可托海的牧羊人"},
+     {"artist": "王琪", "track": "可可托海的牧羊人", "changed": True}, "王琪", True),
+    ("歌手为空时正常补全", {"artist": None, "track": "小風波"},
+     {"artist": "譚詠麟", "track": "小風波", "changed": True}, "譚詠麟", True),
+    ("噪声歌手同样可以被替换", {"artist": "完整版", "track": "某歌"},
+     {"artist": "周杰倫", "track": "某歌", "changed": True}, "周杰倫", True),
+    ("不换人时歌名照样洗", {"artist": "任賢齊", "track": "傷心太平洋 The Sad Pacific"},
+     {"artist": "任賢齊", "track": "傷心太平洋", "changed": True}, "任賢齊", True),
+]:
+    got = _fm._keep_existing_artist(job, plan)
+    T(got["artist"] == want_a and got["changed"] == want_changed,
+      "%s（%r → %r, changed=%s）" % (name, job["artist"], got["artist"], got["changed"]))
+
+
 print(("\n✗ %d 项失败" % fails) if fails else "\n✓ 全部通过")
 raise SystemExit(1 if fails else 0)
