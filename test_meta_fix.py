@@ -173,6 +173,11 @@ for (a, t), (wa, wt) in [
       "本地兜底清洗 %r → %r" % ((a, t), (wa, wt)))
 T(_local_only_fix("周杰倫", "告白氣球") is None, "本来就干净的不产生改动")
 T(_local_only_fix(None, "完整版") is None, "洗完会变空的歌名保持原样，不改")
+# 洗完还超长 = 这压根不是歌名而是一整条介绍语，退一步只留头段
+_lo = _local_only_fix(None, "武家坡2021，身騎白馬，國粹戲腔與流行業的完美結合")
+T(_lo is not None and _lo["track"] == "武家坡2021", "超长脏标题退回头段 → %r" % (_lo and _lo["track"]))
+# 但没超长的带逗号歌名不能动
+T(_local_only_fix("鄧紫棋", "可不可以，你也剛好喜歡我") is None, "没超长的带逗号歌名不切")
 
 # 「歌名＋一长串介绍」的标题：整条拿去检索必然落空，得把头段也当检索词
 for title, want in [
@@ -180,7 +185,12 @@ for title, want in [
     ("下山 要不要買菜chinese dance/Chinese elegant classical woman", "下山 要不要買菜"),
     ("易燃易爆炸 陳粒chinese dance/Chinese elegant classical woman", "易燃易爆炸 陳粒"),
 ]:
-    T(want in _head_segments(title), "长标题切出头段 %r ∋ %r" % (title[:18], want))
+    T(want in _head_segments(clean_track(title)) or want in _head_segments(title),
+      "长标题切出头段 %r ∋ %r" % (title[:18], want))
+# 括号注解要先剥掉再切，否则切在 `【創作` 上，切出来还是查不到的脏词
+T("下山 要不要買菜" in _head_segments(
+    clean_track("下山  要不要買菜【創作MV】chinese dance/Chinese elegant classical woman")),
+  "先剥括号注解再切头段")
 # 短标题不必切，免得白白多打几次公共服务
 T(_head_segments("海闊天空") == [], "短标题不产生额外检索词")
 T(_head_segments("Never Gonna Give You Up") == [], "纯英文短标题也不切")
