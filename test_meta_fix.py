@@ -5,6 +5,7 @@
 """
 from backend.steps.meta_fix import (
     _norm, has_cjk, score, strip_junk, clean_track, clean_artist, ACCEPT_SCORE,
+    _local_only_fix, _head_segments,
 )
 
 fails = 0
@@ -118,8 +119,28 @@ for raw, want in [
     # 剥完什么都不剩时必须原样保留，不能把歌名清空
     ("【動態歌詞】", "【動態歌詞】"),
     ("完整版", "完整版"),
+    # 官方／画质尾巴可能叠好几层
+    ("像我這樣的人 官方高畫質 Official HD MV", "像我這樣的人"),
+    ("匆匆那年 Official MV (官方頻道)", "匆匆那年"),
+    # 但「官方」出现在歌名内部时不能动
+    ("官方情歌", "官方情歌"),
+    # 不可见的双向控制符：看着一样，比对／除重全废
+    ("來個蹦蹦\u202d \u202cFt\u202d. \u202cElla\u202d \u202c陳嘉樺", "來個蹦蹦 Ft. Ella 陳嘉樺"),
 ]:
     T(clean_track(raw) == want, "清理歌名 %r → %r" % (raw, want))
+
+# 歌名里重复的歌手前缀
+for raw, artist, want in [
+    ("OneRepublic - Counting Stars", "OneRepublic", "Counting Stars"),
+    ("周杰倫：告白氣球", "周杰倫", "告白氣球"),
+    ("Counting Stars", "OneRepublic", "Counting Stars"),
+    # 前缀不是歌手时不能乱剥
+    ("五月天 - 突然好想你", "周杰倫", "五月天 - 突然好想你"),
+    # 剥完什么都不剩就别剥
+    ("周杰倫", "周杰倫", "周杰倫"),
+]:
+    T(clean_track(raw, artist) == want,
+      "去掉重复的歌手前缀 %r + %r → %r" % (raw, artist, want))
 
 for raw, want in [
     ("鄧麗君 (Teresa Teng)", "鄧麗君"),
@@ -132,8 +153,37 @@ for raw, want in [
     ("官方", ""),
     ("Official", ""),
     ("MV", ""),
+    # 频道页抓下来的播放量／订阅数不是歌手名的一部分
+    ("王琪 • 49M plays", "王琪"),
+    ("周杰倫 | 1.2K views", "周杰倫"),
+    ("鄧麗君 · 3,456,789 次觀看", "鄧麗君"),
+    # 但数字本身在歌手名里时不能碰
+    ("五月天 5", "五月天 5"),
 ]:
     T(clean_artist(raw) == want, "清理歌手 %r → %r" % (raw, want))
+
+# 查不到曲库时的本地兜底：脏名字也得洗，否则除重认不出同一首
+for (a, t), (wa, wt) in [
+    (("王琪 • 49M plays", "可可托海的牧羊人"), ("王琪", "可可托海的牧羊人")),
+    (("OneRepublic", "OneRepublic - Counting Stars"), ("OneRepublic", "Counting Stars")),
+    (("毛不易", "像我這樣的人 官方高畫質 Official HD MV"), ("毛不易", "像我這樣的人")),
+]:
+    got = _local_only_fix(a, t)
+    T(got is not None and got["artist"] == wa and got["track"] == wt,
+      "本地兜底清洗 %r → %r" % ((a, t), (wa, wt)))
+T(_local_only_fix("周杰倫", "告白氣球") is None, "本来就干净的不产生改动")
+T(_local_only_fix(None, "完整版") is None, "洗完会变空的歌名保持原样，不改")
+
+# 「歌名＋一长串介绍」的标题：整条拿去检索必然落空，得把头段也当检索词
+for title, want in [
+    ("武家坡2021，身騎白馬，國粹戲腔與流行業的完美結合", "武家坡2021"),
+    ("下山 要不要買菜chinese dance/Chinese elegant classical woman", "下山 要不要買菜"),
+    ("易燃易爆炸 陳粒chinese dance/Chinese elegant classical woman", "易燃易爆炸 陳粒"),
+]:
+    T(want in _head_segments(title), "长标题切出头段 %r ∋ %r" % (title[:18], want))
+# 短标题不必切，免得白白多打几次公共服务
+T(_head_segments("海闊天空") == [], "短标题不产生额外检索词")
+T(_head_segments("Never Gonna Give You Up") == [], "纯英文短标题也不切")
 
 print(("\n✗ %d 项失败" % fails) if fails else "\n✓ 全部通过")
 raise SystemExit(1 if fails else 0)
