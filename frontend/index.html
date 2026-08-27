@@ -118,9 +118,13 @@
           <label class="mon" title="把麦克风的声音一起放出来（和真正的 KTV 一样）">
             <input type="checkbox" id="monitor" checked /> 麦克风外放
           </label>
+          <label class="mon" title="麦克风离音箱太近会尖叫（啸叫）。开着会自动找到啸叫的频率并把它挖掉，实在压不住就临时调小外放">
+            <input type="checkbox" id="howlGuard" checked /> 防啸叫
+          </label>
           <button id="recBtn" class="rec">🎤 开始录唱</button>
           <span id="recStatus" class="muted small"></span>
           <span id="micHint" class="hint"></span>
+          <span id="howlHint" class="hint howl hidden"></span>
         </div>
 
         <div class="rec-list-wrap hidden" id="recListWrap">
