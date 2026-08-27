@@ -322,11 +322,21 @@ def plan_fix(job: Dict[str, Any], sleep: float = 0.35) -> Optional[Dict[str, Any
     # 已有的中文歌名不该被英文译名顶掉。
     if track and cur_t and has_cjk(cur_t) and not has_cjk(track):
         track = cur_t
-    # 候选歌名只是在原名后面又缀了译名/副标题时（一場遊戲一場夢 - One Game,
-    # One Dream），取更短的那个——点歌台要的是能一眼认出的歌名。
+    # 候选歌名只是在原名前后又缀了译名/副标题/歌手名时（一場遊戲一場夢 - One
+    # Game, One Dream；麦小兜 - 9420），取更短的那个——点歌台要的是能一眼认
+    # 出的歌名。
     if track and cur_t:
         n_new, n_cur = _norm(track), _norm(cur_t)
-        if n_cur and n_cur != n_new and n_new.startswith(n_cur):
+        if n_cur and n_cur != n_new and (n_new.startswith(n_cur) or n_new.endswith(n_cur)):
+            track = cur_t
+    # 曲库给的歌名必须是当前歌名「掐头去尾」的结果，不能是从中间抠一段。
+    # 「候选名出现在原标题里」这条底线挡不住 `阿信的故事` → `信` 这种截断：
+    # 它确实是子串，却是另一首歌。真正的清洗只会去掉开头的歌手前缀或结尾的
+    # 宣传尾巴，所以要求前缀或后缀关系，中间命中一律不采纳。
+    if track and cur_t and not _JUNK_TRACK.search(cur_t) and len(cur_t) <= MAX_TRACK_LEN:
+        n_new, n_cur = _norm(track), _norm(cur_t)
+        if n_new and n_cur and not (n_cur.startswith(n_new) or n_cur.endswith(n_new)
+                                    or n_new.startswith(n_cur) or n_new.endswith(n_cur)):
             track = cur_t
     # 归一化后完全相同就保留原文，别做无谓的繁简互换：曲库繁简混排会让
     # 同一个歌手在点歌台上分裂成两个人。

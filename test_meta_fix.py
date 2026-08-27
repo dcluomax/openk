@@ -5,7 +5,7 @@
 """
 from backend.steps.meta_fix import (
     _norm, has_cjk, score, strip_junk, clean_track, clean_artist, ACCEPT_SCORE,
-    _local_only_fix, _head_segments,
+    _local_only_fix, _head_segments, _JUNK_TRACK, MAX_TRACK_LEN,
 )
 
 fails = 0
@@ -207,6 +207,44 @@ for name, job, plan, want_a, want_changed in [
     got = _fm._keep_existing_artist(job, plan)
     T(got["artist"] == want_a and got["changed"] == want_changed,
       "%s（%r → %r, changed=%s）" % (name, job["artist"], got["artist"], got["changed"]))
+
+
+# ---- 曲库候选歌名的采纳边界 ----
+# 「候选名出现在原标题里」挡不住从中间抠一段：`阿信的故事` → `信` 确实是子串，
+# 却是另一首歌。真正的清洗只会掐头或去尾，所以只认前缀／后缀关系。
+def _accept_track(cur_t, new):
+    """复刻 plan_fix 里对候选歌名的两道过滤，单独测边界。"""
+    track = new
+    n_new, n_cur = _norm(track), _norm(cur_t)
+    if n_cur and n_cur != n_new and (n_new.startswith(n_cur) or n_new.endswith(n_cur)):
+        track = cur_t
+    if track and cur_t and not _JUNK_TRACK.search(cur_t) and len(cur_t) <= MAX_TRACK_LEN:
+        a, b = _norm(track), _norm(cur_t)
+        if a and b and not (b.startswith(a) or b.endswith(a)
+                            or a.startswith(b) or a.endswith(b)):
+            track = cur_t
+    return track
+
+
+for cur, new, want in [
+    # 从中间抠一段 = 另一首歌，一律不采纳
+    ("阿信的故事", "信", "阿信的故事"),
+    ("可不可以，你也剛好喜歡我", "很久以後", "可不可以，你也剛好喜歡我"),
+    ("Demons", "Imagine Dragons", "Demons"),
+    # 候选反而更长（前缀塞了歌手名）时留短的
+    ("9420", "麦小兜 - 9420", "9420"),
+    # 正常的掐头去尾照常采纳
+    ("Snow (Hey Oh)", "Snow", "Snow"),
+    ("若月亮没来 (若是月亮还没来)", "若月亮没来", "若月亮没来"),
+    ("Coldplay - Yellow", "Yellow", "Yellow"),
+    ("宋冬野 - 安和桥", "安和桥", "安和桥"),
+    ("OneRepublic - Counting Stars", "Counting Stars", "Counting Stars"),
+    ("愛人錯過 Somewhere in time", "愛人錯過", "愛人錯過"),
+    # 当前歌名本来就是一整条脏标题时不设限，曲库怎么给都比现在强
+    ("武家坡2021，身騎白馬，國粹戲腔與流行業的完美結合", "武家坡2021", "武家坡2021"),
+]:
+    T(_accept_track(cur, new) == want,
+      "候选歌名采纳 %r + %r → %r" % (cur[:20], new, want))
 
 
 print(("\n✗ %d 项失败" % fails) if fails else "\n✓ 全部通过")
