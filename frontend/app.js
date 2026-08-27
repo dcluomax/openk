@@ -1128,11 +1128,167 @@ const MONITOR_GAIN = 1.8;
 // 限幅后的补偿增益。限幅器把峰值压到 -3dB 附近，乘回来刚好接近满刻度而不削顶。
 const MIC_MAKEUP = 1.4;
 
+/* ---------- 防啸叫 ---------- */
+// 麦克风离音箱太近就会尖叫：音箱的声音被麦克风再拾回去、再放大、再拾回去，
+// 环路增益一旦大于 1，房间里某个共振频率就会指数级涨到削顶为止。
+// 限幅器只能把它压得没那么伤耳朵，治不了成因——要真止住，必须把那个频率
+// 从环路里挖掉，或者干脆把环路增益拉回 1 以下。
+//
+// 好在啸叫和唱歌在频谱上长得完全不一样，这是能自动判别的根据：
+//   · 啸叫是共振被反复放大出的「一根针」，能量几乎全堆在一个频点上；
+//   · 人声再飙高音也是一串泛音（基频 + 2f + 3f…），谱线是「一把梳子」；
+//   · 啸叫锁死在房间共振上纹丝不动，人声就算长音也有揉弦、有漂移。
+// 三条都对上才算数，避免把长音误伤成啸叫。
+const HOWL = {
+  minHz: 180,           // 以下是伴奏低频，本来就厚，不参与
+  maxHz: 8000,          // 以上多是气声齿音，能量低、误判多
+  peakOverMedianDb: 18, // 峰值高出频谱中位数多少 dB 才算「尖」
+  harmonicDb: 10,       // 2f/3f 也这么突出就是泛音列 → 是人声，放过
+  quietDb: -70,         // 比这还小说明根本没出声
+  holdFrames: 6,        // 连续几帧锁在同一频点才确认（约 100ms）
+  binTol: 2,            // 容许的频率漂移，人声的揉弦远大于此
+  releaseMs: 12000,     // 一个陷波多久没再啸叫就放开
+  maxFilters: 4,        // 陷波器上限，挖太多会把声音掏空
+  notchQ: 24,
+  burstMs: 2500,        // 这段时间内反复啸叫就认为陷波按不住
+  burstHits: 2,
+  duckTo: 0.22,         // 按不住时监听增益掐到多少
+  duckMs: 40,           // 掐下去要快过啸叫涨起来的速度
+  holdMs: 1200,         // 安静多久才开始恢复
+  recoverMs: 2500,      // 恢复要慢，免得一放开又炸
+};
+// 同一处反复啸叫就一档档挖深，别一上来就把整段频率挖没。
+const NOTCH_DEPTHS = [-15, -26, -38];
+
+/** 从一帧频谱里挑出「疑似啸叫」的那根针；不像就返回 null。
+ *  spec 是 AnalyserNode.getFloatFrequencyData 的输出（dB），binHz 是每格的赫兹数。 */
+function findHowlPeak(spec, binHz, cfg = HOWL) {
+  const lo = Math.max(1, Math.ceil(cfg.minHz / binHz));
+  const hi = Math.min(spec.length - 1, Math.floor(cfg.maxHz / binHz));
+  if (hi - lo < 8) return null;
+  let bin = -1, peak = -Infinity;
+  const vals = [];
+  for (let i = lo; i <= hi; i++) {
+    const v = spec[i];
+    if (!Number.isFinite(v)) continue;
+    vals.push(v);
+    if (v > peak) { peak = v; bin = i; }
+  }
+  if (bin < 0 || vals.length < 8 || peak < cfg.quietDb) return null;
+  vals.sort((a, b) => a - b);
+  const median = vals[vals.length >> 1];
+  const prominence = peak - median;
+  if (prominence < cfg.peakOverMedianDb) return null;
+  // 泛音检查。注意峰值不一定落在基频上——人声常常是第二、三泛音最响——
+  // 所以查的是「峰值的整数倍上还有没有东西」，对基频和泛音都成立。
+  let harmonics = 0;
+  for (const mult of [2, 3]) {
+    const h = bin * mult;
+    if (h + 1 > hi) continue;
+    let hv = -Infinity;
+    for (let k = h - 1; k <= h + 1; k++) if (Number.isFinite(spec[k]) && spec[k] > hv) hv = spec[k];
+    if (hv - median >= cfg.harmonicDb) harmonics++;
+  }
+  if (harmonics >= 2) return null;
+  return { bin, hz: bin * binHz, db: peak, prominence };
+}
+
+/** 盯住连续多帧都待在同一频点的那根针。
+ *  「像啸叫」和「就是啸叫」的分界全在这一步：正反馈会赖着不走，人声会飘。 */
+function makeHowlTracker(cfg = HOWL) {
+  let bin = -1, hits = 0, lastDb = -Infinity;
+  return {
+    push(peak) {
+      if (!peak) { bin = -1; hits = 0; lastDb = -Infinity; return null; }
+      if (bin >= 0 && Math.abs(peak.bin - bin) <= cfg.binTol) hits++;
+      else { bin = peak.bin; hits = 1; }
+      // 正反馈只会越长越响；已经削顶的啸叫则是平的，所以判「没在明显衰减」。
+      const rising = peak.db > lastDb - 1;
+      lastDb = peak.db;
+      if (hits >= cfg.holdFrames && rising) { hits = 0; return peak; }
+      return null;
+    },
+    reset() { bin = -1; hits = 0; lastDb = -Infinity; },
+  };
+}
+
+// AudioParam 的排程方法在测试替身里可能没有，退回直接赋值。
+function rampParam(param, value, ms, actx) {
+  if (!param) return;
+  if (actx && typeof actx.currentTime === 'number' && typeof param.linearRampToValueAtTime === 'function') {
+    try {
+      const t = actx.currentTime;
+      param.cancelScheduledValues(t);
+      param.setValueAtTime(param.value, t);
+      param.linearRampToValueAtTime(value, t + Math.max(0.001, ms / 1000));
+      return;
+    } catch {}
+  }
+  param.value = value;
+}
+
+/** 串成一串的陷波器。确认一处啸叫就在那个频率上挖一个窄坑，
+ *  把环路增益压回 1 以下——这是唯一能「不降音量也止住啸叫」的办法。
+ *  用 peaking 而非 notch：深度可以随顽固程度一档档加，也不会一刀切没。 */
+function makeNotchBank(actx, cfg = HOWL) {
+  const filters = [];
+  for (let i = 0; i < cfg.maxFilters; i++) {
+    const f = actx.createBiquadFilter();
+    f.type = 'peaking';
+    f.frequency.value = 1000;
+    f.Q.value = cfg.notchQ;
+    f.gain.value = 0;
+    if (i > 0) filters[i - 1].connect(f);
+    filters.push(f);
+  }
+  const slots = filters.map(() => ({ hz: 0, level: -1, at: 0 }));
+  const apply = (i) => {
+    const s = slots[i];
+    if (s.level < 0) { rampParam(filters[i].gain, 0, 120, actx); return; }
+    filters[i].frequency.value = s.hz;
+    rampParam(filters[i].gain, NOTCH_DEPTHS[s.level], 30, actx);
+  };
+  return {
+    input: filters[0],
+    output: filters[filters.length - 1],
+    filters, slots,
+    /** 返回 'deepen' | 'add' | 'steal'，供上层判断陷波是否已经按不住。 */
+    engage(hz, now) {
+      const near = (a, b) => Math.abs(a - b) <= Math.max(25, b * 0.05);
+      for (let i = 0; i < slots.length; i++) {
+        if (slots[i].level >= 0 && near(slots[i].hz, hz)) {
+          slots[i].level = Math.min(NOTCH_DEPTHS.length - 1, slots[i].level + 1);
+          slots[i].at = now; apply(i);
+          return 'deepen';
+        }
+      }
+      let idx = slots.findIndex((s) => s.level < 0);
+      const kind = idx >= 0 ? 'add' : 'steal';
+      // 都占满了就顶掉最久没用的那个：新叫起来的比早就安静的更该管。
+      if (idx < 0) idx = slots.reduce((m, s, i) => (s.at < slots[m].at ? i : m), 0);
+      slots[idx] = { hz, level: 0, at: now };
+      apply(idx);
+      return kind;
+    },
+    /** 久未复发的坑要填回去，否则唱着唱着声音就被掏空了。 */
+    release(now) {
+      for (let i = 0; i < slots.length; i++) {
+        if (slots[i].level >= 0 && now - slots[i].at > cfg.releaseMs) {
+          slots[i] = { hz: 0, level: -1, at: now }; apply(i);
+        }
+      }
+    },
+    active() { return slots.filter((s) => s.level >= 0).map((s) => s.hz); },
+    reset(now = 0) { for (let i = 0; i < slots.length; i++) { slots[i] = { hz: 0, level: -1, at: now }; apply(i); } },
+  };
+}
+
 /* ---------- 用户偏好（存浏览器本地，换台设备互不影响） ---------- */
 const PREF_KEY = 'openk.prefs';
 const PREF_DEFAULTS = {
   micMonitor: true,   // 默认把麦克风外放——真正的 KTV 就是插上麦就有声
   micVol: 110,        // 裸麦（关掉 AGC）电平远低于成品伴奏，得给到 1 以上才压得住
+  howlGuard: true,    // 外放就必然有啸叫风险，防护默认开着
   reverb: 'ktv',
   singMode: 'inst',   // KTV 默认伴唱
   v: 2,               // 偏好版本，用来做一次性迁移
@@ -1353,12 +1509,35 @@ async function ensureMic(quiet = false) {
   micGain.connect(micDry); micDry.connect(g.recordBus);
   micGain.connect(micSend); micSend.connect(micConv); micConv.connect(micWet); micWet.connect(g.recordBus);
   micDry.connect(monitorGain); micWet.connect(monitorGain);
-  monitorGain.connect(limiter); limiter.connect(micMakeup); micMakeup.connect(g.speakerBus);
+
+  // 防啸叫只挂在监听支路上，不碰录音总线：陷波和急掐都是为了断开
+  // 「音箱→麦克风」这个环路，环路一断，麦克风自然也就不再拾到啸叫，
+  // 录音跟着就干净了。反过来若挖在录音路上，一旦误判就是永久性损伤。
+  const bank = makeNotchBank(g.actx);
+  const howlDuck = g.actx.createGain();
+  monitorGain.connect(bank.input);
+  bank.output.connect(howlDuck);
+  howlDuck.connect(limiter); limiter.connect(micMakeup); micMakeup.connect(g.speakerBus);
+
+  // 分析点取在 micGain 之后：这里听到的就是送去放大的东西，
+  // 麦克风推子拉到 0 时自然什么也测不到，不会空转误报。
+  const analyser = g.actx.createAnalyser();
+  analyser.fftSize = 4096;          // 48kHz 下每格约 11.7Hz，够窄的陷波定位
+  analyser.smoothingTimeConstant = 0; // 要看瞬时涨势，不能被平滑抹平
+  micGain.connect(analyser);
 
   g.mic = { micSrc, micGain, micDry, micSend, micConv, micWet };
   g.monitorGain = monitorGain;
   g.limiter = limiter;
   g.micMakeup = micMakeup;
+  g.howl = {
+    analyser, bank, duck: howlDuck,
+    spec: new Float32Array(analyser.frequencyBinCount),
+    tracker: makeHowlTracker(),
+    binHz: g.actx.sampleRate / analyser.fftSize,
+    hits: [], ducked: false, lastAt: 0, raf: 0,
+  };
+  startHowlGuard();
   micGain.gain.value = prefs.micVol / 100;
   const p = REVERB_PRESETS[$('#reverb').value] || REVERB_PRESETS.none;
   micConv.buffer = makeIR(g.actx, p.seconds, p.decay);
@@ -1371,6 +1550,80 @@ function micHint(msg) {
   if (el) el.textContent = msg || '';
 }
 
+function howlHint(msg) {
+  const el = $('#howlHint');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.classList.toggle('hidden', !msg);
+}
+
+const fmtHz = (hz) => (hz >= 1000 ? (hz / 1000).toFixed(1) + 'k' : Math.round(hz)) + 'Hz';
+
+/** 走一帧防啸叫：测 → 判 → 挖坑 →（按不住就）急掐 → 平静后慢慢还回来。
+ *  拆成纯粹按 now 推进的一步，方便脱离 rAF 和真实音频直接测。 */
+function howlTick(g, now, cfg = HOWL) {
+  const h = g && g.howl;
+  if (!h) return null;
+  // 没外放就没有「音箱→麦克风」这个环路，也就不可能啸叫，不必空转做 FFT。
+  if (g.monitorGain && !(g.monitorGain.gain.value > 0)) { h.tracker.reset(); return null; }
+  h.analyser.getFloatFrequencyData(h.spec);
+  const confirmed = h.tracker.push(findHowlPeak(h.spec, h.binHz, cfg));
+  let acted = null;
+  if (confirmed) {
+    h.bank.engage(confirmed.hz, now);
+    h.lastAt = now;
+    h.hits = h.hits.filter((t) => now - t < cfg.burstMs);
+    h.hits.push(now);
+    acted = confirmed;
+    // 陷波挖了还照叫，说明环路增益高得离谱（麦克风基本贴在音箱上了），
+    // 或者共振点在不停乱窜。这时候只能直接把监听掐小——难听一下下，
+    // 总好过一屋子人捂耳朵。
+    if (!h.ducked && h.hits.length >= cfg.burstHits) {
+      h.ducked = true;
+      rampParam(h.duck.gain, cfg.duckTo, cfg.duckMs, g.actx);
+    }
+    const hz = h.bank.active().map(fmtHz).join('、');
+    howlHint(h.ducked ? `⚠️ 啸叫压不住，已临时调小外放（${hz}）——请把麦克风拿远离音箱`
+                      : `🔇 已自动压掉啸叫 ${hz}`);
+  }
+  h.bank.release(now);
+  if (h.ducked && now - h.lastAt > cfg.holdMs) {
+    h.ducked = false;
+    h.hits = [];
+    rampParam(h.duck.gain, 1, cfg.recoverMs, g.actx);
+    howlHint('');
+  } else if (!h.ducked && h.lastAt && now - h.lastAt > cfg.releaseMs) {
+    h.lastAt = 0;
+    howlHint('');
+  }
+  return acted;
+}
+
+function startHowlGuard() {
+  const g = state.audioGraph;
+  if (!g || !g.howl || g.howl.raf) return;
+  const loop = () => {
+    const h = state.audioGraph && state.audioGraph.howl;
+    if (!h || !h.raf) return;
+    // 关掉开关就只是停止判定，链路照旧——陷波要先复位，
+    // 免得把上一轮挖的坑留在声音里。
+    if (prefs.howlGuard) howlTick(state.audioGraph, performance.now());
+    else if (h.bank.active().length || h.ducked) resetHowlGuard();
+    h.raf = requestAnimationFrame(loop);
+  };
+  g.howl.raf = requestAnimationFrame(loop);
+}
+
+function resetHowlGuard() {
+  const h = state.audioGraph && state.audioGraph.howl;
+  if (!h) return;
+  h.bank.reset(performance.now());
+  h.tracker.reset();
+  h.hits = []; h.lastAt = 0;
+  if (h.ducked) { h.ducked = false; rampParam(h.duck.gain, 1, 200, state.audioGraph.actx); }
+  howlHint('');
+}
+
 /** 开唱时按偏好自动把麦克风外放接上。
  *  必须在用户手势（点播放 / 点歌）之后调用，否则浏览器不给授权。 */
 async function autoEnableMic() {
@@ -1381,7 +1634,7 @@ async function autoEnableMic() {
   try {
     const g = await ensureMic(true);          // quiet：失败不弹窗，免得打断唱歌
     g.monitorGain.gain.value = MONITOR_GAIN;
-    micHint('麦克风已接通；若啸叫请调低麦克风音量或让麦远离音箱');
+    micHint('麦克风已接通；防啸叫已开启，若仍尖叫请把麦克风拿远离音箱');
   } catch {
     box.checked = false;                       // 授权失败就老实关掉，但保留偏好，下首歌再试
   }
@@ -1441,6 +1694,13 @@ function stopRecording() {
 function cleanupMic() {
   const g = state.audioGraph;
   if (state.micStream) { state.micStream.getTracks().forEach((t) => t.stop()); state.micStream = null; }
+  if (g && g.howl) {
+    if (g.howl.raf) cancelAnimationFrame(g.howl.raf);
+    g.howl.raf = 0;
+    try { [g.howl.analyser, g.howl.duck, ...g.howl.bank.filters].forEach((n) => n.disconnect && n.disconnect()); } catch {}
+    g.howl = null;
+    howlHint('');
+  }
   if (g && g.mic) {
     try { Object.values(g.mic).forEach((n) => n.disconnect && n.disconnect()); } catch {}
     g.mic = null;
@@ -1569,6 +1829,17 @@ function bindPlayer() {
     if (g && g.monitorGain) g.monitorGain.gain.value = on ? MONITOR_GAIN : 0;
     if (!on) maybeReleaseMic();
   });
+
+  const hg = $('#howlGuard');
+  if (hg) {
+    hg.checked = prefs.howlGuard;
+    hg.addEventListener('change', () => {
+      prefs.howlGuard = hg.checked;
+      savePrefs();
+      if (!hg.checked) resetHowlGuard();
+      howlHint(hg.checked ? '' : '⚠️ 防啸叫已关闭，麦克风离音箱近了会尖叫');
+    });
+  }
 
   // 空格键播放/暂停
   document.addEventListener('keydown', (e) => {
