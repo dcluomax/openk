@@ -300,10 +300,17 @@ worker 停在那里，服务端只会显示 worker 离线，任务一直排队�
 **1. 共享存储要在 worker 之前就绪。**
 开机后 worker 很可能比挂载先起来，对着还不存在的路径反复报错。
 用 [`deploy/ensure-mount.sh.example`](../deploy/ensure-mount.sh.example) 挡在前面：
-它只**等待**挂载出现，等不到就退出，交给 `KeepAlive` 退避重试。
+它先**等待**挂载出现，等不到就退出，交给 `KeepAlive` 退避重试。
 
-挂载本身交给系统既有的登录项（macOS 上用 `open smb://…`，走钥匙串凭据），
-不要在磁盘上另存一份密码。
+挂载本身优先交给系统既有的登录项（macOS 上用 `open smb://…`，走钥匙串凭据），
+不要在磁盘上另存一份密码。但登录项**不可靠**：实测机器重启后它可能什么都没挂上，
+而且不报任何错——现象是 worker 一直退避重试，`/Volumes` 下干干净净。
+所以脚本里留了兜底：配上 `OPENK_SMB_URL=smb://用户名@主机/共享名`，
+宽限期内还没挂上就自己调一次 `open`，同样复用钥匙串凭据，密码不落盘。
+
+> **兜底一定要用 `open smb://…`，不要用 `mount_smbfs`。** 除了下面「挂两次」那条，
+> 还有个更硬的原因：`/Volumes` 属主是 root，普通用户根本创建不了挂载点，
+> 而 `open` 走的 NetAuth 会自己把挂载点建好、挂完再收走。
 
 > **两个代价很高的坑**，都是实测撞出来的：
 >
@@ -405,6 +412,42 @@ curl -s http://<服务端>:8000/api/worker/status
 
 > 换成系统级 LaunchDaemon **绕不过**这个限制，而且 daemon 看不到登录会话里的
 > SMB/AFP 挂载点，共享存储会直接消失。用 LaunchAgent + 授权才是正解。
+
+### macOS worker：`Operation not permitted`，可 SSH 进去明明读得到
+
+任务在准备输入阶段就挂，错误指向共享存储上一个确实存在、权限也正常的文件：
+
+```
+PermissionError: [Errno 1] Operation not permitted: '/Volumes/Media/openk/data/jobs/…/source.m4a'
+```
+
+你 SSH 上去 `cat` 一下——**完全正常**。于是很容易往 SMB 属主、mode、挂载参数上查，
+全是死路。真正的原因是 macOS 的**「网络卷」隐私授权**（`kTCCServiceSystemPolicyNetworkVolumes`）：
+launchd 托管的进程没有会话可以弹窗，系统不问，直接**静默拒绝**，
+返回的 `EPERM` 和真正的权限问题一模一样。
+
+> **别用 SSH 验证这件事。** `sshd` 自带「完全磁盘访问」，且该授权会传给子进程，
+> 所以从 SSH 里跑什么都通过——这是个彻头彻尾的假阳性对照组。
+> 唯一可信的验证方式：临时 bootstrap 一个 one-shot LaunchAgent，
+> 让它跑**待测的那个解释器**，把结果写进文件再看。
+
+授权对象也有坑。Homebrew 的 `bin/python3.12` 只是个 34 KB 的壳，
+运行时会 re-exec 进 `…/Versions/3.12/Resources/Python.app/Contents/MacOS/Python`。
+**授权登记在壳上永远不会生效**——TCC 认的是真正执行的那个二进制。
+到「系统设置 ▸ 隐私与安全性 ▸ 完全磁盘访问」里，把 `Python.app` 本身拖进去
+（路径条目和 bundle 条目各加一次最稳妥）。
+
+还有两条别浪费时间去试的：
+
+- **靠「责任进程」继承是行不通的。** 套一层 `sh -c`、或者用 `open -a Terminal`
+  借终端已有的授权，实测都照样被拒。
+- **加完授权不重启等于没加。** `tccd` 会缓存判定结果，而
+  `launchctl kickstart -k gui/$UID/com.apple.tccd` 被 SIP 挡住（报 `150`）。
+  只能重启。加完发现毫无变化，多半就是卡在这。
+
+> 授权是**按 Cellar 里的具体版本路径**记的，`brew upgrade python@3.12` 一升级，
+> 路径变了，授权就悄悄失效，故障现象和第一次一模一样。
+> 装完记得 `brew pin python@3.12`。
 
 ### 共享存储的属主
 
