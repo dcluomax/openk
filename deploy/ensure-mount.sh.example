@@ -1,30 +1,65 @@
 #!/bin/sh
 # 启动 worker 前，等共享存储就绪。
 #
-# 这里只「等待」不「挂载」，是刻意的：挂载已经由系统里既有的登录项完成
-# （它用钥匙串凭据，不需要在磁盘上另存一份密码）。本脚本要解决的是时序问题——
-# 开机后 worker 可能比挂载先起来，对着还不存在的路径反复报错。
+# 首要职责是解决时序问题——开机后 worker 可能比挂载先起来，
+# 对着还不存在的路径反复报错。
 #
-# 两条走过弯路、别再踩的经验：
-#  1. 不要另起一个 mount_smbfs 挂到别处：macOS 不允许同一共享挂两次，
-#     后挂的会一直 "File exists"，而且两份挂载点也会让路径映射产生歧义。
+# 挂载本身优先交给系统里既有的登录项（它用钥匙串凭据，不必在磁盘上另存密码）。
+# 但登录项并不可靠：实测机器重启后它可能什么都没挂上，而且不报任何错。
+# 所以配了 OPENK_SMB_URL 时，宽限期内仍未就绪就由本脚本兜底挂一次。
+#
+# 三条走过弯路、别再踩的经验：
+#  1. 兜底不要用 mount_smbfs：macOS 不允许同一共享挂两次，后挂的会一直
+#     "File exists"，两份挂载点也会让路径映射产生歧义；而且 /Volumes 是
+#     root 属主，普通用户根本创建不了挂载点。走 `open smb://…` 才对——
+#     那是登录项用的同一套 NetAuth：复用钥匙串凭据、自己建挂载点、
+#     已经挂上时不会重复挂。
 #  2. 挂载点绝对不要放在 $HOME 里面。家目录会被各种 CLI / 编辑器 / 索引器
 #     递归扫描，一旦扫进一个几十 TB 的网络共享，就会永久卡在 opendir 上——
 #     现象是进程 0% CPU、没有任何网络连接，极难定位。
+#  3. 已挂载但探针不通，别在这里重挂。那是 macOS「网络卷」隐私授权没给到
+#     真正执行的二进制，重挂一万次也没用，见 docs/distributed.md。
 MOUNT_POINT="${OPENK_SMB_MOUNT:-/Volumes/Media}"
 PROBE="${OPENK_SMB_PROBE:-$MOUNT_POINT/openk/data}"
 WAIT_SECONDS="${OPENK_SMB_WAIT:-120}"
+# 兜底挂载地址，形如 smb://用户名@主机/共享名。留空＝只等待、不主动挂载。
+# 密码不写在这里：首次手工挂载时让系统存进钥匙串，这里就能免密复用。
+SMB_URL="${OPENK_SMB_URL:-}"
+# 先把机会留给登录项，避免两边同时发起 NetAuth 请求。
+GRACE_SECONDS="${OPENK_SMB_GRACE:-20}"
+
+is_mounted() {
+    /sbin/mount | grep -qF " on ${MOUNT_POINT} ("
+}
 
 waited=0
+tried_mount=0
 while [ "$waited" -lt "$WAIT_SECONDS" ]; do
     if [ -d "$PROBE" ]; then
         [ "$waited" -gt 0 ] && echo "[mount] $PROBE 就绪（等了 ${waited}s）"
         exit 0
     fi
+
+    if [ -n "$SMB_URL" ] && [ "$tried_mount" -eq 0 ] &&
+       [ "$waited" -ge "$GRACE_SECONDS" ] && ! is_mounted; then
+        tried_mount=1
+        echo "[mount] 等了 ${waited}s 登录项仍未挂上 $MOUNT_POINT，兜底挂载 $SMB_URL"
+        /usr/bin/open "$SMB_URL" >/dev/null 2>&1 ||
+            echo "[mount] open 调用失败——当前没有可用的图形会话？"
+    fi
+
     sleep 5
     waited=$((waited + 5))
 done
 
 echo "[mount] 等待 ${WAIT_SECONDS}s 后 $PROBE 仍不可用，本轮不启动 worker"
-echo "[mount] 检查登录项是否挂上了 $MOUNT_POINT：mount | grep $MOUNT_POINT"
+if is_mounted; then
+    echo "[mount] $MOUNT_POINT 已挂载但探针不通，是隐私授权问题，重挂没用："
+    echo "[mount] 「系统设置 → 隐私与安全性 → 完全磁盘访问」里加上真正执行的二进制"
+elif [ -z "$SMB_URL" ]; then
+    echo "[mount] $MOUNT_POINT 未挂载。配上 OPENK_SMB_URL 可让本脚本兜底挂载"
+else
+    echo "[mount] 兜底挂载 $SMB_URL 没成功。多半是钥匙串里没有该共享的凭据，"
+    echo "[mount] open 会弹窗等人输密码——先手工挂一次并勾选「记住密码」"
+fi
 exit 1

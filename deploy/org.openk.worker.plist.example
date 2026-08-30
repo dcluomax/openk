@@ -13,6 +13,7 @@
 
   ProgramArguments 里先跑 ensure-mount.sh：挂载没就绪就直接退出，
   由 KeepAlive 按 ThrottleInterval 退避重试，而不是让 worker 对着空路径刷错误日志。
+  worker.env 要在它之前 source——ensure-mount.sh 的 OPENK_SMB_* 也从那里读。
 -->
 <plist version="1.0">
 <dict>
@@ -23,7 +24,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>"$HOME/openk/bin/ensure-mount.sh" || exit 1; set -a; . "$HOME/openk/worker.env"; set +a; cd "$HOME/openk"; exec "$HOME/openk/.venv/bin/python" worker/openk_worker.py</string>
+    <string>set -a; . "$HOME/openk/worker.env"; set +a; "$HOME/openk/bin/ensure-mount.sh" || exit 1; cd "$HOME/openk"; exec "$HOME/openk/.venv/bin/python" worker/openk_worker.py</string>
   </array>
 
   <key>RunAtLoad</key><true/>
