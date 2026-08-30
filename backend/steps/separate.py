@@ -5,14 +5,17 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from .. import config
 from .retry import with_retry
@@ -32,6 +35,81 @@ def _resolve_stem(out_dir: Path, wanted: str) -> Optional[Path]:
         if p.is_file() and p.suffix.lower() in {".mp3", ".wav", ".flac", ".m4a"}:
             return p
     return None
+
+
+_GENERIC_FAIL = "produced no output files"
+
+
+def _failure_detail(recent: "deque[str]", last_line: str) -> str:
+    """从分离器输出里挑一句真正说明问题的错误。
+
+    分离器失败时最后一行往往是 “Separation produced no output files — see errors
+    above.”，指不到任何原因，真正的异常在更上面。只把末行抛出去会让排查无从下手
+    （5.1 片源崩在 np.concatenate 的问题就是这样被掩盖了很久），所以这里回溯挑出
+    最后一条具体错误，套话仅作兜底。
+    """
+    for line in reversed(recent):
+        if _GENERIC_FAIL in line:
+            continue
+        if "error" in line.lower() or line.startswith("Traceback"):
+            return line
+    return last_line
+
+
+def _audio_channels(path: Path) -> Optional[int]:
+    """探测首条音轨的声道数；探测不出来返回 None，按原样交给分离器。"""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=channels", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, errors="replace", timeout=30,
+        )
+    except Exception:  # noqa: BLE001 — 探测只是前置优化，失败不该拖垮分离本身
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    if not lines:
+        return None
+    try:
+        return int(lines[0].strip())
+    except ValueError:
+        return None
+
+
+def _downmix_to_stereo(src: Path, dst_dir: Path) -> Path:
+    """把多声道（或单声道）源转成 2 声道 WAV。
+
+    输出用 WAV 而非 MP3：分离器读完即弃，没必要多一次有损编码。
+    """
+    dst = dst_dir / "stereo.wav"
+    proc = subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-i", str(src),
+         "-vn", "-ac", "2", "-c:a", "pcm_s16le", str(dst)],
+        capture_output=True, text=True, errors="replace",
+    )
+    if proc.returncode != 0 or not dst.exists():
+        tail = (proc.stderr or "").strip().splitlines()
+        detail = tail[-1] if tail else f"ffmpeg 退出码 {proc.returncode}"
+        raise RuntimeError(f"多声道源降混为立体声失败：{detail}")
+    return dst
+
+
+@contextlib.contextmanager
+def _stereo_source(audio_path: Path, on_progress: ProgressCb) -> Iterator[Path]:
+    """确保送进分离器的音频是立体声，必要时先降混。
+
+    MDX 系模型把输入按固定的 2 声道张量建图，喂 5.1 片源（YouTube 上的演唱会、
+    MV 相当常见）会在 np.concatenate 处抛 ValueError。而 CLI 只在末行留一句
+    「Separation produced no output files」，真实报错被吞掉——表现就是这首歌
+    无论重试多少次都失败，且错误信息完全指不到原因。
+    """
+    channels = _audio_channels(audio_path)
+    if channels is None or channels == 2:
+        yield audio_path
+        return
+    if on_progress:
+        on_progress(0, f"源文件为 {channels} 声道，正在降混为立体声…")
+    with tempfile.TemporaryDirectory(prefix="openk-downmix-") as td:
+        yield _downmix_to_stereo(audio_path, Path(td))
 
 
 def separate(
@@ -66,10 +144,12 @@ def separate_local(
     """在本机执行分离（worker 进程直接调用这个函数）。
 
     分离器偶尔会原生崩溃，跟歌本身无关，重跑一次基本就好，所以这里带一次重试。
+    降混放在重试外层：重复降混没有意义，且同一份临时文件可跨重试复用。
     """
-    return with_retry(
-        lambda: _separate_local_once(audio_path, out_dir, model, on_progress),
-        label="人声分离", on_progress=on_progress)
+    with _stereo_source(Path(audio_path), on_progress) as src:
+        return with_retry(
+            lambda: _separate_local_once(src, out_dir, model, on_progress),
+            label="人声分离", on_progress=on_progress)
 
 
 def _separate_local_once(
@@ -143,12 +223,14 @@ def _separate_local_once(
     timer.start()
 
     last_line = ""
+    recent: deque[str] = deque(maxlen=40)
     try:
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
             last_line = line
+            recent.append(line)
             if on_progress:
                 m = _PCT_RE.search(line)
                 if m:
@@ -165,7 +247,7 @@ def _separate_local_once(
             "或减小 OPENK_SEPARATOR_SEGMENT_SIZE（如 128），也可换更小的模型。"
         )
     if code != 0:
-        raise RuntimeError(f"人声分离失败（退出码 {code}）：{last_line}")
+        raise RuntimeError(f"人声分离失败（退出码 {code}）：{_failure_detail(recent, last_line)}")
 
     vocals = _resolve_stem(out_dir, "vocals")
     instrumental = _resolve_stem(out_dir, "instrumental")
