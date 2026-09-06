@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .. import config
 from .queue import queue
+from .artifacts import InvalidResult, PROTOCOL_VERSION
 
 queue.lease_seconds = config.WORKER_LEASE_SECONDS
 queue.offline_after = config.WORKER_OFFLINE_AFTER
@@ -28,18 +29,21 @@ def _auth(authorization: Optional[str]) -> None:
 
 class ClaimRequest(BaseModel):
     worker_id: str
+    protocol_version: Optional[int] = None
     kinds: List[str] = Field(default_factory=list)
     wait: float = 25.0
 
 
 class ProgressRequest(BaseModel):
     worker_id: str
+    claim_token: Optional[str] = None
     percent: int = 0
     message: str = ""
 
 
 class FinishRequest(BaseModel):
     worker_id: str
+    claim_token: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
@@ -48,6 +52,10 @@ class FinishRequest(BaseModel):
 def claim(req: ClaimRequest, authorization: str | None = Header(None)) -> Response:
     """长轮询领取任务；没有活时挂起到超时返回 204。"""
     _auth(authorization)
+    if req.protocol_version != PROTOCOL_VERSION:
+        raise HTTPException(status_code=426,
+                            detail="Worker protocol v2 required; update worker/openk_worker.py "
+                                   "with the controller before accepting more tasks")
     task = queue.claim(req.worker_id, req.kinds, min(max(req.wait, 0.0), 60.0))
     if task is None:
         return Response(status_code=204)
@@ -59,7 +67,9 @@ def claim(req: ClaimRequest, authorization: str | None = Header(None)) -> Respon
 def progress(task_id: str, req: ProgressRequest,
              authorization: str | None = Header(None)) -> dict:
     _auth(authorization)
-    ok = queue.progress(task_id, req.worker_id, req.percent, req.message)
+    if not req.claim_token:
+        raise HTTPException(status_code=426, detail="claim_token required; update worker to protocol v2")
+    ok = queue.progress(task_id, req.worker_id, req.percent, req.message, req.claim_token)
     return {"ok": ok}
 
 
@@ -67,7 +77,14 @@ def progress(task_id: str, req: ProgressRequest,
 def finish(task_id: str, req: FinishRequest,
            authorization: str | None = Header(None)) -> dict:
     _auth(authorization)
-    ok = queue.finish(task_id, req.worker_id, req.result, req.error)
+    if not req.claim_token:
+        raise HTTPException(status_code=426, detail="claim_token required; update worker to protocol v2")
+    try:
+        ok = queue.finish(task_id, req.worker_id, req.result, req.error, req.claim_token)
+    except InvalidResult as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Artifact commit interrupted; retry this claim") from exc
     return {"ok": ok}
 
 

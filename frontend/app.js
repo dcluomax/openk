@@ -2,6 +2,35 @@
 
 /* ---------------- 工具 ---------------- */
 const $ = (sel) => document.querySelector(sel);
+async function fetchResponse(url, options = {}, timeout = 20000, consume = null) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, timeout);
+  try {
+    const r = await fetch(url, { ...options, signal: controller.signal });
+    return consume ? await consume(r) : r;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener('abort', abort);
+  }
+}
+async function responseJSON(r) {
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw Object.assign(new Error(detail.detail || `请求失败（HTTP ${r.status}）`), { status: r.status });
+  }
+  return r.json();
+}
+const fetchJSON = (url, options) => fetchResponse(url, options, 20000, responseJSON);
+function bounded(promise, milliseconds, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), milliseconds); }),
+  ]).finally(() => clearTimeout(timer));
+}
 const api = {
   async createJob(payload) {
     const r = await fetch('/api/jobs', {
@@ -12,9 +41,12 @@ const api = {
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '创建任务失败');
     return r.json();
   },
-  async listJobs() { const r = await fetch('/api/jobs'); return r.ok ? r.json() : []; },
-  async getJob(id) { const r = await fetch('/api/jobs/' + id); if (!r.ok) throw new Error('任务不存在'); return r.json(); },
-  async deleteJob(id) { await fetch('/api/jobs/' + id, { method: 'DELETE' }); },
+  listJobs(options = {}) { return fetchJSON('/api/jobs', { cache: 'no-cache', ...options }); },
+  getJob(id, options = {}) { return fetchJSON('/api/jobs/' + encodeURIComponent(id), { cache: 'no-cache', ...options }); },
+  async deleteJob(id) {
+    const r = await fetchResponse('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!r.ok) throw new Error(`删除失败（HTTP ${r.status}）`);
+  },
   async retryJob(id, payload) {
     const r = await fetch('/api/jobs/' + id + '/retry', {
       method: 'POST',
@@ -30,13 +62,15 @@ const api = {
     return r.json();
   },
   async alignLyrics(id, payload) {
-    const r = await fetch(`/api/jobs/${id}/lyrics/align`, {
+    return fetchResponse(`/api/jobs/${id}/lyrics/align`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    }, 20000, async (r) => {
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '对齐失败');
+      return { accepted: r.status === 202, data: await r.json() };
     });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '对齐失败');
-    return r.json();
   },
+  getOperation(id, options) { return fetchJSON('/api/operations/' + encodeURIComponent(id), options); },
   async updateLyrics(id, payload) {
     const r = await fetch('/api/jobs/' + id + '/lyrics', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -45,8 +79,11 @@ const api = {
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
     return r.json();
   },
-  async listRecordings(id) { const r = await fetch(`/api/jobs/${id}/recordings`); return r.ok ? r.json() : []; },
-  async deleteRecording(id, file) { await fetch(`/api/jobs/${id}/recordings/${encodeURIComponent(file)}`, { method: 'DELETE' }); },
+  listRecordings(id, options) { return fetchJSON(`/api/jobs/${id}/recordings`, options); },
+  async deleteRecording(id, file) {
+    const r = await fetchResponse(`/api/jobs/${id}/recordings/${encodeURIComponent(file)}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(`删除失败（HTTP ${r.status}）`);
+  },
   async previewPlaylist(payload) {
     const r = await fetch('/api/playlists/preview', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -95,6 +132,39 @@ const fmt = (s) => {
 /* ---------------- 全局状态 ---------------- */
 const state = {
   currentJobId: null,
+  inspectedJobId: null,
+  selectionGeneration: 0,
+  selectionRequestGeneration: 0,
+  selectionRequest: null,
+  lyricsGeneration: 0,
+  lyricsRequest: null,
+  recordingsGeneration: 0,
+  recordingsRequest: null,
+  pollGeneration: 0,
+  pollRequest: null,
+  listRequest: null,
+  listForce: false,
+  endedTimer: null,
+  lyricRaf: 0,
+  lyricWords: [],
+  activeWord: -2,
+  micRequest: null,
+  micGeneration: 0,
+  monitorHidden: false,
+  alignmentTimers: new Map(),
+  alignmentRequests: new Map(),
+  alignmentSubmitting: new Set(),
+  alignmentOperations: {},
+  recordingSession: null,
+  recordingStarting: false,
+  recordingStartGeneration: 0,
+  pendingRecordings: new Map(),
+  buffering: false,
+  audioStatus: '',
+  playbackGeneration: 0,
+  playRequested: false,
+  lastSyncAt: 0,
+  disposed: false,
   pollTimer: null,
   listTimer: null,
   lyrics: null,      // { language, lines:[{start,end,text,words:[{text,start,end}]}] }
@@ -305,37 +375,8 @@ async function onPickerImport() {
   }
 }
 
-/* ---------------- 拼音首字母检索 ----------------
- * KTV 点歌的习惯是敲首字母（「世界因你」→ SJYN）。这里不带字库：
- * 用 pinyin 排序规则把汉字和 23 个「边界字」比大小，落在哪一格就是哪个字母。
- * 边界字必须正好 23 个，和 PY_LETTERS 一一对应（拼音里没有 I / U / V 打头）。 */
-const PY_BOUNDS = ['阿', '八', '嚓', '哒', '蛾', '发', '噶', '哈', '击', '喀', '垃', '妈',
-                   '拿', '哦', '啪', '期', '然', '撒', '塌', '挖', '昔', '压', '匝'];
-const PY_LETTERS = 'ABCDEFGHJKLMNOPQRSTWXYZ';
-let _collator;
-function pyCollator() {
-  if (_collator === undefined) {
-    try {
-      const c = new Intl.Collator('zh-Hans-CN-u-co-pinyin');
-      // 探一下这个环境到底认不认拼音排序，不认就退化成「只按原文搜」。
-      _collator = c.compare('啊', '波') < 0 && c.compare('波', '啊') > 0 ? c : null;
-    } catch { _collator = null; }
-  }
-  return _collator;
-}
-
-function initialsOf(text) {
-  const c = pyCollator();
-  let out = '';
-  for (const ch of String(text || '')) {
-    if (/[a-zA-Z0-9]/.test(ch)) { out += ch.toUpperCase(); continue; }
-    if (!c || ch.charCodeAt(0) < 0x2e80) continue;   // 非汉字（标点等）直接跳过
-    for (let i = PY_BOUNDS.length - 1; i >= 0; i--) {
-      if (c.compare(ch, PY_BOUNDS[i]) >= 0) { out += PY_LETTERS[i]; break; }
-    }
-  }
-  return out;
-}
+const { pyCollator, initialsOf } = OpenKSearch;
+const librarySearch = OpenKSearch.create();
 
 /* ---------------- 曲库 ---------------- */
 const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
@@ -360,73 +401,69 @@ function guessLang(j) {
   return '其他';
 }
 
-/** 曲库繁简混排，搜索前把两边都折成简体，免得打「梦然」搜不到「夢然」。
- *  对照表由后端按曲库实际用字生成（/api/zh-map），拿不到就退化成原样比对。 */
-const zh = { map: null };
-function toSimp(s) {
-  if (!zh.map || !s) return s || '';
-  let out = '';
-  for (const ch of s) out += zh.map[ch] || ch;
-  return out;
-}
+/** 全量单字表也能把「繁体输入 / 纯简体曲库」折成同一写法。 */
+const zh = { map: null, version: 0 };
 
 async function loadZhMap() {
   try {
     const r = await fetch('/api/zh-map');
     if (r.ok) {
       zh.map = await r.json();
-      state.allJobs.forEach((j) => { delete j._si; });   // 缓存的 hay 要重算
+      zh.version++;
+      librarySearch.setMap(zh.map);
+      state.allJobs.forEach((j) => { delete j._si; });
     }
   } catch { /* 没有对照表也能搜，只是繁简不互通 */ }
 }
 
 /** 检索用的派生字段算一次就缓存在任务对象上：428 首歌逐字比对 collator 并不便宜。 */
 function songInfo(j) {
-  if (!j._si) {
+  const key = JSON.stringify([j.track, j.title, j.artist, zh.version, j.search_index]);
+  if (!j._si || j._siKey !== key) {
+    j._siKey = key;
     const title = j.track || j.title || '未命名';
     const artist = j.artist || '';
     j._si = {
       title, artist,
       lang: guessLang(j),
       chars: (title.match(/[\u4e00-\u9fff]/g) || []).length,   // 字数检索用
-      hay: (title + ' ' + artist + ' ' + (j.title || '')).toLowerCase(),
-      hays: toSimp((title + ' ' + artist + ' ' + (j.title || '')).toLowerCase()),
-      // 首字母只取汉字部分：像「A-Lin 有一種悲傷」这种混排，用户敲的是
-      // yyzbs 而不是 alinyyzbs，把 ASCII 混进来反而搜不到。
-      pyTitle: initialsOf(title.replace(/[^\u2e80-\u9fff]/g, '')),
-      pyArtist: initialsOf(artist.replace(/[^\u2e80-\u9fff]/g, '')),
       letter: (initialsOf(artist || title)[0] || '#'),
     };
   }
   return j._si;
 }
 
-function jobMatches(j, kw) {
-  if (!kw) return true;
-  const si = songInfo(j);
-  if (si.hay.includes(kw) || si.hays.includes(toSimp(kw))) return true;
-  // 首字母必须从头匹配。用子串会串味：搜 dx（稻香）会把「淚的小雨」
-  // LDXY 也捞出来，曲库一大就全是噪声。
-  const up = kw.toUpperCase();
-  return si.pyTitle.startsWith(up) || si.pyArtist.startsWith(up);
-}
-
 async function refreshList(force = false) {
-  try {
-    const jobs = await api.listJobs();
-    // 后端按时间倒序返回；派生字段挂在旧对象上，能复用就复用，别白算拼音。
-    const prev = new Map(state.allJobs.map((j) => [j.id, j._si]));
-    jobs.forEach((j) => { const si = prev.get(j.id); if (si) j._si = si; });
-    state.allJobs = jobs;
-  } catch { return; }
-  // 渲染异常不能往外抛：调用方是自递归的定时器，一次抛出就再也不会续上。
-  try {
-    renderBrowse(force);
-    renderProcessing();
-    renderQueue();
-  } catch (e) {
-    console.error('渲染列表失败', e);
-  }
+  if (state.disposed) return;
+  state.listForce ||= force;
+  if (state.listRequest) return state.listRequest;
+  state.listRequest = (async () => {
+    try {
+      const jobs = await api.listJobs();
+      if (!Array.isArray(jobs)) throw new Error('曲库响应格式不正确');
+      if (state.disposed) return;
+      const prev = new Map(state.allJobs.map((j) => [j.id, j]));
+      jobs.forEach((j) => {
+        const old = prev.get(j.id);
+        if (old) { j._si = old._si; j._siKey = old._siKey; }
+      });
+      state.allJobs = jobs;
+      $('#catalogStatus').textContent = '';
+      $('#catalogStatus').classList.add('hidden');
+      renderBrowse(state.listForce);
+      renderProcessing();
+      renderQueue();
+    } catch (e) {
+      if (!state.disposed) {
+        $('#catalogStatus').textContent = '曲库暂时无法更新，保留上次结果。' + (e.message || '');
+        $('#catalogStatus').classList.remove('hidden');
+      }
+    } finally {
+      state.listForce = false;
+      state.listRequest = null;
+    }
+  })();
+  return state.listRequest;
 }
 
 function doneJobs() { return state.allJobs.filter((j) => j.state === 'done'); }
@@ -470,12 +507,12 @@ function songRow(j, idx) {
   if (state.queue.includes(j.id)) li.classList.add('queued');
   li.innerHTML = `
     <span class="sr-no">${idx + 1}</span>
-    <span class="sr-title">${escapeHtml(si.title)}</span>
-    ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}
+    <span class="sr-name"><span class="sr-title">${escapeHtml(si.title)}</span>
+      ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}</span>
     <span class="sr-artist">${escapeHtml(si.artist || '未知歌手')}</span>
     <span class="sr-lang">${escapeHtml(si.lang)}</span>
     <span class="sr-dur">${j.duration ? fmt(j.duration) : ''}</span>
-    <button class="sr-pick" data-act="pick">点歌</button>`;
+    <button class="sr-pick" data-act="pick" aria-label="点歌：${escapeHtml(si.title)}">点歌</button>`;
   return li;
 }
 
@@ -488,7 +525,7 @@ function renderLangBar(all) {
     counts.set(l, (counts.get(l) || 0) + 1);
   });
   const names = [...counts.entries()].sort((a, b) => b[1] - a[1]).map((e) => e[0]);
-  const sig = names.join(',') + '|' + state.lang;
+  const sig = names.map((n) => `${n}:${counts.get(n)}`).join(',') + '|' + state.lang;
   if (bar.dataset.sig === sig) return;
   bar.dataset.sig = sig;
   bar.innerHTML = '';
@@ -496,25 +533,28 @@ function renderLangBar(all) {
     const b = document.createElement('button');
     b.className = 'lang-btn' + (state.lang === v ? ' active' : '');
     b.dataset.lang = v;
+    b.setAttribute('aria-pressed', String(state.lang === v));
     b.textContent = label;
     bar.appendChild(b);
   });
 }
 
 function renderBrowse(force = false) {
-  const kw = state.search.trim().toLowerCase();
+  syncQueuedMarkers();
+  const query = librarySearch.query(state.search);
+  const kw = query.text;
   const all = doneJobs();
   renderLangBar(all);
   let list = all;
   if (state.lang) list = list.filter((j) => songInfo(j).lang === state.lang);
-  if (kw) list = list.filter((j) => jobMatches(j, kw));
+  if (kw) list = librarySearch.search(list, query);
 
   const grid = $('#grid'), artistBox = $('#artistList'), rows = $('#songList');
   const mode = kw ? 'all' : state.libMode;   // 搜索时不分组，直接给结果
 
   // 「歌手」页：先列歌手，点进去再看这位歌手的歌
   if (mode === 'artist' && !state.artistPick) {
-    const sig = `A:${list.length}:${kw}`;
+    const sig = `A:${state.lang}:${list.map(jobRenderKey).join('|')}:${kw}`;
     if (!force && sig === _browseSig) return;
     _browseSig = sig;
     grid.classList.add('hidden'); rows.classList.add('hidden');
@@ -524,7 +564,7 @@ function renderBrowse(force = false) {
       const a = songInfo(j).artist || '未知歌手';
       // 同一位歌手在曲库里可能繁简两种写法（夢然 / 梦然），按简体归组合成一位；
       // 显示时沿用该写法里出现最多的那个，不擅自把港台歌手改成简体。
-      const key = toSimp(a);
+      const key = librarySearch.artistKey(a);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(j);
     });
@@ -542,7 +582,8 @@ function renderBrowse(force = false) {
                                   : label.get(a).localeCompare(label.get(b)));
     artistBox.innerHTML = '';
     names.forEach((n) => {
-      const li = document.createElement('li');
+      const li = document.createElement('button');
+      li.type = 'button';
       li.className = 'artist-chip';
       li.dataset.artist = n;
       li.innerHTML = `<span>${escapeHtml(label.get(n))}</span><em>${groups.get(n).length}</em>`;
@@ -555,18 +596,12 @@ function renderBrowse(force = false) {
   }
 
   if (mode === 'artist' && state.artistPick) {
-    list = list.filter((j) => toSimp(songInfo(j).artist || '未知歌手') === state.artistPick);
+    list = list.filter((j) => librarySearch.artistKey(songInfo(j).artist || '未知歌手') === state.artistPick);
   }
   if (mode === 'new') list = list.slice(0, 60);
-  else if (mode === 'all') {
-    const c = pyCollator();
-    list = [...list].sort((a, b) => {
-      const x = songInfo(a).title, y = songInfo(b).title;
-      return c ? c.compare(x, y) : x.localeCompare(y);
-    });
-  }
+  else if (mode === 'all' && !kw) list = librarySearch.search(list, query);
 
-  const sig = `${mode}:${state.view}:${state.lang}:${state.artistPick || ''}:${kw}:${list.map((j) => j.id).join(',')}:${state.queue.join(',')}`;
+  const sig = `${mode}:${state.view}:${state.lang}:${state.artistPick || ''}:${state.search}:${list.map(jobRenderKey).join('|')}`;
   if (!force && sig === _browseSig) return;
   _browseSig = sig;
 
@@ -582,13 +617,25 @@ function renderBrowse(force = false) {
   list.forEach((j, i) => frag.appendChild(useGrid ? songCard(j) : songRow(j, i)));
   box.appendChild(frag);
 
-  $('#browseCount').textContent = state.artistPick
+  $('#browseCount').textContent = mode === 'artist' && state.artistPick
     ? `${state.artistLabel || state.artistPick} · ${list.length} 首（点「歌手」返回）`
     : `${list.length} 首`;
   $('#browseEmpty').classList.toggle('hidden', list.length > 0);
   $('#browseEmpty').textContent = kw
-    ? `没搜到「${state.search.trim()}」。可以试试歌名首字母，比如 pyzy。`
+    ? `没搜到「${state.search.trim()}」。试试歌名、歌手、全拼或首字母，也可用空格组合搜索。`
     : '曲库还是空的，去「⚙️ 后台」添加歌曲。';
+}
+
+function jobRenderKey(j) {
+  return JSON.stringify([j.id, songInfo(j).title, songInfo(j).artist, songInfo(j).lang,
+    j.thumbnail, j.duration, j.line_count, j.lyrics_status]);
+}
+
+function syncQueuedMarkers() {
+  const queued = new Set(state.queue);
+  document.querySelectorAll('.song-row, .song-card').forEach((el) => {
+    el.classList.toggle('queued', queued.has(el.dataset.id));
+  });
 }
 
 /* ---------------- 已点歌曲（KTV 的核心交互） ---------------- */
@@ -596,7 +643,7 @@ const QUEUE_KEY = 'openk.queue';
 
 function saveQueue() { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue)); } catch {} }
 function loadQueue() {
-  try { state.queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').filter(Boolean); }
+  try { state.queue = [...new Set(JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').filter((id) => typeof id === 'string'))]; }
   catch { state.queue = []; }
 }
 
@@ -606,21 +653,21 @@ function addToQueue(id, playNow = false) {
   if (playNow) {
     state.queue = state.queue.filter((q) => q !== id);
     state.queue.unshift(id);
-    saveQueue(); renderQueue(); renderBrowse(true);
+    saveQueue(); renderQueue(); renderBrowse();
     playFromQueue();
     return;
   }
   if (state.queue.includes(id)) { toast('这首已经在已点列表里了'); return; }
   state.queue.push(id);
-  saveQueue(); renderQueue(); renderBrowse(true);
+  saveQueue(); renderQueue(); renderBrowse();
   // 没在唱歌就直接开唱，符合「点了就响」的预期
-  if (!state.currentJobId) playFromQueue();
+  if (!state.currentJobId && !state.selectionRequest) playFromQueue();
   else toast(`已点：${songInfo(jobById(id) || {}).title || ''}（第 ${state.queue.length} 位）`);
 }
 
 function removeFromQueue(id) {
   state.queue = state.queue.filter((q) => q !== id);
-  saveQueue(); renderQueue(); renderBrowse(true);
+  saveQueue(); renderQueue(); renderBrowse();
 }
 
 function topQueue(id) {
@@ -634,13 +681,19 @@ function topQueue(id) {
  *  界面自己跳走，很烦人；所以只有用户主动点歌 / 切歌时才切到歌词页。 */
 function playFromQueue(keepView = false) {
   const id = state.queue.shift();
-  saveQueue(); renderQueue(); renderBrowse(true);
+  saveQueue(); renderQueue(); renderBrowse();
   if (!id) { endPlayback(); return; }   // 队列空了才真正停下来
   selectJob(id, keepView);
 }
 
 function renderQueue() {
   const ul = $('#queueList');
+  const signature = state.queue.map((id) => {
+    const j = jobById(id);
+    return JSON.stringify([id, j && songInfo(j).title, j && songInfo(j).artist]);
+  }).join('|');
+  if (ul.dataset.signature === signature) return;
+  ul.dataset.signature = signature;
   ul.innerHTML = '';
   state.queue.forEach((id, i) => {
     const j = jobById(id);
@@ -651,7 +704,7 @@ function renderQueue() {
     li.innerHTML = `
       <span class="q-no">${i + 1}</span>
       <div class="q-body">
-        <p class="q-title">${escapeHtml(si.title)}</p>
+        <button class="q-title item-open" data-act="play" aria-label="立即演唱：${escapeHtml(si.title)}">${escapeHtml(si.title)}</button>
         <p class="q-artist">${escapeHtml(si.artist || '未知歌手')}</p>
       </div>
       <button class="lyr-btn" data-act="top" title="置顶，下一首就唱它">⇧ 置顶</button>
@@ -668,15 +721,19 @@ function renderQueue() {
 function renderProcessing() {
   const pending = state.allJobs.filter((j) => j.state !== 'done');
   const ul = $('#procList');
+  const focused = ul.contains(document.activeElement) ? {
+    id: document.activeElement.closest('.proc-item')?.dataset.id,
+    action: document.activeElement.dataset.act,
+  } : null;
   ul.innerHTML = '';
   pending.slice(0, 50).forEach((j) => {
     const li = document.createElement('li');
     li.className = `proc-item ${j.state}`;
     li.dataset.id = j.id;
-    const pct = Math.round((j.progress || 0) * 100);
+    const pct = Math.round(Math.max(0, Math.min(100, Number(j.progress) || 0)));
     li.innerHTML = `
       <div class="p-body">
-        <p class="p-title">${escapeHtml(j.title || j.url || j.id)}</p>
+        <button class="p-title item-open" data-act="inspect" aria-label="查看处理进度：${escapeHtml(j.title || j.id)}">${escapeHtml(j.title || j.url || j.id)}</button>
         <p class="p-msg muted small">${STATE_TEXT[j.state] || j.state} · ${escapeHtml(j.message || '')}</p>
       </div>
       ${j.state === 'error'
@@ -691,6 +748,11 @@ function renderProcessing() {
   const badge = $('#adminBadge');
   badge.textContent = String(pending.length);
   badge.classList.toggle('hidden', pending.length === 0);
+  if (focused) {
+    const row = [...ul.children].find((el) => el.dataset.id === focused.id);
+    const button = row && [...row.querySelectorAll('button')].find((el) => el.dataset.act === focused.action);
+    (button || $('#adminClose')).focus();
+  }
 }
 
 /* ---------------- 视图切换 ---------------- */
@@ -699,19 +761,23 @@ function renderProcessing() {
 function showBrowse() {
   $('#stage').classList.add('hidden');
   $('#browse').classList.remove('hidden');
-  renderBrowse(true);
+  stopLyricAnimation();
+  renderBrowse();
 }
 
 function showStage() {
   $('#browse').classList.add('hidden');
   $('#stage').classList.remove('hidden');
+  state.activeLine = -1;
+  updateLyrics(inst.currentTime);
+  startLyricAnimation();
 }
 
 /** 彻底停止播放（只有清空队列 / 没有下一首时才走这里）。 */
 function endPlayback() {
-  state.currentJobId = null;
-  stopPolling();
+  invalidateSelection();
   stopAudio();
+  state.currentJobId = null;
   renderNowBar();
   showBrowse();
 }
@@ -731,6 +797,12 @@ function renderNowBar() {
   $('#nbArtist').textContent = si.artist || '未知歌手';
   $('#nbQueueCount').textContent = String(state.queue.length);
   $('#nbPlay').textContent = inst.paused ? '▶' : '⏸';
+  measureNowBar();
+}
+
+function measureNowBar() {
+  const height = Math.ceil($('#nowbar').getBoundingClientRect().height);
+  if (height > 0) document.documentElement.style.setProperty('--nowbar-height', `${height}px`);
 }
 
 /** 原唱 / 伴唱切换。KTV 里默认永远是伴唱——原唱是拿来学的，不是拿来唱的。 */
@@ -740,21 +812,38 @@ function setSingMode(mode) {
   savePrefs();
   $('#modeInst').classList.toggle('active', mode === 'inst');
   $('#modeOrig').classList.toggle('active', mode === 'orig');
+  $('#modeInst').setAttribute('aria-pressed', String(mode === 'inst'));
+  $('#modeOrig').setAttribute('aria-pressed', String(mode === 'orig'));
   // 原唱模式下把导唱人声推满，伴唱模式下压到 0
   $('#vocalVol').value = mode === 'orig' ? 100 : 0;
   applyVolumes();
 }
 
+let drawerTrigger = null;
 function openDrawer(which) {
+  if ($('#scrim').classList.contains('hidden')) drawerTrigger = document.activeElement;
   const q = which === 'queue';
   $('#queuePanel').classList.toggle('hidden', !q);
   $('#adminPanel').classList.toggle('hidden', q);
   $('#scrim').classList.remove('hidden');
+  ['.topbar', '#browse', '#stage', '#nowbar', '#pendingRecordingsWrap', '.foot'].forEach((s) => {
+    const el = $(s);
+    if (el) el.inert = true;
+  });
+  document.body.classList.add('drawer-open');
+  (q ? $('#queueClose') : $('#adminClose')).focus();
 }
 function closeDrawers() {
   $('#queuePanel').classList.add('hidden');
   $('#adminPanel').classList.add('hidden');
   $('#scrim').classList.add('hidden');
+  ['.topbar', '#browse', '#stage', '#nowbar', '#pendingRecordingsWrap', '.foot'].forEach((s) => {
+    const el = $(s);
+    if (el) el.inert = false;
+  });
+  document.body.classList.remove('drawer-open');
+  if (drawerTrigger?.isConnected) drawerTrigger.focus();
+  drawerTrigger = null;
 }
 
 let _toastTimer;
@@ -763,6 +852,7 @@ function toast(msg) {
   if (!el) {
     el = document.createElement('div');
     el.id = 'toast'; el.className = 'toast';
+    el.setAttribute('role', 'status');
     document.body.appendChild(el);
   }
   el.textContent = msg;
@@ -777,40 +867,119 @@ function escapeHtml(s) {
 }
 
 /* ---------------- 选择任务 ---------------- */
+function cancelEndedTimer() {
+  clearTimeout(state.endedTimer);
+  state.endedTimer = null;
+}
+
+function invalidateSelection() {
+  state.selectionGeneration++;
+  state.selectionRequestGeneration++;
+  state.selectionRequest?.abort();
+  state.selectionRequest = null;
+  state.lyricsGeneration++;
+  state.lyricsRequest?.abort();
+  state.recordingsGeneration++;
+  state.recordingsRequest?.abort();
+  cancelEndedTimer();
+}
+
+function isCurrentPlayer(id, generation) {
+  return !state.disposed && state.currentJobId === id && state.selectionGeneration === generation;
+}
+
 async function selectJob(id, keepView = false) {
-  state.currentJobId = id;
-  stopPolling();
-  let job;
-  try { job = await api.getJob(id); } catch { endPlayback(); return; }
-  if (job.state === 'done') {
-    if (!keepView) showStage();
-    showPlayer(job);
-  } else {
-    // 还没做好的歌不该占着舞台，进度归后台管
-    openDrawer('admin');
-    showProgress(job);
-    startPolling(id);
+  const requestGeneration = ++state.selectionRequestGeneration;
+  state.selectionRequest?.abort();
+  cancelEndedTimer();
+  const request = new AbortController();
+  state.selectionRequest = request;
+  unlockAudio();
+  try {
+    const job = await api.getJob(id, { signal: request.signal });
+    if (requestGeneration !== state.selectionRequestGeneration || request.signal.aborted || state.disposed) return;
+    if (job.state === 'done') {
+      if (!job.media?.instrumental) throw new Error('伴奏文件暂时不可用，请在后台检查歌曲');
+      const generation = ++state.selectionGeneration;
+      state.lyricsGeneration++;
+      state.lyricsRequest?.abort();
+      state.recordingsGeneration++;
+      state.recordingsRequest?.abort();
+      if (!keepView) showStage();
+      await showPlayer(job, generation);
+    } else {
+      openDrawer('admin');
+      showProgress(job);
+      startPolling(id);
+    }
+  } catch (e) {
+    if (requestGeneration === state.selectionRequestGeneration && e.name !== 'AbortError') {
+      toast(e.message || '无法载入歌曲，请重试');
+    }
+  } finally {
+    if (state.selectionRequest === request) state.selectionRequest = null;
   }
 }
 
 /* ---------------- 进度轮询 ---------------- */
 function startPolling(id) {
   stopPolling();
-  state.pollTimer = setInterval(async () => {
-    let job;
-    try { job = await api.getJob(id); } catch { return; }
-    // UI 出错不能挡住下面的状态跳转，否则任务已完成却永远卡在进度页。
-    try {
-      updateProgressUI(job);
-      refreshList();
-    } catch (e) {
-      console.error('更新进度失败', e);
+  state.inspectedJobId = id;
+  const generation = state.pollGeneration;
+  let failures = 0;
+  const tick = async () => {
+    if (generation !== state.pollGeneration || state.disposed) return;
+    state.pollTimer = null;
+    if (document.hidden) {
+      state.pollTimer = setTimeout(tick, 3000);
+      return;
     }
-    if (job.state === 'done') { stopPolling(); showPlayer(job); }
-    else if (job.state === 'error') { stopPolling(); }
-  }, 1200);
+    const request = new AbortController();
+    state.pollRequest = request;
+    try {
+      const job = await api.getJob(id, { signal: request.signal });
+      if (generation !== state.pollGeneration || request.signal.aborted) return;
+      failures = 0;
+      updateProgressUI(job);
+      const index = state.allJobs.findIndex((j) => j.id === id);
+      if (index >= 0) state.allJobs[index] = job;
+      else state.allJobs.unshift(job);
+      renderProcessing();
+      if (job.state === 'done' || job.state === 'error') {
+        stopPolling();
+        await refreshList();
+        toast(job.state === 'done' ? '歌曲已制作完成，可在曲库点唱' : '制作失败，请在后台查看原因');
+        return;
+      }
+    } catch (e) {
+      if (generation === state.pollGeneration && e.name !== 'AbortError') {
+        if (e.status === 404) {
+          stopPolling();
+          $('#progressPanel').classList.add('hidden');
+          await refreshList();
+          toast('该制作任务已不存在');
+          return;
+        }
+        failures++;
+        $('#progMessage').textContent = '连接暂时中断，正在重试…';
+      }
+    } finally {
+      if (state.pollRequest === request) state.pollRequest = null;
+      if (generation === state.pollGeneration && !state.disposed) {
+        state.pollTimer = setTimeout(tick, Math.min(15000, 1200 * (2 ** failures)));
+      }
+    }
+  };
+  state.pollTimer = setTimeout(tick, 1200);
 }
-function stopPolling() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+function stopPolling() {
+  state.pollGeneration++;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  state.pollRequest?.abort();
+  state.pollRequest = null;
+  state.inspectedJobId = null;
+}
 
 function showProgress(job) {
   $('#progressPanel').classList.remove('hidden');
@@ -820,8 +989,10 @@ function showProgress(job) {
 function updateProgressUI(job) {
   $('#progTitle').textContent = job.title || '处理中…';
   $('#progMessage').textContent = job.message || '';
-  $('#progBar').style.width = (job.progress || 0) + '%';
-  $('#progPct').textContent = (job.progress || 0) + '%';
+  const pct = Math.max(0, Math.min(100, Number(job.progress || 0)));
+  $('#progBar').style.width = pct + '%';
+  $('#progPct').textContent = Math.round(pct) + '%';
+  $('#progressMeter').setAttribute('aria-valuenow', String(Math.round(pct)));
   const thumb = $('#progThumb');
   if (job.thumbnail) { thumb.src = job.thumbnail; thumb.style.display = ''; }
   else { thumb.style.display = 'none'; }
@@ -848,7 +1019,8 @@ function updateProgressUI(job) {
 const inst = $('#instAudio');
 const vocal = $('#vocalAudio');
 
-async function showPlayer(job) {
+async function showPlayer(job, generation = state.selectionGeneration) {
+  if (generation !== state.selectionGeneration) return;
   $('#progressPanel').classList.add('hidden');
   $('#player').classList.remove('hidden');
 
@@ -860,6 +1032,9 @@ async function showPlayer(job) {
 
   // 载入音轨（换歌不掉麦）
   stopAudio(true);
+  state.currentJobId = job.id;
+  if (!jobById(job.id)) state.allJobs.unshift(job);
+  else state.allJobs[state.allJobs.findIndex((j) => j.id === job.id)] = job;
   inst.src = job.media?.instrumental || '';
   if (job.media?.vocals) {
     vocal.src = job.media.vocals;
@@ -869,6 +1044,8 @@ async function showPlayer(job) {
     document.querySelector('label.mix:nth-child(2)').style.display = 'none';
   }
   applyVolumes();
+  $('#modeOrig').disabled = !hasVocal();
+  setAudioStatus('正在载入音频…');
 
   // 开唱先把麦克风接上（点歌那一下就是用户手势，此时申请授权才会被允许）
   autoEnableMic();
@@ -880,7 +1057,14 @@ async function showPlayer(job) {
   $('#recStatus').textContent = '';
   $('#recBtn').textContent = '🎤 开始录唱';
   $('#recBtn').classList.remove('recording');
+  $('#recBtn').disabled = false;
+  $('#saveLyrics').disabled = false;
+  $('#lsGo').disabled = false;
+  $('#recList').replaceChildren();
+  $('#recListWrap').classList.add('hidden');
+  $('#recListStatus').textContent = '';
   loadRecordings(job.id);
+  renderPendingRecordings();
 
   // 载入歌词
   state.lyrics = null; state.lineEls = []; state.activeLine = -1;
@@ -891,19 +1075,57 @@ async function showPlayer(job) {
   $('#editLyrics').classList.add('hidden');
   $('#searchLyrics').classList.add('hidden');
   $('#lyricSearch').classList.add('hidden');
+  $('#lsQuery').value = '';
+  $('#lyricSource').classList.add('hidden');
+  await loadPlayerLyrics(job.id, state.lyricsUrl, generation);
+  if (isCurrentPlayer(job.id, generation)) renderAlignmentStatus(job.id);
+}
+
+async function loadPlayerLyrics(jobId, url, generation = state.selectionGeneration, bust = false) {
+  if (!isCurrentPlayer(jobId, generation)) return;
+  const revision = ++state.lyricsGeneration;
+  state.lyricsRequest?.abort();
+  const request = new AbortController();
+  state.lyricsRequest = request;
   const box = $('#lyrics');
-  box.innerHTML = '<p class="muted" style="text-align:center">正在载入歌词…</p>';
+  if (!state.lyrics) box.innerHTML = '<p class="muted empty">正在载入歌词…</p>';
   try {
-    const r = await fetch(job.media.lyrics + '?t=' + Date.now());
-    state.lyrics = await r.json();
+    if (bust) {
+      // 发布歌词会产生新的不可变路径，不能只给旧 URL 加时间戳。
+      const job = await api.getJob(jobId, { signal: request.signal });
+      if (!isCurrentPlayer(jobId, generation) || revision !== state.lyricsGeneration || request.signal.aborted) return;
+      url = job.media?.lyrics || null;
+      state.lyricsUrl = url;
+      const index = state.allJobs.findIndex((j) => j.id === jobId);
+      if (index >= 0) state.allJobs[index] = job;
+    }
+    if (!url) {
+      state.lyrics = { lines: [] };
+      renderLyrics();
+      return;
+    }
+    const suffix = bust ? (url.includes('?') ? '&' : '?') + 't=' + Date.now() : '';
+    const lyrics = await fetchJSON(url + suffix, { signal: request.signal, cache: 'no-cache' });
+    if (!isCurrentPlayer(jobId, generation) || revision !== state.lyricsGeneration || request.signal.aborted) return;
+    if (!lyrics || !Array.isArray(lyrics.lines)) throw new Error('歌词格式不正确');
+    state.lyrics = lyrics;
     // 显示歌词来源徽章
     const badge = $('#lyricSource');
     const src = state.lyrics.source;
     if (src) { badge.textContent = '歌词来源：' + src; badge.classList.remove('hidden'); }
     else { badge.classList.add('hidden'); }
     renderLyrics();
-  } catch {
-    box.innerHTML = '<p class="muted" style="text-align:center">未能载入歌词。</p>';
+  } catch (e) {
+    if (isCurrentPlayer(jobId, generation) && revision === state.lyricsGeneration && e.name !== 'AbortError') {
+      if (state.lyrics?.lines?.length) {
+        renderLyrics();
+        toast('新版歌词暂时无法载入，保留上次版本；重新点歌可重试');
+      } else {
+        box.innerHTML = '<p class="muted empty">未能载入歌词。音乐可继续播放，请稍后重试。</p>';
+      }
+    }
+  } finally {
+    if (state.lyricsRequest === request) state.lyricsRequest = null;
   }
 }
 
@@ -911,31 +1133,47 @@ function renderLyrics() {
   const box = $('#lyrics');
   box.innerHTML = '';
   state.lineEls = [];
+  state.lyricWords = [];
+  state.activeLine = -1;
+  state.activeWord = -2;
   const lines = state.lyrics?.lines || [];
   if (lines.length === 0) {
     box.innerHTML = '<p class="muted" style="text-align:center">这首歌似乎没有可识别的人声歌词。</p>';
+    $('#editLyrics').classList.add('hidden');
+    $('#searchLyrics').classList.toggle('hidden', state.editing);
     return;
   }
   lines.forEach((ln, i) => {
     const div = document.createElement('div');
     div.className = 'lyric-line';
+    div.tabIndex = 0;
+    div.setAttribute('role', 'button');
+    div.setAttribute('aria-label', '跳到歌词：' + ln.text);
+    const words = [];
     if (ln.words && ln.words.length) {
       ln.words.forEach((w) => {
         const span = document.createElement('span');
         span.className = 'w';
-        span.textContent = w.text + ' ';
+        span.textContent = (w.text ?? w.word ?? '') + ' ';
         span.dataset.start = w.start;
         div.appendChild(span);
+        words.push({ el: span, start: Number(w.start) });
       });
     } else {
       div.textContent = ln.text;
     }
     div.addEventListener('click', () => seekTo(ln.start + 0.001));
+    div.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); e.stopPropagation(); seekTo(ln.start + 0.001); }
+    });
     box.appendChild(div);
     state.lineEls.push(div);
+    state.lyricWords.push(words);
   });
   $('#editLyrics').classList.toggle('hidden', !(state.lyrics?.lines?.length) || state.editing);
   $('#searchLyrics').classList.toggle('hidden', state.editing);
+  updateLyrics(inst.currentTime);
+  startLyricAnimation();
 }
 
 /* ---------- 歌词编辑（识别不准时手动纠正） ---------- */
@@ -943,6 +1181,7 @@ function enterLyricsEdit() {
   const lines = state.lyrics?.lines || [];
   if (!lines.length) return;
   state.editing = true;
+  stopLyricAnimation();
   const box = $('#lyrics');
   box.innerHTML = '';
   state.lineEls = [];
@@ -968,6 +1207,10 @@ function exitLyricsEdit() {
 
 async function saveLyricsEdit() {
   if (!state.editing || !state.lyrics) return;
+  const jobId = state.currentJobId;
+  const generation = state.selectionGeneration;
+  const lyricsUrl = state.lyricsUrl;
+  const lyrics = state.lyrics;
   const inputs = $('#lyrics').querySelectorAll('.lyric-edit');
   const lines = (state.lyrics.lines || []).map((ln, i) => ({
     start: ln.start, end: ln.end,
@@ -977,21 +1220,18 @@ async function saveLyricsEdit() {
   const btn = $('#saveLyrics');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
-    await api.updateLyrics(state.currentJobId, {
-      lines, language: state.lyrics.language, source: state.lyrics.source,
+    await api.updateLyrics(jobId, {
+      lines, language: lyrics.language, source: lyrics.source,
     });
-    const url = (state.lyricsUrl || `/media/${state.currentJobId}/lyrics.json`) + '?t=' + Date.now();
-    state.lyrics = await (await fetch(url)).json();
-    const badge = $('#lyricSource');
-    if (state.lyrics.source) { badge.textContent = '歌词来源：' + state.lyrics.source; badge.classList.remove('hidden'); }
+    if (!isCurrentPlayer(jobId, generation)) return;
     state.editing = false;
     $('#editBar').classList.add('hidden');
-    renderLyrics();
+    await loadPlayerLyrics(jobId, lyricsUrl, generation, true);
     refreshList(true);
   } catch (e) {
-    alert(e.message || '保存失败');
+    if (isCurrentPlayer(jobId, generation)) toast(e.message || '保存失败');
   } finally {
-    btn.disabled = false; btn.textContent = '保存';
+    if (isCurrentPlayer(jobId, generation)) { btn.disabled = false; btn.textContent = '保存'; }
   }
 }
 
@@ -1022,11 +1262,16 @@ async function doLyricSearch() {
   const hint = $('#lsHint'); const ul = $('#lsResults');
   hint.textContent = '搜索中…'; ul.innerHTML = '';
   const go = $('#lsGo'); go.disabled = true;
+  const jobId = state.currentJobId, generation = state.selectionGeneration;
+  const searchGeneration = state.lyricSearchGeneration = (state.lyricSearchGeneration || 0) + 1;
   try {
-    renderLyricResults(await api.searchLyrics({ q }));
+    const results = await api.searchLyrics({ q });
+    if (isCurrentPlayer(jobId, generation) && searchGeneration === state.lyricSearchGeneration) renderLyricResults(results);
   } catch (e) {
-    hint.textContent = e.message || '搜索失败';
-  } finally { go.disabled = false; }
+    if (isCurrentPlayer(jobId, generation)) hint.textContent = e.message || '搜索失败';
+  } finally {
+    if (isCurrentPlayer(jobId, generation) && searchGeneration === state.lyricSearchGeneration) go.disabled = false;
+  }
 }
 
 function renderLyricResults(results) {
@@ -1052,28 +1297,119 @@ function renderLyricResults(results) {
     li.querySelector('.ls-use').addEventListener('click', () => applyLyric(r, li));
     ul.appendChild(li);
   });
+  renderAlignmentStatus(state.currentJobId);
+}
+
+const ALIGN_KEY = 'openk.alignments';
+function alignmentBusy(jobId) {
+  return state.alignmentSubmitting.has(jobId) || ['queued', 'running'].includes(state.alignmentOperations[jobId]?.state);
+}
+function saveAlignments() {
+  const pending = {};
+  Object.entries(state.alignmentOperations).forEach(([jobId, op]) => {
+    if (op.id && op.state !== 'done') pending[jobId] = op.id;
+  });
+  try { localStorage.setItem(ALIGN_KEY, JSON.stringify(pending)); } catch {}
+}
+function resumeAlignments() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(ALIGN_KEY) || '{}'); } catch { saved = {}; }
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return;
+  Object.entries(saved).forEach(([jobId, id]) => {
+    if (typeof id !== 'string') return;
+    state.alignmentOperations[jobId] = { id, job_id: jobId, state: 'queued', message: '正在恢复对齐进度…' };
+    scheduleAlignment(jobId, 0);
+  });
+}
+function renderAlignmentStatus(jobId) {
+  if (state.disposed || state.currentJobId !== jobId) return;
+  const op = state.alignmentOperations[jobId];
+  const busy = alignmentBusy(jobId);
+  const status = $('#alignmentStatus');
+  status.textContent = state.alignmentSubmitting.has(jobId) ? '正在提交对齐任务…'
+    : op ? ({ queued: '歌词对齐排队中', running: '正在对齐歌词', done: '歌词已更新', error: '歌词对齐失败' }[op.state] || '正在查询对齐进度')
+      + (op.error || op.message ? ' · ' + (op.error || op.message) : '') : '';
+  status.classList.toggle('hidden', !status.textContent);
+  document.querySelectorAll('.ls-use').forEach((b) => { b.disabled = busy; });
+  $('#editLyrics').disabled = busy;
+}
+async function finishAlignment(jobId, op) {
+  state.alignmentOperations[jobId] = op;
+  saveAlignments();
+  renderAlignmentStatus(jobId);
+  if (op.state === 'done') {
+    if (state.currentJobId === jobId && !state.editing) {
+      await loadPlayerLyrics(jobId, state.lyricsUrl, state.selectionGeneration, true);
+    }
+    await refreshList();
+  }
+}
+function scheduleAlignment(jobId, delay = 1500) {
+  clearTimeout(state.alignmentTimers.get(jobId));
+  if (state.disposed) return;
+  state.alignmentTimers.set(jobId, setTimeout(async () => {
+    state.alignmentTimers.delete(jobId);
+    const op = state.alignmentOperations[jobId];
+    if (!op || !['queued', 'running'].includes(op.state)) return;
+    if (document.hidden || state.alignmentRequests.has(jobId)) { scheduleAlignment(jobId, 3000); return; }
+    const request = new AbortController();
+    state.alignmentRequests.set(jobId, request);
+    let retry = 1500;
+    try {
+      const result = await api.getOperation(op.id, { signal: request.signal });
+      if (request.signal.aborted || state.disposed || state.alignmentOperations[jobId]?.id !== op.id) return;
+      if (result.id !== op.id || result.job_id !== jobId || !['queued', 'running', 'done', 'error'].includes(result.state)) {
+        throw Object.assign(new Error('对齐任务响应格式不正确，请确认服务端版本'), { permanent: true });
+      }
+      state.alignmentOperations[jobId] = result;
+      renderAlignmentStatus(jobId);
+      if (result.state === 'done' || result.state === 'error') await finishAlignment(jobId, result);
+    } catch (e) {
+      retry = Math.min(15000, delay > 0 ? delay * 2 : 3000);
+      if (!request.signal.aborted && state.alignmentOperations[jobId]?.id === op.id) {
+        if (e.status === 404 || e.permanent) {
+          await finishAlignment(jobId, { ...op, state: 'error',
+            error: e.status === 404 ? '对齐任务已过期，可重新提交' : e.message });
+        } else {
+          op.message = '连接暂时中断，稍后自动恢复';
+          renderAlignmentStatus(jobId);
+        }
+      }
+    } finally {
+      if (state.alignmentRequests.get(jobId) === request) state.alignmentRequests.delete(jobId);
+      if (state.alignmentOperations[jobId]?.id === op.id
+          && ['queued', 'running'].includes(state.alignmentOperations[jobId].state)) scheduleAlignment(jobId, retry);
+    }
+  }, delay));
 }
 
 async function applyLyric(r, li) {
-  if (!state.currentJobId) return;
-  const btn = li.querySelector('.ls-use');
-  const hint = $('#lsHint');
-  btn.disabled = true; btn.textContent = '处理中…';
-  hint.textContent = r.synced
-    ? '正在把歌词逐字对齐到人声，约需 1 分钟，请稍候…'
-    : '正在应用歌词…';
+  const jobId = state.currentJobId;
+  if (!jobId || alignmentBusy(jobId)) return;
+  state.alignmentSubmitting.add(jobId);
+  renderAlignmentStatus(jobId);
   try {
-    await api.alignLyrics(state.currentJobId, { lrclib_id: r.id });
-    const url = (state.lyricsUrl || `/media/${state.currentJobId}/lyrics.json`) + '?t=' + Date.now();
-    state.lyrics = await (await fetch(url)).json();
-    const badge = $('#lyricSource');
-    if (state.lyrics.source) { badge.textContent = '歌词来源：' + state.lyrics.source; badge.classList.remove('hidden'); }
-    renderLyrics();
-    refreshList(true);
-    toggleLyricSearch(false);
+    const { accepted, data } = await api.alignLyrics(jobId, { lrclib_id: r.id });
+    if (state.disposed) return;
+    if (accepted) {
+      const op = data?.operation;
+      if (!op?.id || op.job_id !== jobId || !['queued', 'running', 'done', 'error'].includes(op.state)) {
+        throw new Error('服务端未返回有效的对齐任务编号');
+      }
+      state.alignmentOperations[jobId] = op;
+      saveAlignments();
+      if (op.state === 'done' || op.state === 'error') await finishAlignment(jobId, op);
+      else scheduleAlignment(jobId);
+    } else if (data?.ok === true) {
+      await finishAlignment(jobId, { job_id: jobId, state: 'done', message: '已通过旧版接口完成' });
+    } else {
+      throw new Error('无法识别对齐响应，请确认服务端版本');
+    }
   } catch (e) {
-    hint.textContent = e.message || '对齐失败';
-    btn.disabled = false; btn.textContent = '用这个';
+    state.alignmentOperations[jobId] = { job_id: jobId, state: 'error', error: e.message || '对齐失败' };
+  } finally {
+    state.alignmentSubmitting.delete(jobId);
+    renderAlignmentStatus(jobId);
   }
 }
 
@@ -1083,10 +1419,12 @@ function updateLyrics(t) {
   if (!lines || !lines.length) return;
 
   // 找当前行：最后一个 start <= t 的行
-  let idx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].start <= t + 0.02) idx = i; else break;
+  let lo = 0, hi = lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (lines[mid].start <= t + 0.02) lo = mid + 1; else hi = mid;
   }
+  const idx = lo - 1;
 
   if (idx !== state.activeLine) {
     if (state.activeLine >= 0 && state.lineEls[state.activeLine])
@@ -1097,20 +1435,42 @@ function updateLyrics(t) {
       const box = $('#lyrics');
       // 用 scrollTo({behavior:'auto'}) 显式滚动：直接赋值 scrollTop 在
       // CSS scroll-behavior:smooth（或 prefers-reduced-motion）下可能被忽略而不滚动。
-      box.scrollTo({ top: el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2, behavior: 'auto' });
+      if (!document.hidden && !$('#stage').classList.contains('hidden')) {
+        const top = el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2;
+        if (typeof box.scrollTo === 'function') box.scrollTo({ top, behavior: 'auto' });
+        else box.scrollTop = top;
+      }
     }
     state.activeLine = idx;
+    state.activeWord = -2;
   }
 
   // 逐词高亮当前行
   if (idx >= 0) {
-    const el = state.lineEls[idx];
-    const spans = el.getElementsByClassName('w');
-    for (let k = 0; k < spans.length; k++) {
-      const st = parseFloat(spans[k].dataset.start);
-      spans[k].classList.toggle('sung', st <= t);
+    const words = state.lyricWords[idx] || [];
+    let word = -1;
+    while (word + 1 < words.length && words[word + 1].start <= t) word++;
+    if (word !== state.activeWord) {
+      words.forEach((w, i) => w.el.classList.toggle('sung', i <= word));
+      state.activeWord = word;
     }
   }
+}
+
+function stopLyricAnimation() {
+  cancelAnimationFrame(state.lyricRaf);
+  state.lyricRaf = 0;
+}
+function startLyricAnimation() {
+  stopLyricAnimation();
+  if (state.disposed || inst.paused || document.hidden || state.editing || $('#stage').classList.contains('hidden')) return;
+  const tick = () => {
+    state.lyricRaf = 0;
+    if (state.disposed || inst.paused || document.hidden || state.editing || $('#stage').classList.contains('hidden')) return;
+    updateLyrics(inst.currentTime);
+    state.lyricRaf = requestAnimationFrame(tick);
+  };
+  state.lyricRaf = requestAnimationFrame(tick);
 }
 
 /* ---------- Web Audio 引擎（混响 / 录制） ---------- */
@@ -1324,7 +1684,8 @@ function hasVocal() { return !!vocal.getAttribute('src'); }
 function ensureAudioGraph() {
   if (state.audioGraph) return state.audioGraph;
   const Ctx = window.AudioContext || window.webkitAudioContext;
-  const actx = new Ctx();
+  if (!Ctx) throw new Error('此浏览器不支持 Web Audio，请换用较新的浏览器');
+  const actx = new Ctx({ latencyHint: 'interactive' });
   const instGain = actx.createGain();
   const vocalGain = actx.createGain();
   const dry = actx.createGain();
@@ -1347,7 +1708,7 @@ function ensureAudioGraph() {
 
   state.audioGraph = {
     actx, instGain, vocalGain, dry, wet, conv, send,
-    speakerBus, recordBus, recDest, mic: null, monitorGain: null,
+    speakerBus, recordBus, recDest, mic: null, monitorGain: null, irCache: new Map(),
   };
   setReverb($('#reverb').value);
   applyVolumes();
@@ -1358,11 +1719,12 @@ function setReverb(name) {
   const g = state.audioGraph;
   if (!g) return;
   const p = REVERB_PRESETS[name] || REVERB_PRESETS.none;
-  g.conv.buffer = makeIR(g.actx, p.seconds, p.decay);
+  if (!g.irCache.has(name)) g.irCache.set(name, makeIR(g.actx, p.seconds, p.decay));
+  g.conv.buffer = g.irCache.get(name);
   g.wet.gain.value = p.wet;
   g.send.gain.value = p.send;
   if (g.mic) {
-    g.mic.micConv.buffer = makeIR(g.actx, p.seconds, p.decay);
+    g.mic.micConv.buffer = g.irCache.get(name);
     g.mic.micWet.gain.value = p.wet;
     g.mic.micSend.gain.value = p.send;
   }
@@ -1384,37 +1746,96 @@ function applyVolumes() {
   }
 }
 
-function togglePlay() {
-  const g = ensureAudioGraph();
-  if (g.actx.state === 'suspended') g.actx.resume();
-  if (inst.paused) {
-    inst.play();
-    if (hasVocal()) { vocal.currentTime = inst.currentTime; vocal.play().catch(() => {}); }
-  } else {
-    inst.pause(); if (hasVocal()) vocal.pause();
+function setAudioStatus(message = '') {
+  if (state.disposed) return;
+  state.audioStatus = message;
+  $('#audioStatus').textContent = message;
+}
+
+function unlockAudio() {
+  try {
+    const g = ensureAudioGraph();
+    return bounded(Promise.resolve(g.actx.state === 'suspended' ? g.actx.resume() : undefined), 8000, '音频启动超时')
+      .then(() => true, () => { setAudioStatus('点击播放以启用音频'); return false; });
+  } catch (e) {
+    setAudioStatus(e.message || '无法启动音频');
+    return Promise.resolve(false);
   }
+}
+
+function pausePlayback() {
+  cancelEndedTimer();
+  state.playbackGeneration++;
+  state.playRequested = false;
+  inst.pause();
+  if (hasVocal()) { vocal.pause(); vocal.playbackRate = 1; }
+  stopLyricAnimation();
+}
+
+function togglePlay() {
+  if (inst.paused && !state.playRequested) startPlayback();
+  else pausePlayback();
 }
 
 /** 点歌即开唱：KTV 点歌台不会让人再按一次播放键。
  *
  *  点歌那一下是用户手势，浏览器允许带声播放；但自动接下一首时没有新手势，
  *  个别浏览器会拦下来——那就提示一句，绝不能默默停在暂停状态让人干等。 */
-function startPlayback() {
-  const g = ensureAudioGraph();
-  if (g.actx.state === 'suspended') g.actx.resume().catch(() => {});
-  const p = inst.play();
-  if (hasVocal()) { vocal.currentTime = inst.currentTime; vocal.play().catch(() => {}); }
-  if (p && typeof p.catch === 'function') {
-    p.catch(() => toast('浏览器拦下了自动播放，点一下 ▶ 开始'));
+async function startPlayback() {
+  if (!inst.getAttribute('src')) return false;
+  const generation = ++state.playbackGeneration;
+  state.playRequested = true;
+  if (!await unlockAudio() || generation !== state.playbackGeneration) {
+    if (generation === state.playbackGeneration) state.playRequested = false;
+    return false;
+  }
+  try {
+    const playTrack = (element) => Promise.resolve().then(() => {
+      if (generation !== state.playbackGeneration) throw new DOMException('播放已取消', 'AbortError');
+      return element.play();
+    });
+    const plays = [playTrack(inst)];
+    if (hasVocal()) {
+      vocal.currentTime = inst.currentTime;
+      vocal.playbackRate = 1;
+      plays.push(playTrack(vocal));
+    }
+    let guideFailed = false;
+    if (plays[1]) bounded(plays[1], 15000, '导唱载入超时').catch(() => {
+      guideFailed = true;
+      if (generation === state.playbackGeneration) setAudioStatus('伴奏已播放，导唱暂时不可用');
+    });
+    await bounded(plays[0], 15000, '音频载入超时');
+    if (generation !== state.playbackGeneration) return false;
+    if (!guideFailed) setAudioStatus('');
+    startLyricAnimation();
+    return true;
+  } catch (e) {
+    if (generation === state.playbackGeneration) {
+      pausePlayback();
+      setAudioStatus('无法播放，请点击播放重试');
+      toast(e?.name === 'NotAllowedError' ? '请点一下播放按钮启用音频' : '音频载入失败，请重试');
+    }
+    return false;
   }
 }
 
 function seekTo(t) {
-  inst.currentTime = t;
-  if (hasVocal()) vocal.currentTime = t;
+  if (!Number.isFinite(t)) return;
+  cancelEndedTimer();
+  const time = Math.max(0, Math.min(t, Number.isFinite(inst.duration) ? inst.duration : t));
+  inst.currentTime = time;
+  if (hasVocal()) { vocal.currentTime = time; vocal.playbackRate = 1; }
+  state.activeLine = -1;
+  updateLyrics(time);
 }
 function stopAudio(keepMic = false) {
+  state.playbackGeneration++;
+  state.playRequested = false;
+  stopLyricAnimation();
   if (state.recording) stopRecording();
+  state.recordingStarting = false;
+  state.recordingStartGeneration++;
   // 连唱下一首时保留麦克风：每首歌都重新申请一次授权、重建音频图，
   // 中间会有一两秒没声音，唱的人会以为麦克风坏了。
   if (!keepMic) {
@@ -1423,9 +1844,11 @@ function stopAudio(keepMic = false) {
     micHint('');
   }
   try { inst.pause(); vocal.pause(); } catch {}
+  vocal.playbackRate = 1;
   inst.removeAttribute('src'); vocal.removeAttribute('src');
   inst.load(); vocal.load();
   $('#playBtn').textContent = '▶';
+  state.buffering = false;
 }
 
 /* ---------- 录制 / 回放 ---------- */
@@ -1457,25 +1880,62 @@ function micUnavailableReason() {
 }
 
 // 建立麦克风支路（监听/录音共用，仅建一次）。需在用户手势内调用以取得授权。
-async function ensureMic(quiet = false) {
+function ensureMic(quiet = false) {
+  if (state.audioGraph?.mic) return Promise.resolve(state.audioGraph);
+  if (state.micRequest) return state.micRequest.promise;
+  const pending = { deadline: performance.now() + 15000 };
+  const generation = state.micGeneration;
+  state.micRequest = pending;
+  pending.promise = acquireMic(quiet, generation, pending).finally(() => {
+    if (state.micRequest === pending) state.micRequest = null;
+  });
+  return pending.promise;
+}
+
+function requestMicStream(pending, generation) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finishError = (error) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); reject(error);
+    };
+    const remaining = Math.max(1, pending.deadline - performance.now());
+    const timer = setTimeout(() => finishError(new Error('麦克风授权等待超时，请再次点击重试')), remaining);
+    pending.cancel = () => finishError(new DOMException('麦克风请求已取消', 'AbortError'));
+    Promise.resolve().then(() => navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    })).then((stream) => {
+      if (settled || generation !== state.micGeneration || state.disposed) {
+        stream.getTracks().forEach((t) => t.stop());
+        finishError(new DOMException('麦克风请求已过期', 'AbortError'));
+        return;
+      }
+      settled = true; clearTimeout(timer); resolve(stream);
+    }, finishError);
+  });
+}
+
+async function acquireMic(quiet, generation, pending) {
   const g = ensureAudioGraph();
   if (g.mic) return g;
   const why = micUnavailableReason();
-  if (why) { if (quiet) { micHint(why.split('\n')[0]); } else { alert(why); } throw new Error('no mic'); }
-  if (g.actx.state === 'suspended') await g.actx.resume();
+  if (why) { micHint(why); throw new Error(why.split('\n')[0]); }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      // 卡拉OK 要「原始人声」：关掉回声消除 + 降噪。否则——
-      //   · echoCancellation：伴奏一响，AEC 把伴奏当回声疯狂 ducking → 监听断断续续、很小；
-      //   · noiseSuppression：噪声门限把人声也一起切掉 → “屏蔽了很多声音”。
-      // 前提是戴耳机（伴奏走耳机、不串入麦克风），所以本就不需要回声消除。
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+    if (g.actx.state === 'suspended') {
+      micHint('正在启动音频引擎…');
+      await bounded(g.actx.resume(), Math.min(8000, Math.max(1, pending.deadline - performance.now())),
+        '音频引擎启动超时，请点击播放后重试');
+    }
+    if (generation !== state.micGeneration) throw new DOMException('麦克风请求已取消', 'AbortError');
+    micHint('正在连接麦克风，请检查浏览器授权提示（最多等待15秒）');
+    stream = await requestMicStream(pending, generation);
   } catch (e) {
-    const msg = '无法获取麦克风权限：' + (e.message || e);
-    if (quiet) micHint('麦克风未授权，外放已关闭（点上面的复选框可重试）');
-    else alert(msg);
+    if (generation !== state.micGeneration) throw new DOMException('麦克风请求已取消', 'AbortError');
+    if (e.name === 'AbortError') throw e;
+    const msg = '麦克风连接失败：' + (e.message || e);
+    micHint(msg);
+    if (!quiet) toast(msg);
     throw e;
   }
   state.micStream = stream;
@@ -1488,7 +1948,7 @@ async function ensureMic(quiet = false) {
   const micConv = g.actx.createConvolver();
   const micWet = g.actx.createGain();
   const monitorGain = g.actx.createGain();
-  monitorGain.gain.value = $('#monitor').checked ? MONITOR_GAIN : 0;
+  monitorGain.gain.value = 0;
   // 外放时麦克风必然会拾到音箱里的声音，形成正反馈。限幅器压不住成因，但能
   // 把啸叫锁在「难听」而不是「刺耳到伤耳朵」的范围内，是外放的必要保险。
   //
@@ -1540,8 +2000,9 @@ async function ensureMic(quiet = false) {
   startHowlGuard();
   micGain.gain.value = prefs.micVol / 100;
   const p = REVERB_PRESETS[$('#reverb').value] || REVERB_PRESETS.none;
-  micConv.buffer = makeIR(g.actx, p.seconds, p.decay);
+  micConv.buffer = g.conv.buffer || makeIR(g.actx, p.seconds, p.decay);
   micWet.gain.value = p.wet; micSend.gain.value = p.send;
+  applyMonitorState();
   return g;
 }
 
@@ -1604,7 +2065,7 @@ function startHowlGuard() {
   if (!g || !g.howl || g.howl.raf) return;
   const loop = () => {
     const h = state.audioGraph && state.audioGraph.howl;
-    if (!h || !h.raf) return;
+    if (!h || !h.raf || document.hidden || state.disposed) { if (h) h.raf = 0; return; }
     // 关掉开关就只是停止判定，链路照旧——陷波要先复位，
     // 免得把上一轮挖的坑留在声音里。
     if (prefs.howlGuard) howlTick(state.audioGraph, performance.now());
@@ -1627,71 +2088,166 @@ function resetHowlGuard() {
 /** 开唱时按偏好自动把麦克风外放接上。
  *  必须在用户手势（点播放 / 点歌）之后调用，否则浏览器不给授权。 */
 async function autoEnableMic() {
-  if (!prefs.micMonitor) return;
+  if (!prefs.micMonitor || state.disposed) return;
   const box = $('#monitor');
   if (!box) return;
   box.checked = true;
-  try {
-    const g = await ensureMic(true);          // quiet：失败不弹窗，免得打断唱歌
-    g.monitorGain.gain.value = MONITOR_GAIN;
-    micHint('麦克风已接通；防啸叫已开启，若仍尖叫请把麦克风拿远离音箱');
-  } catch {
-    box.checked = false;                       // 授权失败就老实关掉，但保留偏好，下首歌再试
+  if (document.hidden || state.monitorHidden) {
+    state.monitorHidden = true;
+    applyMonitorState();
+    return;
   }
+  const generation = state.micGeneration;
+  try {
+    await ensureMic(true);
+    if (generation === state.micGeneration) applyMonitorState();
+  } catch (e) {
+    if (generation === state.micGeneration && e.name !== 'AbortError') box.checked = false;
+  }
+}
+
+function applyMonitorState() {
+  const g = state.audioGraph;
+  const requested = prefs.micMonitor && $('#monitor').checked;
+  const muted = document.hidden || state.monitorHidden;
+  if (document.hidden && requested) state.monitorHidden = true;
+  if (g?.monitorGain) {
+    if (requested && !muted) {
+      startHowlGuard();
+      rampParam(g.monitorGain.gain, MONITOR_GAIN, 150, g.actx);
+    } else {
+      g.monitorGain.gain.cancelScheduledValues?.(g.actx.currentTime);
+      g.monitorGain.gain.value = 0;
+    }
+  }
+  $('#resumeMonitor').classList.toggle('hidden', !requested || !state.monitorHidden || document.hidden);
+  if (requested && muted) micHint('页面切到后台，麦克风外放已暂停；返回后点击恢复。录音不受影响。');
+  else if (requested && g?.mic) micHint(prefs.howlGuard ? '麦克风已接通 · 防啸叫已开启，建议使用耳机' : '麦克风已接通 · 防啸叫已关闭，请谨慎外放');
+  else if (!requested) micHint('麦克风外放已关闭');
 }
 
 // 仅在既不监听也不录音时释放麦克风。
 function maybeReleaseMic() {
-  if (state.recording || $('#monitor').checked) return;
+  if (state.recording || state.recordingStarting || $('#monitor').checked) return;
   cleanupMic();
 }
 
 async function startRecording() {
+  if (state.recording || state.recordingStarting) return;
   if (!inst.getAttribute('src')) { alert('请先选择一首歌'); return; }
   const why = micUnavailableReason();
-  if (why) { alert(why); return; }
-  if (!window.MediaRecorder) { alert('当前浏览器不支持录音（缺少 MediaRecorder）。'); return; }
-  const g = ensureAudioGraph();
-  try { await ensureMic(); } catch { return; }
-
-  const mr = new MediaRecorder(g.recDest.stream, pickRecorderOptions());
-  const chunks = [];
-  mr.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-  mr.onstop = async () => {
-    const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
-    const dur = (Date.now() - state.recStart) / 1000;
-    await uploadRecording(blob, dur);
+  if (why) { micHint(why); $('#recStatus').textContent = '麦克风不可用'; return; }
+  if (!window.MediaRecorder) { $('#recStatus').textContent = '当前浏览器不支持录音（缺少 MediaRecorder）'; return; }
+  const jobId = state.currentJobId, generation = state.selectionGeneration;
+  const startGeneration = ++state.recordingStartGeneration;
+  state.recordingStarting = true;
+  $('#recBtn').disabled = true;
+  $('#recBtn').textContent = '准备录音…';
+  $('#recStatus').textContent = '正在连接麦克风，请在浏览器中允许访问…';
+  let session;
+  try {
+    const g = await ensureMic();
+    if (!isCurrentPlayer(jobId, generation) || startGeneration !== state.recordingStartGeneration || !state.recordingStarting) return;
+    if (!await unlockAudio() || !isCurrentPlayer(jobId, generation)) return;
+    const mr = new MediaRecorder(g.recDest.stream, pickRecorderOptions());
+    session = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      jobId, title: songInfo(jobById(jobId) || {}).title, generation,
+      mr, chunks: [], startedAt: Date.now(), stoppedAt: null, blob: null,
+      status: 'recording', error: '', uploadPromise: null, objectUrl: null,
+    };
+    mr.ondataavailable = (e) => { if (!session.finalized && e.data?.size) session.chunks.push(e.data); };
+    mr.onerror = () => {
+      session.interrupted = true;
+      session.error = '录制中断，正在保留已录下的音频';
+      if (state.recordingSession === session) stopRecording();
+    };
+    mr.onstop = async () => {
+      if (session.cancelled || session.finalized) return;
+      session.finalized = true;
+      session.stoppedAt ??= Date.now();
+      session.duration = Math.max(0, (session.stoppedAt - session.startedAt) / 1000);
+      session.blob = new Blob(session.chunks, { type: mr.mimeType || session.chunks[0]?.type || 'audio/webm' });
+      session.chunks = [];
+      if (state.recordingSession === session) {
+        state.recording = false; state.recordingSession = null; state.recorder = null;
+        clearInterval(state.recTimer);
+        resetRecordButton();
+      }
+      state.pendingRecordings.set(session.id, session);
+      if (!session.blob.size) {
+        session.status = 'error'; session.error = '没有捕获到音频，请检查麦克风后重试';
+        renderPendingRecordings();
+      } else await uploadRecording(session);
+      maybeReleaseMic();
+    };
+    seekTo(0);
+    state.recordingSession = session;
+    state.recorder = mr;
+    state.recStart = session.startedAt;
+    mr.start(1000);
+    state.recording = true;
+    $('#recBtn').disabled = false;
+    $('#recBtn').textContent = '⏹ 停止并保存';
+    $('#recBtn').classList.add('recording');
+    if (!await startPlayback() || !isCurrentPlayer(jobId, generation)) {
+      session.cancelled = true;
+      if (state.recordingSession === session) stopRecording();
+      return;
+    }
+    $('#recBtn').textContent = '⏹ 停止并保存';
+    $('#recBtn').classList.add('recording');
+    state.recTimer = setInterval(() => {
+      if (state.recordingSession === session) $('#recStatus').textContent = '● 录制中 ' + fmt((Date.now() - session.startedAt) / 1000);
+    }, 250);
+  } catch (e) {
+    if (session && state.recordingSession === session) {
+      session.cancelled = true;
+      stopRecording();
+      state.recordingSession = null;
+      state.recorder = null;
+      resetRecordButton();
+    }
+    if (isCurrentPlayer(jobId, generation)) $('#recStatus').textContent = e.message || '无法开始录音';
+  } finally {
+    if (startGeneration === state.recordingStartGeneration) {
+      state.recordingStarting = false;
+      $('#recBtn').disabled = false;
+      if (!state.recording) resetRecordButton();
+    }
     maybeReleaseMic();
-  };
-  state.recorder = mr;
-  state.recStart = Date.now();
-  state.recording = true;
-  mr.start();
+  }
+}
 
-  // 从头播放伴奏（+按滑块的导唱人声）
-  seekTo(0);
-  inst.play(); if (hasVocal()) { vocal.currentTime = 0; vocal.play().catch(() => {}); }
-
-  $('#recBtn').textContent = '⏹ 停止并保存';
-  $('#recBtn').classList.add('recording');
-  state.recTimer = setInterval(() => {
-    $('#recStatus').textContent = '● 录制中 ' + fmt((Date.now() - state.recStart) / 1000);
-  }, 250);
+function resetRecordButton() {
+  $('#recBtn').disabled = false;
+  $('#recBtn').textContent = '🎤 开始录唱';
+  $('#recBtn').classList.remove('recording');
 }
 
 function stopRecording() {
-  if (!state.recorder || !state.recording) return;
+  const session = state.recordingSession;
+  if (!session || !state.recording) return;
   state.recording = false;
+  state.recordingSession = null;
+  state.recorder = null;
+  session.stoppedAt = Date.now();
   clearInterval(state.recTimer);
-  try { inst.pause(); if (hasVocal()) vocal.pause(); } catch {}
-  try { state.recorder.stop(); } catch {}
-  $('#recBtn').textContent = '🎤 开始录唱';
-  $('#recBtn').classList.remove('recording');
-  $('#recStatus').textContent = '正在保存…';
+  pausePlayback();
+  try { session.mr.stop(); } catch {
+    session.error = '录音已中断';
+    session.mr.onstop();
+  }
+  resetRecordButton();
+  $('#recStatus').textContent = session.cancelled ? '录制未开始，请重试播放' : '正在整理录音…';
   $('#playBtn').textContent = '▶';
+  maybeReleaseMic();
 }
 
 function cleanupMic() {
+  state.micGeneration++;
+  state.micRequest?.cancel?.();
+  state.micRequest = null;
   const g = state.audioGraph;
   if (state.micStream) { state.micStream.getTracks().forEach((t) => t.stop()); state.micStream = null; }
   if (g && g.howl) {
@@ -1706,52 +2262,129 @@ function cleanupMic() {
     g.mic = null;
   }
   if (g && g.monitorGain) { try { g.monitorGain.disconnect(); } catch {} g.monitorGain = null; }
-}
-
-async function uploadRecording(blob, dur) {
-  if (!state.currentJobId) return;
-  try {
-    await fetch(`/api/jobs/${state.currentJobId}/recordings?duration=${dur.toFixed(1)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': blob.type || 'audio/webm' },
-      body: blob,
-    });
-    $('#recStatus').textContent = '已保存 ✓';
-    loadRecordings(state.currentJobId);
-    refreshList(true);
-  } catch (e) {
-    $('#recStatus').textContent = '保存失败';
+  if (g) {
+    for (const name of ['limiter', 'micMakeup']) {
+      try { g[name]?.disconnect(); } catch {}
+      g[name] = null;
+    }
   }
 }
 
-async function loadRecordings(jobId) {
-  let recs = [];
-  try { recs = await api.listRecordings(jobId); } catch { recs = []; }
-  renderRecordings(recs);
+function uploadRecording(session) {
+  if (session.uploadPromise) return session.uploadPromise;
+  session.status = 'uploading';
+  session.error = '';
+  renderPendingRecordings();
+  session.uploadPromise = (async () => {
+    try {
+      const r = await fetchResponse(`/api/jobs/${encodeURIComponent(session.jobId)}/recordings?duration=${session.duration.toFixed(1)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': session.blob.type || 'audio/webm' },
+        body: session.blob,
+      }, 120000);
+      if (!r.ok) throw new Error(`保存失败（HTTP ${r.status}）`);
+      session.status = 'saved';
+      state.pendingRecordings.delete(session.id);
+      if (session.objectUrl) URL.revokeObjectURL(session.objectUrl);
+      session.objectUrl = null;
+      if (!state.disposed && state.currentJobId === session.jobId) {
+        if (!state.recording && !state.recordingStarting) $('#recStatus').textContent = session.interrupted ? '录音中断，已保存可用片段 ✓' : '已保存 ✓';
+        loadRecordings(session.jobId);
+      }
+      return true;
+    } catch (e) {
+      session.status = 'error';
+      session.error = e.message || '保存失败，请重试或下载';
+      if (!state.disposed && state.currentJobId === session.jobId && !state.recording) $('#recStatus').textContent = '保存失败，录音仍保留在本页';
+      return false;
+    } finally {
+      session.uploadPromise = null;
+      renderPendingRecordings();
+    }
+  })();
+  return session.uploadPromise;
 }
 
-function renderRecordings(recs) {
+function renderPendingRecordings() {
+  if (state.disposed) return;
+  const list = $('#pendingRecordings');
+  list.replaceChildren();
+  state.pendingRecordings.forEach((session) => {
+    const row = document.createElement('li');
+    const title = document.createElement('span');
+    title.textContent = `${session.title} · ${session.status === 'uploading' ? '正在保存…' : session.error}`;
+    row.appendChild(title);
+    if (session.blob?.size) {
+      if (!session.objectUrl && URL.createObjectURL) session.objectUrl = URL.createObjectURL(session.blob);
+      if (session.objectUrl) {
+        const download = document.createElement('a');
+        download.href = session.objectUrl;
+        download.download = `openk-${session.jobId}.${session.blob.type.includes('mp4') ? 'm4a' : session.blob.type.includes('ogg') ? 'ogg' : 'webm'}`;
+        download.textContent = '下载备份';
+        row.appendChild(download);
+      }
+      const retry = document.createElement('button');
+      retry.className = 'lyr-btn';
+      retry.textContent = '重试保存';
+      retry.disabled = session.status === 'uploading';
+      retry.addEventListener('click', () => uploadRecording(session));
+      row.appendChild(retry);
+    }
+    list.appendChild(row);
+  });
+  $('#pendingRecordingsWrap').classList.toggle('hidden', state.pendingRecordings.size === 0);
+}
+
+async function loadRecordings(jobId) {
+  if (state.disposed || state.currentJobId !== jobId) return;
+  const generation = ++state.recordingsGeneration;
+  const selection = state.selectionGeneration;
+  state.recordingsRequest?.abort();
+  const request = new AbortController();
+  state.recordingsRequest = request;
+  try {
+    const recs = await api.listRecordings(jobId, { signal: request.signal });
+    if (isCurrentPlayer(jobId, selection) && generation === state.recordingsGeneration && !request.signal.aborted) {
+      renderRecordings(recs, jobId);
+    }
+  } catch (e) {
+    if (isCurrentPlayer(jobId, selection) && generation === state.recordingsGeneration && e.name !== 'AbortError') {
+      $('#recListStatus').textContent = '历史录音暂时无法更新，请稍后重试';
+    }
+  } finally {
+    if (state.recordingsRequest === request) state.recordingsRequest = null;
+  }
+}
+
+function renderRecordings(recs, jobId = state.currentJobId) {
   const wrap = $('#recListWrap');
   const ul = $('#recList');
   ul.innerHTML = '';
+  $('#recListStatus').textContent = '';
   if (!recs || !recs.length) { wrap.classList.add('hidden'); return; }
   wrap.classList.remove('hidden');
   recs.slice().reverse().forEach((r) => {
     const li = document.createElement('li');
     const when = r.created_at ? new Date(r.created_at * 1000).toLocaleString() : '';
     li.innerHTML = `
-      <audio controls preload="none" src="${r.url}"></audio>
+      <audio controls preload="none" src="${escapeHtml(r.url)}" aria-label="录音回放"></audio>
       <div class="rec-meta">
         <span>${when}</span>
         <span class="muted small">${r.duration ? fmt(r.duration) : ''}</span>
       </div>
-      <a class="dl" href="${r.url}" download title="下载">⬇</a>
+      <a class="dl" href="${escapeHtml(r.url)}" download title="下载" aria-label="下载录音">⬇</a>
       <button class="rdel" title="删除">✕</button>`;
     li.querySelector('.rdel').addEventListener('click', async () => {
       if (!confirm('删除这条录音？')) return;
-      await api.deleteRecording(state.currentJobId, r.file);
-      loadRecordings(state.currentJobId);
-      refreshList(true);
+      try {
+        await api.deleteRecording(jobId, r.file);
+        if (state.currentJobId === jobId) loadRecordings(jobId);
+      } catch (e) { toast(e.message || '删除失败'); }
+    });
+    li.querySelector('audio').addEventListener('play', (e) => {
+      if (state.recording) stopRecording();
+      pausePlayback();
+      ul.querySelectorAll('audio').forEach((audio) => { if (audio !== e.target) audio.pause(); });
     });
     ul.appendChild(li);
   });
@@ -1761,23 +2394,70 @@ function renderRecordings(recs) {
 function bindPlayer() {
   $('#playBtn').addEventListener('click', togglePlay);
 
-  inst.addEventListener('play', () => { $('#playBtn').textContent = '⏸'; });
-  inst.addEventListener('pause', () => { $('#playBtn').textContent = '▶'; });
-  inst.addEventListener('loadedmetadata', () => { $('#durTime').textContent = fmt(inst.duration); });
-  inst.addEventListener('ended', () => {
+  inst.addEventListener('play', () => {
+    $('#playBtn').textContent = '⏸';
+    $('#playBtn').setAttribute('aria-label', '暂停');
+    $('#nbPlay').setAttribute('aria-label', '暂停');
+    startLyricAnimation();
+  });
+  inst.addEventListener('pause', () => {
     $('#playBtn').textContent = '▶';
-    if (vocal.src) vocal.pause();
+    $('#playBtn').setAttribute('aria-label', '播放');
+    $('#nbPlay').setAttribute('aria-label', '播放');
+    stopLyricAnimation();
+  });
+  inst.addEventListener('loadedmetadata', () => { $('#durTime').textContent = fmt(inst.duration); });
+  for (const event of ['waiting', 'stalled']) {
+    inst.addEventListener(event, () => {
+      if (!state.currentJobId) return;
+      state.buffering = true;
+      setAudioStatus('音频缓冲中…');
+      if (hasVocal()) vocal.pause();
+    });
+  }
+  inst.addEventListener('playing', () => {
+    const wasBuffering = state.buffering;
+    state.buffering = false;
+    setAudioStatus('');
+    if (wasBuffering && hasVocal()) {
+      const generation = state.playbackGeneration;
+      vocal.currentTime = inst.currentTime;
+      vocal.playbackRate = 1;
+      Promise.resolve().then(() => {
+        if (generation === state.playbackGeneration) return vocal.play();
+      }).catch(() => {
+        if (generation === state.playbackGeneration) setAudioStatus('伴奏已恢复，导唱暂时不可用');
+      });
+    }
+    startLyricAnimation();
+  });
+  inst.addEventListener('error', () => {
+    if (!inst.getAttribute('src')) return;
+    pausePlayback();
+    setAudioStatus('音频无法载入，请重新点歌或检查网络');
+  });
+  inst.addEventListener('ended', () => {
+    if (state.recording) stopRecording();
+    state.playRequested = false;
+    $('#playBtn').textContent = '▶';
+    if (hasVocal()) vocal.pause();
   });
 
   inst.addEventListener('timeupdate', () => {
     const t = inst.currentTime;
     $('#curTime').textContent = fmt(t);
     if (inst.duration) $('#seek').value = Math.round((t / inst.duration) * 1000);
+    $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
     // 纠正双轨漂移
-    if (vocal.src && !vocal.paused && Math.abs(vocal.currentTime - t) > 0.25) {
-      vocal.currentTime = t;
+    if (hasVocal() && !vocal.paused && !inst.paused && !state.buffering
+        && !inst.seeking && !vocal.seeking && inst.readyState >= 2 && vocal.readyState >= 2
+        && performance.now() - state.lastSyncAt >= 500) {
+      state.lastSyncAt = performance.now();
+      const drift = vocal.currentTime - t;
+      if (Math.abs(drift) > 0.75) { vocal.currentTime = t; vocal.playbackRate = 1; }
+      else vocal.playbackRate = Math.abs(drift) > 0.08 ? (drift > 0 ? 0.99 : 1.01) : 1;
     }
-    updateLyrics(t);
+    if (!state.lyricRaf && !document.hidden && !$('#stage').classList.contains('hidden')) updateLyrics(t);
   });
 
   $('#seek').addEventListener('input', (e) => {
@@ -1785,6 +2465,7 @@ function bindPlayer() {
     const t = (e.target.value / 1000) * inst.duration;
     seekTo(t);
     $('#curTime').textContent = fmt(t);
+    $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
     updateLyrics(t);
   });
 
@@ -1820,14 +2501,27 @@ function bindPlayer() {
     const on = $('#monitor').checked;
     prefs.micMonitor = on;
     savePrefs();
-    micHint(on ? '' : '麦克风已静音');
+    if (on) state.monitorHidden = false;
+    const generation = state.micGeneration;
     if (on) {
       // 勾选即请求麦克风并接入监听，无需先点“开始录唱”。
-      try { await ensureMic(); } catch { $('#monitor').checked = false; return; }
+      try { await ensureMic(); } catch (e) {
+        if (generation === state.micGeneration && e.name !== 'AbortError') $('#monitor').checked = false;
+        return;
+      }
     }
-    const g = state.audioGraph;
-    if (g && g.monitorGain) g.monitorGain.gain.value = on ? MONITOR_GAIN : 0;
+    applyMonitorState();
     if (!on) maybeReleaseMic();
+  });
+  $('#resumeMonitor').addEventListener('click', async () => {
+    if (document.hidden || !prefs.micMonitor) return;
+    try {
+      await ensureMic();
+      if (!document.hidden && prefs.micMonitor) {
+        state.monitorHidden = false;
+        applyMonitorState();
+      }
+    } catch { micHint('麦克风未能恢复，请检查授权后重试'); }
   });
 
   const hg = $('#howlGuard');
@@ -1841,13 +2535,30 @@ function bindPlayer() {
     });
   }
 
-  // 空格键播放/暂停
-  document.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && !$('#player').classList.contains('hidden') &&
-        document.activeElement.tagName !== 'INPUT') {
-      e.preventDefault(); togglePlay();
+}
+
+function interactiveTarget(target) {
+  return target?.closest?.('input, textarea, select, button, a, [contenteditable], [role="button"]');
+}
+
+function handleKeys(e) {
+  const drawer = !$('#queuePanel').classList.contains('hidden') ? $('#queuePanel')
+    : !$('#adminPanel').classList.contains('hidden') ? $('#adminPanel') : null;
+  if (drawer) {
+    if (e.key === 'Escape') { e.preventDefault(); closeDrawers(); return; }
+    if (e.key === 'Tab') {
+      const controls = [...drawer.querySelectorAll('button, input, select, textarea, a[href], [tabindex="0"]')]
+        .filter((el) => !el.disabled && !el.closest('.hidden') && !el.hidden);
+      const first = controls[0], last = controls[controls.length - 1];
+      if (first && (!drawer.contains(document.activeElement) || (e.shiftKey && document.activeElement === first))) {
+        e.preventDefault(); (e.shiftKey ? last : first).focus();
+      } else if (last && !e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     }
-  });
+    return;
+  }
+  if (e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || interactiveTarget(e.target)) return;
+  if (e.code === 'Space' && state.currentJobId) { e.preventDefault(); togglePlay(); }
+  if (e.key === '/') { e.preventDefault(); $('#search').focus(); }
 }
 
 /* ---------------- 初始化 ---------------- */
@@ -1855,13 +2566,17 @@ function init() {
   loadQueue();
 
   /* 顶部：搜索 / 已点 / 后台 */
-  const onSearch = () => {
+  let composing = false;
+  const onSearch = (event) => {
+    if (composing || event?.isComposing) return;
     state.search = $('#search').value;
     $('#searchClear').classList.toggle('hidden', !state.search);
-    renderBrowse(true);
+    renderBrowse();
   };
   $('#search').addEventListener('input', onSearch);
-  $('#searchClear').addEventListener('click', () => { $('#search').value = ''; onSearch(); $('#search').focus(); });
+  $('#search').addEventListener('compositionstart', () => { composing = true; });
+  $('#search').addEventListener('compositionend', () => { composing = false; onSearch(); });
+  $('#searchClear').addEventListener('click', () => { composing = false; $('#search').value = ''; onSearch(); $('#search').focus(); });
   $('#homeBtn').addEventListener('click', () => { closeDrawers(); showBrowse(); });   // 只切视图，歌照唱
   $('#backBtn').addEventListener('click', showBrowse);
   $('#queueBtn').addEventListener('click', () => openDrawer('queue'));
@@ -1871,7 +2586,7 @@ function init() {
   $('#scrim').addEventListener('click', closeDrawers);
   $('#queueClear').addEventListener('click', () => {
     if (!state.queue.length || !confirm('清空已点歌曲？')) return;
-    state.queue = []; saveQueue(); renderQueue(); renderBrowse(true);
+    state.queue = []; saveQueue(); renderQueue(); renderBrowse();
   });
 
   /* 分类页签 */
@@ -1879,7 +2594,10 @@ function init() {
     btn.addEventListener('click', () => {
       state.libMode = btn.dataset.tab;
       state.artistPick = null;
-      document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tab').forEach((b) => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', String(b === btn));
+      });
       renderBrowse(true);
     });
   });
@@ -1972,17 +2690,28 @@ function init() {
   $('#viewToggle').textContent = state.view === 'list' ? '🖼 大图' : '📃 列表';
 
   bindPlayer();
+  if (window.ResizeObserver) {
+    const observer = new ResizeObserver(measureNowBar);
+    observer.observe($('#nowbar'));
+    window.addEventListener('pagehide', () => observer.disconnect(), { once: true });
+  }
+  window.addEventListener('resize', measureNowBar);
   inst.addEventListener('play', renderNowBar);
   inst.addEventListener('pause', renderNowBar);
   // 一首唱完自动接下一首，这是 KTV 机器最基本的行为
-  inst.addEventListener('ended', () => { setTimeout(() => playFromQueue(true), 800); });
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeDrawers();
-    if (e.key === '/' && document.activeElement !== $('#search')) { e.preventDefault(); $('#search').focus(); }
+  inst.addEventListener('ended', () => {
+    cancelEndedTimer();
+    const generation = state.selectionGeneration, id = state.currentJobId;
+    state.endedTimer = setTimeout(() => {
+      state.endedTimer = null;
+      if (id && isCurrentPlayer(id, generation)) playFromQueue(true);
+    }, 800);
   });
+  document.addEventListener('keydown', handleKeys);
 
   refreshList(true);
+  resumeAlignments();
+  if (location.pathname.replace(/\/+$/, '') === '/admin') openDrawer('admin');
   // 繁简对照表跟曲库走，晚一步到也没关系——到了就把检索字段重算一遍。
   loadZhMap().then(() => renderBrowse(true));
   // 本地导入默认关闭（部署者不配白名单目录就当没这功能），所以入口按服务端答复决定显隐。
@@ -1992,12 +2721,13 @@ function init() {
   // 后台自适应刷新列表：有运行中任务时 3s，全部空闲时放慢到 15s；
   // 页面不可见、或正在逐帧轮询单个任务时跳过，避免无谓请求刷屏。
   const scheduleListRefresh = () => {
+    if (state.disposed) return;
     if (state.listTimer) clearTimeout(state.listTimer);
     const busy = state.allJobs.some((j) => j.state === 'running' || j.state === 'queued');
     state.listTimer = setTimeout(async () => {
       // finally 保证无论如何都续上下一轮，否则页面会静默停更、只能手动刷新。
       try {
-        if (!state.pollTimer && !document.hidden) await refreshList();
+        if (!state.pollTimer && !state.pollRequest && !document.hidden) await refreshList();
       } catch (e) {
         console.error('刷新列表失败', e);
       } finally {
@@ -2009,7 +2739,48 @@ function init() {
   // 息屏/切走时浏览器会暂停定时器，回来后立刻补一次并重新排期，
   // 免得长时间挂着的标签页显示的是过期曲库。
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) { refreshList(); scheduleListRefresh(); }
+    if (document.hidden) {
+      stopLyricAnimation();
+      applyMonitorState();
+      const h = state.audioGraph?.howl;
+      if (h?.raf) { cancelAnimationFrame(h.raf); h.raf = 0; }
+      state.pollRequest?.abort();
+      state.alignmentRequests.forEach((r) => r.abort());
+    } else {
+      if (!state.inspectedJobId) refreshList();
+      else startPolling(state.inspectedJobId);
+      scheduleListRefresh();
+      state.activeLine = -1;
+      if (!$('#stage').classList.contains('hidden')) updateLyrics(inst.currentTime);
+      startLyricAnimation();
+      applyMonitorState();
+      Object.keys(state.alignmentOperations).forEach((jobId) => {
+        if (alignmentBusy(jobId)) scheduleAlignment(jobId, 0);
+      });
+    }
+  });
+  window.addEventListener('beforeunload', (e) => {
+    if (state.recording || state.recordingStarting || state.pendingRecordings.size) {
+      e.preventDefault(); e.returnValue = '';
+    }
+  });
+  window.addEventListener('pagehide', (e) => {
+    if (state.recording) stopRecording();
+    pausePlayback();
+    cleanupMic();
+    invalidateSelection();
+    state.monitorHidden = prefs.micMonitor;
+    if (!e.persisted) {
+      state.disposed = true;
+      stopPolling();
+      clearTimeout(state.listTimer);
+      state.alignmentTimers.forEach(clearTimeout);
+      state.alignmentRequests.forEach((r) => r.abort());
+      state.audioGraph?.actx.close?.();
+    }
+  });
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) { applyMonitorState(); scheduleListRefresh(); }
   });
 }
 

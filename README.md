@@ -2,10 +2,17 @@
 
 把任意 YouTube / 视频链接一键变成卡拉OK：**自动去除人声**、**逐字对齐歌词**，并提供带同步高亮歌词的播放器。
 
+**客厅模式**：电视打开 `/tv`，手机扫码进入 `/remote` 点歌；共享队列、遥控器焦点、
+大字逐词歌词、原唱切换和自动连唱。经典点歌台与录唱仍在 `/`，管理入口为 `/admin`。
+见 [电视／Fire TV 与手机点歌指南](docs/tv.md)。
+
+**部署边界**：当前没有全站账号登录；房间配对仅保护共享控制。请部署在可信网络，
+或放在具备身份认证的反向代理后，不要直接暴露到公网。见 [安全说明](SECURITY.md)。
+
 <p align="center">
-  <img src="docs/screenshots/player.png" alt="openk 卡拉OK 播放器 —— 逐字高亮歌词" width="860" />
+  <img src="docs/screenshots/tv-stage.png" alt="openk 电视舞台 —— 大字逐词歌词与手机共享点歌" width="860" />
   <br/>
-  <sub>卡拉OK 播放器：逐字高亮歌词 · 独立伴奏/导唱音量 · KTV 混响 · 一键录唱 · 歌词来源标注</sub>
+  <sub>电视大屏演唱 · 手机扫码点歌 · 共享队列 · 逐词高亮 · 原唱切换</sub>
 </p>
 
 - 🎸 **人声分离**：基于 [audio-separator](https://github.com/nomadkaraoke/python-audio-separator)（[Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) 的 MDX-Net / BS-Roformer / Demucs 模型封装），在 Apple Silicon 上自动启用 CoreML 加速。
@@ -33,26 +40,45 @@
 
 ## 界面预览
 
-**点歌台** —— 首页就是一整墙做好的歌（封面 + 歌名 + 歌手），像 KTV 机器一样点歌、排队、连播：
+以下截图全部来自隔离演示环境：虚构曲目、原创示例歌词和程序生成的音轨／封面，
+不包含实际曲库、服务器地址或有效配对凭据。
+
+**点歌台** —— 首页默认是高密度列表，也能切换封面墙，像 KTV 机器一样点歌、排队、连播：
 
 <p align="center">
-  <img src="docs/screenshots/songboard.png" alt="点歌台式曲库：封面墙、按歌手分组、可搜索" width="860" />
+  <img src="docs/screenshots/songboard.png" alt="经典点歌台：演示曲目列表、歌手分类与搜索" width="860" />
 </p>
 
 - **高密度曲目列表**：默认是文字列表（歌名 / 歌手 / 语种 / 时长 / 点歌），一屏十几首，找歌比翻封面快得多——商业点歌台也都是这么做的。想按 MV 画面认歌就点右上角切「🖼 大图」。
-- **搜索**：歌名、歌手，或**拼音首字母**（`pfzl` → 平凡之路，从头匹配）。按 `/` 直接聚焦搜索框。
-  曲库繁简混排，搜索会自动**繁简互通**（打「海阔天空」能搜到「海闊天空」）。
+- **搜索**：经典点歌台和手机遥控器共用歌名 / 歌手搜索，支持**全拼和拼音首字母**。
+  例如 `周杰伦 稻香`、`稻香 zhoujielun`、`zjl dx`，词序不限；首字母只从头匹配，
+  `dx` 不会误中「淚的小雨」的 `ldxy`。经典页面按 `/` 聚焦搜索框；输入法组词期间不刷新结果。
+  **繁简双向互通**（包括繁体输入搜索纯简体曲库），忽略大小写、全半角、标点、空格与重音；
+  歌名 / 歌手精确命中优先于包含和拼音命中，不做错别字猜测或歌手别名扩展。
+  输入关键词时跨歌手搜索，经典页面仍保留选中的语种筛选；清空后恢复原浏览范围。
+  全拼由 NAS 上的 `pypinyin` 按元数据缓存预计算，多音字读音以其词库为准；不依赖 CDN 或外网服务。
+  字符表加载失败时仍可用原文和服务端全拼；旧版 / 模拟曲目没有搜索索引时仅回退到浏览器首字母估算。
 - **分类**：全部（按拼音排序）/ 歌手（先选人再选歌）/ 最新，外加一条**语种**筛选（国语 / 粤语 / 日语 / 韩语 / 英语…，从标题里的标记识别）。
-  歌手页同样按繁简归一，`夢然` 和 `梦然` 会合成一位，不会劈成两张卡片。
-- **已点歌曲**：点一首就排进队列，可**置顶**、删除、清空；一首唱完自动接下一首。队列存在浏览器本地，刷新不丢。
+  歌手页按繁简、大小写、全半角归一，`夢然` 和 `梦然` 会合成一位，显示仍保留曲库中最常见的原写法；
+  不会把 `A-Lin` 与 `ALin` 等标点不同的歌手强行合并。
+- **已点歌曲**：点一首就排进队列，可**置顶**、删除、清空；一首唱完自动接下一首。经典入口队列存在浏览器本地；电视／手机房间队列由服务端持久化，两种模式互不覆盖。
 - **常驻控制条**：唱歌时底部一直有「伴唱 / 原唱」「重唱」「切歌」「已点 N」，**浏览区照常可用**——一个人在唱、其他人接着点歌，这才是点歌台的正常用法。默认是**伴唱**。
 - **麦克风默认外放**：点歌开唱就自动接通麦克风并从音箱出声（和真 KTV 一样），带**自动防啸叫**（见下）；麦克风音量、混响、伴唱/原唱都记在本地偏好里。
 - **后台（⚙️）**：添加链接、导入歌单、导入本地文件、查看处理进度都收在这里，唱歌时不碍事；有任务在跑时按钮上会显示数量角标。
 
-**处理过程实时可见**（在「⚙️ 后台」里）—— 下载 → 人声分离 → 歌词对齐，三步流水线带进度：
+**手机点歌、组合搜索与共享队列** —— 手机只控制房间，声音从电视输出：
 
 <p align="center">
-  <img src="docs/screenshots/processing.png" alt="三步处理流水线，实时进度" width="860" />
+  <img src="docs/screenshots/remote.png" alt="手机曲库与播放控制" width="280" />
+  <img src="docs/screenshots/remote-search.png" alt="手机歌手与拼音组合搜索" width="280" />
+  <img src="docs/screenshots/remote-queue.png" alt="手机共享待唱队列" width="280" />
+</p>
+
+**后台管理**（「⚙️ 后台」）—— 添加链接、本地导入与任务管理；下图为无活跃任务的演示界面，
+有任务时显示下载 → 人声分离 → 歌词对齐的进度：
+
+<p align="center">
+  <img src="docs/screenshots/processing.png" alt="后台导入和任务管理，无活跃处理任务" width="860" />
 </p>
 
 **混音与录唱** —— 伴奏 / 导唱人声独立音量、KTV 等多种混响、一键录唱与耳机监听：
@@ -124,6 +150,7 @@ YouTube 链接
 openk/
 ├── backend/
 │   ├── main.py            # FastAPI 服务与路由
+│   ├── search.py          # 归一、相关度排序、繁简表与缓存的拼音搜索索引
 │   ├── config.py          # 配置（可用环境变量覆盖）
 │   ├── jobs.py            # 任务管理（内存 + status.json 持久化）
 │   ├── pipeline.py        # 下载→分离→对齐 编排
@@ -142,7 +169,8 @@ openk/
 │       └── transcribe.py     # whisperX 强制对齐 / 识别 → lyrics.json / .lrc
 ├── frontend/              # 纯静态前端 (HTML/CSS/JS)，无构建步骤
 │   ├── index.html        # 点歌台 + 演唱页 + 已点/后台两个抽屉
-│   ├── app.js            # 曲库渲染、拼音首字母检索、已点队列、播放器与录唱
+│   ├── app.js            # 曲库渲染、已点队列、播放器与录唱
+│   ├── search.js         # 经典 / 手机共用的轻量检索，与后端算法一致
 │   └── styles.css
 ├── worker/                # 可选：远程算力 worker（跑在算力机上）
 ├── tools/                 # 运维小工具：dedupe.py（曲库除重，留音质最好的版本）
@@ -160,20 +188,25 @@ openk/
 镜像已发布到 GitHub Container Registry，**内置 ffmpeg / Deno / Python 与全部依赖**，Mac / Windows / Linux 通用，只需装好 [Docker](https://docs.docker.com/get-docker/)：
 
 ```bash
-docker run -d --name openk -p 8000:8000 \
+docker run -d --name openk -p 127.0.0.1:8000:8000 \
   -v "$PWD/openk-data:/data" \
-  ghcr.io/dcluomax/openk:latest
+  ghcr.io/dcluomax/openk:stable
 ```
 
 （Windows PowerShell 把挂载写成 `-v ${PWD}/openk-data:/data`。）打开 <http://localhost:8000> 即可使用；数据、录音与下载的模型都存在挂载的 `openk-data/` 里，重启不丢。
 
-- 更新镜像：`docker pull ghcr.io/dcluomax/openk:latest`，再 `docker rm -f openk` 并重跑上面的命令。
+- 更新稳定镜像：`docker pull ghcr.io/dcluomax/openk:stable`。先等待任务空闲、备份数据与当前镜像，
+  再重建容器；分布式部署须同步更新 worker。见 [升级说明](CHANGELOG.md)。
+- 默认仅本机访问。电视／手机需要通过认证反向代理访问；仅在可信隔离局域网内，
+  才把端口映射显式改为 `-p 8000:8000`，并限制防火墙入站范围。
 - 传配置：追加 `-e OPENK_WHISPER_LANGUAGE=zh`、`-e OPENK_SEPARATOR_SEGMENT_SIZE=128` 等环境变量（见下方「配置」表）。
 - ⚠️ 人声分离很吃内存，请在 Docker Desktop 的「Resources」里给容器**至少 6–8GB 内存**。
 - 首次处理某首歌会联网下载模型（分离 / 识别 / 对齐），之后从 `openk-data` 缓存复用。
 - 私有包免登录拉不到时：在仓库 **Packages → openk → Package settings** 把可见性改成 **Public**，或先 `docker login ghcr.io`。
 
-> 镜像由 [GitHub Actions 工作流](.github/workflows/docker-publish.yml)在每次推送 `main` 时自动构建并发布（`linux/amd64` + `linux/arm64` 双架构）。
+> [GitHub Actions](.github/workflows/docker-publish.yml)先运行回归，再构建 `linux/amd64` +
+> `linux/arm64` 镜像。`main` 推送只更新 `:main` 开发镜像；正式 `vX.Y.Z` 标签更新版本镜像、
+> `:stable` 和 `:latest`，预发布标签不更新稳定别名。需要固定版本时使用 `:v1.0.0` 或镜像摘要。
 
 > **精简镜像**：把重活都交给远程 worker 时（见 [分布式部署](docs/distributed.md)），
 > 服务端不再需要 torch / onnxruntime，可以自行构建一个不含 ML 依赖的镜像，
@@ -393,6 +426,7 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 | `OPENK_RESUME_ON_START` | `true` | 重启后把没跑完的任务重新排队，而不是标记失败 |
 | `OPENK_PORT` | `8000` | 服务端口 |
 | `OPENK_HOST` | `127.0.0.1` | 监听地址；局域网访问填 `0.0.0.0` |
+| `OPENK_ALLOWED_ORIGINS` | 空 | 默认仅同源浏览器访问；额外可信来源以逗号分隔，必须是完整 `http(s)://主机[:端口]`，不接受通配符。TLS 代理需保留完整 Host 并正确识别 scheme，或显式列出页面的外部来源 |
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
 | `OPENK_SSL_CERTFILE` | 空 | HTTPS 证书路径；与下一项同时设置才启用 |
 | `OPENK_SSL_KEYFILE` | 空 | HTTPS 私钥路径 |
@@ -414,7 +448,7 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 **1. 生成自签证书**（把地址换成你自己的）：
 
 ```bash
-python -m scripts.make_cert 192.168.1.10 myhost.local localhost 127.0.0.1
+python -m scripts.make_cert 192.0.2.10 nas.example localhost 127.0.0.1
 ```
 
 证书写到 `OPENK_CERTS_DIR`（默认 `<data>/certs`）。
@@ -479,8 +513,8 @@ python -m backend.main
 | GET | `/api/local/status` | 本地导入是否可用及允许的目录；未启用时 `enabled: false` |
 | POST | `/api/local/scan` | 扫描白名单目录 `{subdir?, limit?}`，标出每个文件的状态；**不创建任务** |
 | POST | `/api/local/import` | 批量导入本地文件 `{paths?, subdir?, language?, whisper_model?, limit?}` |
-| GET | `/api/jobs?q=` | 任务列表，`q` 可按标题搜索 |
-| GET | `/api/zh-map` | 曲库用到的繁体字 → 简体字对照表，供前端搜索做繁简归一 |
+| GET | `/api/jobs?q=` | 与点歌台相同的歌名 / 歌手多词、繁简、全拼和首字母检索，按相关度排序；也保留 URL 子串搜索。返回预计算的 `search_index`；`q` 为空时按歌名拼音稳定排序，省略 `q` 则保留原有最新优先顺序 |
+| GET | `/api/zh-map` | 完整单字繁 → 简对照表（进程内缓存，不依赖曲库内容），供前端搜索归一 |
 | GET | `/api/jobs/{id}` | 任务状态（含媒体 URL 与录音列表） |
 | DELETE | `/api/jobs/{id}` | 删除任务及其文件 |
 | POST | `/api/jobs/{id}/retry` | 重试失败任务（body 可选 `{language?, whisper_model?}` 覆盖语言/模型） |

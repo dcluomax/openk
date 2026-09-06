@@ -15,10 +15,14 @@
 """
 from __future__ import annotations
 
+import errno
+import os
 import re
 import shutil
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from .. import config
 
@@ -59,32 +63,74 @@ def library_dir() -> Optional[Path]:
     return p if p.is_dir() else None
 
 
-def archive(src: str | Path, artist: Optional[str], track: Optional[str],
-            video_id: Optional[str] = None) -> Optional[Path]:
-    """把源文件搬进媒体库并规范命名，返回新路径。
+@dataclass(frozen=True)
+class ArchiveResult:
+    status: Literal["disabled", "skipped", "conflict", "failed", "archived"]
+    message: str
+    path: Optional[Path] = None
 
-    搬不动（没配库、没歌名、同名已存在）就返回 None，由调用方维持原状。
-    同名已存在时**不覆盖**：宁可留两份，也不能悄悄吃掉一首歌。
-    """
+    def as_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "message": self.message,
+                "path": str(self.path) if self.path else None}
+
+
+def archive_result(src: str | Path, artist: Optional[str], track: Optional[str],
+                   video_id: Optional[str] = None) -> ArchiveResult:
+    """Publish without replacing another source; all unsuccessful outcomes retain src."""
     src = Path(src)
-    root = library_dir()
-    if root is None or not src.is_file():
-        return None
+    if not config.LIBRARY_DIR:
+        return ArchiveResult("disabled", "未配置媒体库，源文件保留在任务目录")
+    root = Path(config.LIBRARY_DIR)
+    if not root.is_dir():
+        return ArchiveResult("failed", "媒体库目录不可用；恢复挂载后重试归档")
+    if not src.is_file():
+        return ArchiveResult("failed", "源文件不存在；请检查源文件后重试")
     name = canonical_name(artist, track, video_id or extract_video_id(src.name), src.suffix)
     if not name:
-        return None
+        return ArchiveResult("skipped", "缺少歌名；补全歌名后可重试归档")
     dst = root / name
-    if dst.exists():
-        return dst if dst.samefile(src) else None
+    part = root / f".openk-archive-{uuid.uuid4().hex}.part"
     try:
-        # 跨设备时 rename 会失败（库和 data 常挂在不同卷上），退回复制后删源。
+        if dst.exists():
+            if dst.samefile(src):
+                return ArchiveResult("archived", "源文件已在媒体库", dst)
+            return ArchiveResult("conflict", "媒体库已有同名文件；源文件保留，请核对版本", dst)
+        # Hard-link publication is atomic and no-clobber. Cross-device copies
+        # remain hidden until complete, then use the same no-clobber operation.
         try:
-            src.rename(dst)
+            os.link(src, dst)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copyfile(src, part)
+            os.link(part, dst)
+        try:
+            src.unlink()
         except OSError:
-            shutil.move(str(src), str(dst))
-    except OSError:
-        return None
-    return dst
+            return ArchiveResult("archived", "归档完成；任务目录旧副本未能清理", dst)
+        return ArchiveResult("archived", "源文件已归档到媒体库", dst)
+    except FileExistsError:
+        return ArchiveResult("conflict", "媒体库已有同名文件；源文件保留，请核对版本", dst)
+    except OSError as exc:
+        return ArchiveResult("failed", f"归档失败（{exc.strerror or type(exc).__name__}）；源文件保留，可重试")
+    finally:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def archive(src: str | Path, artist: Optional[str], track: Optional[str],
+            video_id: Optional[str] = None) -> Optional[Path]:
+    """Compatibility helper: unsuccessful moves leave the source untouched."""
+    result = archive_result(src, artist, track, video_id)
+    return result.path if result.status == "archived" else None
+
+
+def archive_job_source_result(job: Dict[str, Any], src: str | Path) -> ArchiveResult:
+    if not config.LIBRARY_ARCHIVE_DOWNLOADS:
+        return ArchiveResult("disabled", "下载源归档已关闭")
+    return archive_result(src, job.get("artist"), job.get("track"), job.get("video_id"))
 
 
 def archive_job_source(job: Dict[str, Any], src: str | Path) -> Optional[Path]:

@@ -37,11 +37,7 @@ def build(
         traceback.print_exc()
         candidate = None
     if not candidate:
-        try:
-            candidate = lyrics_sources.from_subtitles(info.get("subtitles"))
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
-            candidate = None
+        candidate = lyrics_sources.from_subtitles(info.get("subtitles"), language)
 
     # 2) 有现成歌词 → 尝试逐词强制对齐，失败则保留逐行
     if candidate:
@@ -53,7 +49,7 @@ def build(
                 on_progress(8, f"已获取歌词（{source}），正在逐词对齐…")
             return transcribe.align_known_lyrics(
                 vocals_path, candidate["lines"], lang, out_dir, source, on_progress)
-        except Exception:  # noqa: BLE001 - 对齐失败则优雅降级
+        except transcribe.AlignmentUnavailable:
             traceback.print_exc()
             if on_progress:
                 on_progress(90, f"逐词对齐不可用，使用逐行歌词（{source}）")

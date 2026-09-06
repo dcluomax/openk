@@ -20,18 +20,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
+from .lyrics_sources import SubtitleDescriptor, SubtitleError
+from .media_utils import check_duration
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
 # 认得的媒体扩展名。视频会被抽出音轨，音频直接用。
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".ts"}
-AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".aac", ".wma"}
+AUDIO_EXTS = {".m4a", ".mka", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".aac", ".wma"}
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 # 以 `_` 或 `.` 开头的子目录一律不参与扫描。除重时被淘汰的版本会挪进
 # `_重复/`，如果扫描还把它们列出来，下次导入又原样回到曲库，等于白删。
@@ -155,6 +158,19 @@ def _save_index(index: Dict[str, Any]) -> None:
         pass  # 索引只是缓存，写不进去也不该影响功能
 
 
+def _media_paths(root: Path):
+    # Sort one directory at a time: preserve deterministic path order without
+    # enumerating excluded subtrees or the entire library before applying limit.
+    with os.scandir(root) as scan:
+        entries = sorted(scan, key=lambda entry: entry.name)
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False):
+            if not entry.name.startswith(HIDDEN_PREFIXES):
+                yield from _media_paths(Path(entry.path))
+        elif entry.is_file() and Path(entry.name).suffix.lower() in MEDIA_EXTS:
+            yield Path(entry.path)
+
+
 def scan(subdir: str | None = None, limit: int = 1000) -> Dict[str, Any]:
     """列出白名单目录下的媒体文件。
 
@@ -177,14 +193,10 @@ def scan(subdir: str | None = None, limit: int = 1000) -> Dict[str, Any]:
     dirty = False
 
     for root in search_roots:
-        for path in sorted(root.rglob("*")):
-            if len(entries) >= limit:
+        for path in _media_paths(root):
+            if len(entries) >= max(0, limit):
                 truncated = True
                 break
-            if not path.is_file() or path.suffix.lower() not in MEDIA_EXTS:
-                continue
-            if _in_hidden_dir(path, search_roots):
-                continue
             try:
                 st = path.stat()
             except OSError:
@@ -262,13 +274,13 @@ def _extract_audio(src: Path, out_dir: Path, on_progress: ProgressCb) -> Path:
     """抽出音轨。优先直接复制音频流，失败再转码。
 
     直接 copy 不重新编码：一首歌零点几秒就完事，也不会有二次压缩的损失。
-    只有当源音频编码装不进 m4a（比如 vorbis/opus）时才退回转码。
+    m4a 装不下时先尝试 Matroska 原流封装，最后才解码为无损 FLAC。
     """
     dst = out_dir / "source.m4a"
     if on_progress:
         on_progress(10, "正在抽取音轨…")
 
-    copy_cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(src),
+    copy_cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-map", "0:a:0",
                 "-vn", "-c:a", "copy", "-movflags", "+faststart", str(dst)]
     # errors="replace"：ffmpeg 会把源文件的元数据原样打进 stderr，而外面下载来的
     # mp4 里常带非 UTF-8 的标题/注释。严格解码会让抽音轨这一步直接抛异常，
@@ -281,11 +293,25 @@ def _extract_audio(src: Path, out_dir: Path, on_progress: ProgressCb) -> Path:
         return dst
 
     if on_progress:
-        on_progress(40, "音频编码需要转换，正在转码…")
+        on_progress(40, "正在保留原音轨编码，调整封装…")
     dst.unlink(missing_ok=True)
+    dst = out_dir / "source.mka"
     res = subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-vn",
-         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst)],
+        ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-map", "0:a:0",
+         "-vn", "-c:a", "copy", str(dst)],
+        capture_output=True, text=True, errors="replace",
+        timeout=config.SEPARATOR_TIMEOUT, check=False)
+    if res.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+        if on_progress:
+            on_progress(100, "音轨就绪")
+        return dst
+    dst.unlink(missing_ok=True)
+    dst = out_dir / "source.flac"
+    if on_progress:
+        on_progress(60, "原封装不可用，正在转换为无损音频…")
+    res = subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-map", "0:a:0",
+         "-vn", "-c:a", "flac", str(dst)],
         capture_output=True, text=True, errors="replace",
         timeout=config.SEPARATOR_TIMEOUT, check=False)
     if res.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
@@ -316,18 +342,23 @@ def _grab_thumbnail(src: Path, out_dir: Path, duration: Optional[float]) -> Opti
     return None
 
 
-def _sidecar_subtitles(src: Path, out_dir: Path) -> List[str]:
+def _sidecar_subtitles(src: Path, out_dir: Path) -> List[SubtitleDescriptor]:
     """收集与媒体同名的外挂字幕，作为歌词来源之一（有就省掉一次识别）。"""
-    found: List[str] = []
+    found: List[SubtitleDescriptor] = []
     for sub in sorted(src.parent.glob(glob_escape(src.stem) + "*")):
-        if sub.suffix.lower() not in _SUB_EXTS:
+        tail = sub.name[len(src.stem):]
+        if not tail.startswith(".") or sub.suffix.lower() not in _SUB_EXTS:
             continue
         try:
             dst = out_dir / sub.name
-            dst.write_bytes(sub.read_bytes())
-            found.append(str(dst))
-        except OSError:
-            continue
+            shutil.copyfile(sub, dst)
+        except OSError as exc:
+            raise SubtitleError(f"无法读取本地外挂字幕（{sub.suffix.lower()}）：{exc.strerror}") from exc
+        lang = tail[1:-len(sub.suffix)].strip(".") or None
+        if lang and not re.fullmatch(r"[a-zA-Z]{2,3}(?:-[a-zA-Z]{2,8})*", lang):
+            lang = None
+        found.append({"path": str(dst), "lang": lang, "auto": False,
+                      "origin": "local", "format": sub.suffix.lower().lstrip(".")})
     return found
 
 
@@ -348,13 +379,14 @@ def ingest(
 
     title, video_id = parse_name(src.stem)
     duration = _ffprobe_duration(src)
+    check_duration(duration)
 
     if src.suffix.lower() in AUDIO_EXTS:
         # 已经是音频：直接复制进任务目录，不动编码。
         audio = out_dir / ("source" + src.suffix.lower())
         if on_progress:
             on_progress(10, "正在准备音频…")
-        audio.write_bytes(src.read_bytes())
+        shutil.copyfile(src, audio)
         if on_progress:
             on_progress(100, "音频就绪")
     else:

@@ -24,7 +24,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-_TMP = tempfile.mkdtemp(prefix="openk-local-test-")
+# Match the canonical paths returned by allowed_roots()/scan(), including when
+# the test runner's scratch directory itself is reached through a symlink.
+_TMP = str(Path(tempfile.mkdtemp(prefix="openk-local-test-")).resolve())
 os.environ["OPENK_DATA_DIR"] = str(Path(_TMP) / "data")
 os.environ["OPENK_JOBS_DIR"] = str(Path(_TMP) / "data" / "jobs")
 
@@ -225,7 +227,10 @@ def test_api() -> None:
 
     before = len(manager.list())
     res = main.import_local(main.LocalImportRequest(paths=[str(SONG)]))
-    check("只导入指定的那个文件", res["created_count"] == 1, str(res["created_count"]))
+    check("只导入指定的那个文件", res["created_count"] == 1,
+          f"created={res['created_count']}, skipped={res.get('skipped', [])}")
+    if not res["created"]:
+        return  # Keep the original failed assertion, rather than masking it with IndexError.
     job = res["created"][0]
     check("任务标成 local 来源", job.get("source_type") == "local", str(job.get("source_type")))
     check("记下了本地路径", job.get("local_path") == str(SONG.resolve())
@@ -238,6 +243,14 @@ def test_api() -> None:
     check("重复导入说明是已在队列中",
           any("队列" in s["reason"] for s in again["skipped"]),
           str([s["reason"] for s in again["skipped"]]))
+
+    if _HAVE_SYMLINK:
+        alias = Path(_TMP) / "api-media-alias"
+        alias.symlink_to(MEDIA, target_is_directory=True)
+        aliased = main.import_local(main.LocalImportRequest(paths=[str(alias / SONG.name)]))
+        check("绝对路径别名仍选中已批准的同一文件，不重复创建任务",
+              aliased["created_count"] == 0 and aliased["skipped_count"] == 1
+              and aliased["skipped"][0].get("job_id") == job["id"], str(aliased))
 
     # 没有 video_id 的文件只能按路径去重，单独验一遍。
     res2 = main.import_local(main.LocalImportRequest(paths=[str(NO_ID)]))

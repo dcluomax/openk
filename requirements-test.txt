@@ -1,0 +1,6 @@
+-r requirements.txt
+# 兼容旧版与新版 Starlette 的 TestClient。
+httpx>=0.27
+httpx2>=2.0
+numpy>=1.26
+PyYAML>=6.0

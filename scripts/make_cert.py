@@ -3,12 +3,12 @@
 
 为什么卡拉OK 需要 https：浏览器只在「安全上下文」下开放 getUserMedia，
 也就是 https 或 localhost。用手机、平板连局域网里的 openk 时地址是
-http://192.168.x.x:8000，属于不安全来源，navigator.mediaDevices 干脆不存在，
+http://192.0.2.10:8000，属于不安全来源，navigator.mediaDevices 干脆不存在，
 点「开始录唱」只会得到一句「当前浏览器不支持麦克风」——其实浏览器支持得很好。
 
 用法：
     python -m scripts.make_cert                       # 自动探测本机地址
-    python -m scripts.make_cert 192.168.1.10 nas.local
+    python -m scripts.make_cert 192.0.2.10 nas.example
 
 生成 data/certs/openk.crt 与 openk.key，然后：
     export OPENK_SSL_CERTFILE=data/certs/openk.crt

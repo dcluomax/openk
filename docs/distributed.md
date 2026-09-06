@@ -153,7 +153,7 @@ worker 一上线，积压的任务立刻开始处理（长轮询让派发延迟�
 | `OPENK_WORKER_STAGE_LOCAL` | `true` | 先把输入拷到本机临时盘再算。网络存储上强烈建议保持开启 |
 | `OPENK_WORKER_POLL_WAIT` | `25` | 长轮询挂起秒数 |
 | `OPENK_WORKER_HEARTBEAT` | `30` | 心跳续租间隔 |
-| `OPENK_MODELS_DIR` | 空 | 模型缓存目录。留空时 audio-separator 会写 `/tmp`，重启可能被清空；模型有好几 GB，建议指到持久盘 |
+| `OPENK_MODELS_DIR` | 自动 | 默认把分离模型持久缓存到 `<项目目录>/data/models/audio-separator`，HF/Torch 沿用现有缓存；显式配置则统一模型缓存根目录，仍尊重 `HF_HOME` / `TORCH_HOME` / `AUDIO_SEPARATOR_MODEL_DIR` 覆盖 |
 
 现成模板：[`deploy/worker.env.example`](../deploy/worker.env.example)、
 [`deploy/openk.env.example`](../deploy/openk.env.example)。
@@ -168,15 +168,20 @@ worker 还需要装好 ML 依赖（`requirements.txt` + `requirements-ml.txt`）
 ### 1. 起服务端
 
 ```bash
-# 先生成一个口令，两端都要用
+# 先生成一个口令，两端都要用；文件不应进入版本控制
+umask 077
 openssl rand -hex 24 > worker-token.txt
+export OPENK_WORKER_TOKEN="$(< worker-token.txt)"
 
 docker run -d --name openk -p 8000:8000 \
   -v /srv/openk-data:/data \
   -e OPENK_REMOTE_STEPS=separate,transcribe,align \
-  -e OPENK_WORKER_TOKEN="$(cat worker-token.txt)" \
-  openk:slim     # 或 ghcr.io/dcluomax/openk:latest
+  -e OPENK_WORKER_TOKEN \
+  openk:slim     # 或 ghcr.io/dcluomax/openk:stable
 ```
+
+上述端口映射仅适用于可信隔离网络；跨机器优先 HTTPS 或加密隧道，不能把私网
+当作传输加密。口令通过环境变量交给 Docker，不放进命令行参数或 Git。
 
 精简镜像（不含 torch，仅在三个步骤都远程时可用）：
 
@@ -188,10 +193,16 @@ docker build --build-arg WITH_ML=0 -t openk:slim .
 
 在算力机上（需要已装好 ML 依赖，见主 README 的「从源码安装」）：
 
+worker 应使用与服务端相同的 Git 版本。口令写入权限为 `600` 的 `worker.env`，
+不要直接把真实口令粘贴到公开终端记录或版本控制中。
+
 ```bash
-export OPENK_SERVER=http://nas.local:8000
-export OPENK_WORKER_TOKEN=<与服务端相同>
-export OPENK_WORKER_PATH_MAP=/data=/mnt/nas/openk
+cp deploy/worker.env.example worker.env
+chmod 600 worker.env
+# 编辑 worker.env：填写服务地址、共享目录映射和与服务端相同的随机口令
+set -a
+. ./worker.env
+set +a
 python worker/openk_worker.py
 ```
 
@@ -384,12 +395,33 @@ curl -s http://<服务端>:8000/api/worker/status
 给浏览器上 TLS 有两种做法，对 worker 的影响不一样：
 
 - **反向代理终结 TLS（推荐）**：nginx / Caddy 监听 443，转发到 openk 的 HTTP 端口。
-  浏览器走 HTTPS，worker 继续用 `OPENK_SERVER=http://<内网IP>:<HTTP端口>` 直连，
-  两边互不干扰，worker 不需要处理自签证书。注意把 `client_max_body_size` 调大，
+  浏览器和 worker 都可走该 HTTPS 入口；自签证书需配置 worker 的 `SSL_CERT_FILE`。
+  仅在可信隔离网络中才考虑 worker 明文直连，浏览器侧 TLS 不会保护这条独立连接。
+  将 `client_max_body_size` 设为 `100m`，与应用录音上限一致，
   并对媒体流关掉 `proxy_buffering`（Range 请求被缓冲会导致播放卡顿）。
 - **openk 自己开 TLS**（`OPENK_SSL_CERTFILE` / `OPENK_SSL_KEYFILE`）：此时只有 HTTPS 一个入口，
   `OPENK_SERVER` 也得改成 `https://…`。自签证书 Python 默认不信任，
   需要给 worker 进程设 `SSL_CERT_FILE=/path/to/openk.crt` 指向同一份证书。
+
+浏览器修改请求还会校验来源。代理必须保留完整 Host（含非标准端口），并仅信任正确代理的
+转发协议；若后端看到的来源与页面不同，可显式设置
+`OPENK_ALLOWED_ORIGINS=https://openk.example:8443`，替换为页面的实际来源。不要填写 `*`。
+
+### 参数化容器模板
+
+[`deploy-openk.sh.example`](../deploy-openk.sh.example) 不包含实际 NAS 路径或固定账户编号。
+使用前设置 `OPENK_HOST_DATA_DIR`、`OPENK_HOST_MEDIA_DIR`、`OPENK_HOST_LIBRARY_DIR`，
+并确保目录对 `OPENK_RUN_UID` / `OPENK_RUN_GID` 指定的容器用户可读写；媒体库只读挂载。
+需要额外媒体组时设置 `OPENK_MEDIA_GID`。
+
+先准备 `OPENK_IMAGE` 指定的镜像和 `OPENK_NETWORK` 网络；默认分别为稳定镜像和
+`openk-net`。默认端口仅绑定 `127.0.0.1`，可通过 `OPENK_BIND_ADDRESS` /
+`OPENK_PUBLISHED_PORT` 调整。已有 nginx 容器可用 `OPENK_TLS_CONTAINER` 指定。
+这是标准挂载布局的模板，不是任意旧容器配置的自动迁移工具，定制参数需要同步保留。
+
+模板继承已有 worker 口令及浏览器来源配置，停止旧容器后保留一个禁用自动重启的回退副本；
+健康检查失败会明确退出，不会删除媒体。升级时不要提交新任务，并同时保留旧 worker 代码。
+回退应先停下新容器，把回退副本恢复为原名称及重启策略，再恢复相应 worker 版本。
 
 ### macOS worker：`No route to host`，但手动跑就是通的
 

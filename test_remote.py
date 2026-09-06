@@ -1,204 +1,290 @@
 #!/usr/bin/env python3
-"""远程算力拆分的自检脚本：python test_remote.py
-
-覆盖的是「worker 可以随时离线」这条要求下最容易出错的几个点：
-租约回收、离线排队、进度回调透传、路径映射。
-"""
+"""Offline protocol/lifecycle checks: python test_remote.py (no models or user media)."""
 from __future__ import annotations
 
+import copy
+import json
 import os
-import sys
+import shutil
 import threading
 import time
+import unittest
+import uuid
+import wave
 from pathlib import Path
+from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from backend.remote.queue import TaskQueue  # noqa: E402
-
-_failures: list[str] = []
+from backend.remote.artifacts import InvalidResult, digest_file
+from backend.remote.queue import TaskCancelled, TaskQueue
 
 
-def check(name: str, ok: bool, detail: str = "") -> None:
-    print(f"{'PASS' if ok else 'FAIL'}  {name}{'  — ' + detail if detail else ''}")
-    if not ok:
-        _failures.append(name)
+class RemoteTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent / (".test-remote-" + uuid.uuid4().hex)
+        self.out = self.root / "output"
+        self.out.mkdir(parents=True)
+        self.queue = TaskQueue(lease_seconds=30, staging_root=self.root / ".remote-staging")
+        self.threads = []
+        self.results, self.errors = [], []
 
+    def tearDown(self):
+        self.queue.cancel_where(lambda task: True)
+        for thread in self.threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "submitter must not be abandoned")
+        shutil.rmtree(self.root)
 
-def test_roundtrip() -> None:
-    q = TaskQueue(lease_seconds=30)
-    seen: list[tuple[int, str]] = []
-    result: dict = {}
+    def submit(self, kind="transcribe", **kwargs):
+        def producer():
+            try:
+                self.results.append(self.queue.submit(kind, {"out_dir": str(self.out)}, **kwargs))
+            except Exception as exc:
+                self.errors.append(exc)
+        thread = threading.Thread(target=producer)
+        thread.start()
+        self.threads.append(thread)
 
-    def producer() -> None:
-        result["value"] = q.submit(
-            "separate", {"audio_path": "/x/a.mp3"},
-            on_progress=lambda p, m: seen.append((p, m)))
+    def claim(self, worker="worker", kind="transcribe"):
+        task = self.queue.claim(worker, [kind], wait_seconds=2)
+        self.assertIsNotNone(task)
+        return task
 
-    t = threading.Thread(target=producer, daemon=True)
-    t.start()
+    def manifest(self, task, audio=False):
+        stage = Path(task["staging_dir"])
+        if audio:
+            result = {"vocals": "vocals.wav", "instrumental": "instrumental.wav"}
+            for filename in result.values():
+                with wave.open(str(stage / filename), "wb") as stream:
+                    stream.setnchannels(1)
+                    stream.setsampwidth(2)
+                    stream.setframerate(8000)
+                    stream.writeframes(b"\0\0" * 800)
+            roles = result
+        else:
+            data = {"language": "en", "source": "test", "lines": [
+                {"start": 0, "end": 1, "text": "Test", "words": []}]}
+            (stage / "lyrics.json").write_text(json.dumps(data))
+            (stage / "lyrics.lrc").write_text("[re:openk]\n[00:00.00]Test\n")
+            result = {"lyrics_file": "lyrics.json", "language": "en",
+                      "line_count": 1, "source": "test"}
+            roles = {"lyrics_file": "lyrics.json", "lrc": "lyrics.lrc"}
+        return {"protocol_version": 2, "task_id": task["task_id"],
+                "claim_token": task["claim_token"], "generation": task["generation"],
+                "result": result, "files": [
+                    {"role": role, "name": filename, "size": (stage / filename).stat().st_size,
+                     "sha256": digest_file(stage / filename)} for role, filename in roles.items()]}
 
-    task = q.claim("w1", ["separate"], wait_seconds=3)
-    check("worker 能领到任务", task is not None and task["kind"] == "separate")
+    def finish(self, task, manifest, worker="worker"):
+        return self.queue.finish(task["task_id"], worker, result=manifest,
+                                 claim_token=task["claim_token"])
 
-    q.progress(task["task_id"], "w1", 42, "分离中")
-    q.finish(task["task_id"], "w1", result={"vocals": "vocals.mp3"})
-    t.join(timeout=5)
+    def test_roundtrip_and_coalesced_progress(self):
+        seen = []
+        self.submit(on_progress=lambda p, m: seen.append((p, m)))
+        task = self.claim()
+        for _ in range(10):
+            self.assertTrue(self.queue.progress(task["task_id"], "worker", 42, "working",
+                                                task["claim_token"]))
+        self.assertEqual(seen.count((42, "working")), 1)
+        self.assertTrue(self.finish(task, self.manifest(task)))
+        self.threads[-1].join(3)
+        self.assertFalse(self.errors)
+        self.assertEqual(self.results[0]["line_count"], 1)
+        self.assertTrue((self.out / self.results[0]["lyrics_file"]).is_file())
+        self.assertFalse((self.out / "lyrics.json").exists())
+        self.assertFalse(Path(task["staging_dir"]).exists())
+        self.assertTrue(self.finish(task, self.manifest_copy_for_receipt(task)))
 
-    check("进度回调透传到 pipeline", (42, "分离中") in seen)
-    check("结果原样返回", result.get("value", {}).get("vocals") == "vocals.mp3")
+    def manifest_copy_for_receipt(self, task):
+        # The receipt acknowledges the claim without rereading already removed staging.
+        return {"protocol_version": 2}
 
+    def test_same_worker_stale_attempt_cannot_renew_or_publish(self):
+        self.queue.lease_seconds = 0.15
+        self.submit()
+        first = self.claim()
+        old_manifest = self.manifest(first)
+        time.sleep(0.2)
+        second = self.claim()
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.assertNotEqual(first["claim_token"], second["claim_token"])
+        self.assertEqual(second["attempts"], 2)
+        self.assertFalse(Path(first["staging_dir"]).exists())
+        self.assertFalse(self.queue.progress(first["task_id"], "worker", 50, "late",
+                                             first["claim_token"]))
+        self.assertFalse(self.finish(first, old_manifest))
+        self.assertTrue(self.finish(second, self.manifest(second)))
 
-def test_kind_filter() -> None:
-    q = TaskQueue()
-    threading.Thread(
-        target=lambda: q.submit("align", {}), daemon=True).start()
-    time.sleep(0.2)
-    check("只领自己声明的类型",
-          q.claim("w1", ["separate"], wait_seconds=0.5) is None)
-    check("声明了就能领到",
-          (q.claim("w1", ["align"], wait_seconds=1) or {}).get("kind") == "align")
+    def test_expired_claim_rejected_before_reaper(self):
+        self.submit()
+        task = self.claim()
+        manifest = self.manifest(task)
+        with self.queue._lock:
+            self.queue._tasks[task["task_id"]].lease_expires = time.monotonic() - 1
+        self.assertFalse(self.finish(task, manifest))
+        self.assertFalse(self.queue.progress(task["task_id"], "worker", 1, "", task["claim_token"]))
 
+    def test_cancel_pending_claimed_and_timeout(self):
+        for claimed in (False, True):
+            self.submit()
+            if claimed:
+                task = self.claim()
+                manifest = self.manifest(task)
+            else:
+                deadline = time.monotonic() + 2
+                while not self.queue.status()["waiting"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            self.assertEqual(self.queue.cancel_where(lambda task: True), 1)
+            self.threads[-1].join(2)
+            self.assertIsInstance(self.errors[-1], TaskCancelled)
+            if claimed:
+                self.assertFalse(self.finish(task, manifest))
+                self.assertFalse(Path(task["staging_dir"]).exists())
+        self.submit(timeout=0.1)
+        self.threads[-1].join(2)
+        self.assertIsInstance(self.errors[-1], TimeoutError)
+        self.assertEqual(self.queue.status()["waiting"], 0)
 
-def test_offline_queues_instead_of_failing() -> None:
-    q = TaskQueue()
-    check("没有 worker 时报告离线", q.worker_online() is False)
+    def test_offline_and_kind_capabilities(self):
+        self.assertFalse(self.queue.worker_online())
+        self.submit(kind="align")
+        self.assertIsNone(self.queue.claim("gpu", ["separate"], 0))
+        self.assertEqual(self.claim("gpu", "align")["kind"], "align")
+        worker = self.queue.status()["workers"][0]
+        self.assertEqual(worker["kinds"], ["align"])
+        self.assertGreaterEqual(worker["idle_seconds"], 0)
 
-    msgs: list[str] = []
-    err: list[Exception] = []
+    def test_interrupted_commit_publishes_nothing_and_can_retry(self):
+        self.submit()
+        task = self.claim()
+        manifest = self.manifest(task)
+        with patch("backend.remote.artifacts.os.replace", side_effect=OSError("interrupted rename")):
+            with self.assertRaises(OSError):
+                self.finish(task, manifest)
+        self.assertEqual(list((self.out / ".openk-results").iterdir()), [])
+        self.assertFalse(self.results)
+        self.assertTrue(Path(task["staging_dir"]).is_dir())
+        self.assertTrue(self.finish(task, manifest))
 
-    def producer() -> None:
-        try:
-            q.submit("separate", {}, on_progress=lambda p, m: msgs.append(m),
-                     timeout=1.0)
-        except Exception as exc:  # noqa: BLE001
-            err.append(exc)
+    def test_validation_does_not_block_heartbeat_and_cancellation_wins_commit(self):
+        from backend.remote import artifacts
+        self.submit()
+        task = self.claim()
+        manifest = self.manifest(task)
+        validating = threading.Event()
+        resume = threading.Event()
+        finished = []
+        original = artifacts._validate_lyrics
+        def slow_validate(*args):
+            validating.set()
+            resume.wait(2)
+            return original(*args)
+        with patch.object(artifacts, "_validate_lyrics", side_effect=slow_validate):
+            thread = threading.Thread(target=lambda: finished.append(self.finish(task, manifest)))
+            thread.start()
+            self.assertTrue(validating.wait(1))
+            started = time.monotonic()
+            self.assertTrue(self.queue.progress(task["task_id"], "worker", 99, "publishing",
+                                                task["claim_token"]))
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.queue.cancel_where(lambda item: True)
+            resume.set()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(finished, [False])
+        self.assertFalse((self.out / ".openk-results").exists())
+        self.assertFalse(Path(task["staging_dir"]).exists())
 
-    t = threading.Thread(target=producer, daemon=True)
-    t.start()
-    t.join(timeout=5)
+    def test_corrupt_incomplete_and_path_injected_results(self):
+        for corruption in ("checksum", "missing", "traversal", "json", "count", "legacy",
+                           "duplicate", "generation", "role", "symlink"):
+            with self.subTest(corruption=corruption):
+                self.submit()
+                task = self.claim()
+                manifest = self.manifest(task)
+                stage = Path(task["staging_dir"])
+                if corruption == "checksum":
+                    (stage / "lyrics.json").write_text("truncated")
+                elif corruption == "missing":
+                    (stage / "lyrics.lrc").unlink()
+                elif corruption == "traversal":
+                    manifest["result"]["lyrics_file"] = "../outside.json"
+                elif corruption == "json":
+                    (stage / "lyrics.json").write_text("not-json")
+                    entry = manifest["files"][0]
+                    entry.update(size=8, sha256=digest_file(stage / "lyrics.json"))
+                elif corruption == "count":
+                    manifest["result"]["line_count"] = 99
+                elif corruption == "legacy":
+                    manifest = {"lyrics_file": "lyrics.json"}
+                elif corruption == "duplicate":
+                    manifest["files"][1] = copy.deepcopy(manifest["files"][0])
+                elif corruption == "generation":
+                    manifest["generation"] = "old-generation"
+                elif corruption == "role":
+                    manifest["files"][0]["role"] = []
+                else:
+                    (stage / "lyrics.json").unlink()
+                    (stage / "lyrics.json").symlink_to(stage / "lyrics.lrc")
+                with self.assertRaises((InvalidResult, OSError)):
+                    self.finish(task, manifest)
+                self.queue.cancel_where(lambda item: True)
+                self.threads[-1].join(2)
+                self.assertFalse(Path(task["staging_dir"]).exists())
+                self.assertFalse((self.out / "lyrics.json").exists())
 
-    check("离线时给出排队提示", any("等待处理节点" in m for m in msgs),
-          "; ".join(msgs) or "无提示")
-    check("超时是 TimeoutError 而非静默失败",
-          bool(err) and isinstance(err[0], TimeoutError))
+    def test_audio_group_validates_both_outputs(self):
+        self.submit("separate")
+        task = self.claim(kind="separate")
+        manifest = self.manifest(task, audio=True)
+        self.assertTrue(self.finish(task, manifest))
+        self.threads[-1].join(3)
+        paths = [self.out / self.results[-1][role] for role in ("vocals", "instrumental")]
+        self.assertEqual(paths[0].parent, paths[1].parent)
+        self.assertTrue(all(path.is_file() for path in paths))
+        self.submit("separate")
+        task = self.claim(kind="separate")
+        manifest = self.manifest(task, audio=True)
+        broken = Path(task["staging_dir"]) / "instrumental.wav"
+        broken.write_bytes(b"not playable audio")
+        manifest["files"][1].update(size=broken.stat().st_size, sha256=digest_file(broken))
+        with self.assertRaises(InvalidResult):
+            self.finish(task, manifest)
 
+    def test_unknown_restart_claim(self):
+        self.submit()
+        task = self.claim()
+        restarted = TaskQueue(staging_root=self.root / ".remote-staging")
+        self.assertFalse(restarted.progress(task["task_id"], "worker", 1, "", task["claim_token"]))
+        self.assertFalse(restarted.finish(task["task_id"], "worker",
+                                          claim_token=task["claim_token"], error="stale"))
 
-def test_status_reports_capabilities() -> None:
-    """/worker/status 要能看出每个 worker 能接哪些活，否则线上无从排查。"""
-    q = TaskQueue()
-    q.claim("w-gpu", ["separate", "align"], wait_seconds=0)
-    st = q.status()
-    w = next((x for x in st["workers"] if x["id"] == "w-gpu"), None)
-
-    check("状态里列出了 worker", w is not None)
-    check("上报了该 worker 能接的任务类型",
-          bool(w) and sorted(w["kinds"]) == ["align", "separate"],
-          repr(w and w.get("kinds")))
-    check("空闲时长可读", bool(w) and w["idle_seconds"] >= 0)
-
-
-def test_lease_requeue() -> None:
-    """worker 领走任务后掉线，任务必须回到队列而不是永远卡住。"""
-    q = TaskQueue(lease_seconds=1)
-    threading.Thread(target=lambda: q.submit("separate", {}), daemon=True).start()
-    time.sleep(0.2)
-
-    first = q.claim("dying-worker", ["separate"], wait_seconds=2)
-    check("第一个 worker 领到任务", first is not None)
-
-    # 不续租，模拟断电/断网；reaper 每 5s 扫一次
-    again = q.claim("fresh-worker", ["separate"], wait_seconds=12)
-    check("租约到期后任务被重新排队",
-          again is not None and again["task_id"] == first["task_id"])
-    check("重排后 attempts 递增", (again or {}).get("attempts") == 2)
-
-    dead = q.progress(first["task_id"], "dying-worker", 50, "late")
-    check("掉线的 worker 不能再污染任务状态", dead is False)
-
-
-def test_path_map() -> None:
-    os.environ["OPENK_WORKER_PATH_MAP"] = "/srv/shared=/mnt/nas"
-    sys.modules.pop("worker.openk_worker", None)
-    from worker import openk_worker as w
-    w.PATH_MAP = w._path_map()
-
-    check("共享目录被翻译成本机视角",
-          w.localize("/srv/shared/openk/jobs/a/source/x.mp3")
-          == "/mnt/nas/openk/jobs/a/source/x.mp3")
-    check("不匹配的路径原样保留",
-          w.localize("/tmp/other.mp3") == "/tmp/other.mp3")
-    check("只按目录边界匹配，不做子串替换",
-          w.localize("/srv/shared-other/x") == "/srv/shared-other/x")
-
-
-def test_http_layer() -> None:
-    try:
+    def test_http_protocol_and_roundtrip(self):
+        from fastapi import FastAPI
         from fastapi.testclient import TestClient
-    except (ImportError, RuntimeError) as exc:
-        print(f"SKIP  HTTP 层（{exc.__class__.__name__}: 缺 httpx2，pip install httpx2）")
-        return
-
-    os.environ["OPENK_WORKER_TOKEN"] = "s3cret"
-    for mod in [m for m in sys.modules if m.startswith("backend")]:
-        sys.modules.pop(mod, None)
-    from backend.main import app
-    from backend.remote.queue import queue as live
-
-    c = TestClient(app)
-    check("无口令被拒",
-          c.post("/api/worker/claim",
-                 json={"worker_id": "w", "kinds": ["separate"], "wait": 0}
-                 ).status_code == 401)
-
-    h = {"Authorization": "Bearer s3cret"}
-    check("空队列返回 204",
-          c.post("/api/worker/claim",
-                 json={"worker_id": "w", "kinds": ["separate"], "wait": 0},
-                 headers=h).status_code == 204)
-
-    out: dict = {}
-    threading.Thread(
-        target=lambda: out.update(value=live.submit("separate", {"a": 1})),
-        daemon=True).start()
-    time.sleep(0.3)
-
-    r = c.post("/api/worker/claim",
-               json={"worker_id": "w", "kinds": ["separate"], "wait": 2}, headers=h)
-    check("HTTP 领取任务", r.status_code == 200 and r.json()["kind"] == "separate")
-    tid = r.json()["task_id"]
-
-    c.post(f"/api/worker/tasks/{tid}/progress",
-           json={"worker_id": "w", "percent": 10, "message": "go"}, headers=h)
-    c.post(f"/api/worker/tasks/{tid}/finish",
-           json={"worker_id": "w", "result": {"vocals": "v.mp3"}}, headers=h)
-    time.sleep(0.5)
-    check("HTTP 全链路把结果送回 pipeline",
-          out.get("value", {}).get("vocals") == "v.mp3")
-
-    st = c.get("/api/worker/status").json()
-    check("状态接口报告 worker 在线", st.get("online") is True)
-
-
-def main() -> int:
-    for fn in (test_roundtrip, test_kind_filter, test_offline_queues_instead_of_failing,
-               test_status_reports_capabilities, test_lease_requeue,
-               test_path_map, test_http_layer):
-        print(f"\n── {fn.__name__} ──")
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001
-            import traceback
-            traceback.print_exc()
-            check(fn.__name__, False, str(exc))
-
-    print()
-    if _failures:
-        print(f"❌ {len(_failures)} 项失败：{', '.join(_failures)}")
-        return 1
-    print("✅ 全部通过")
-    return 0
+        from backend.remote import api
+        app = FastAPI()
+        app.include_router(api.router, prefix="/api")
+        with patch.object(api, "queue", self.queue), patch.object(api.config, "WORKER_TOKEN", ""):
+            client = TestClient(app)
+            request = {"worker_id": "worker", "kinds": ["transcribe"], "wait": 0}
+            self.assertEqual(client.post("/api/worker/claim", json=request).status_code, 426)
+            request["protocol_version"] = 2
+            self.assertEqual(client.post("/api/worker/claim", json=request).status_code, 204)
+            self.submit()
+            request["wait"] = 2
+            response = client.post("/api/worker/claim", json=request)
+            self.assertEqual(response.status_code, 200)
+            task = response.json()
+            base = f"/api/worker/tasks/{task['task_id']}"
+            self.assertEqual(client.post(base + "/finish", json={"worker_id": "worker"}).status_code, 426)
+            payload = {"worker_id": "worker", "claim_token": task["claim_token"]}
+            self.assertTrue(client.post(base + "/progress", json=payload).json()["ok"])
+            payload["result"] = self.manifest(task)
+            self.assertTrue(client.post(base + "/finish", json=payload).json()["ok"])
+            payload["claim_token"] = "old"
+            self.assertFalse(client.post(base + "/finish", json=payload).json()["ok"])
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main(verbosity=2)
