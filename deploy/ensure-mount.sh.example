@@ -43,7 +43,7 @@ while [ "$waited" -lt "$WAIT_SECONDS" ]; do
     if [ -n "$SMB_URL" ] && [ "$tried_mount" -eq 0 ] &&
        [ "$waited" -ge "$GRACE_SECONDS" ] && ! is_mounted; then
         tried_mount=1
-        echo "[mount] 等了 ${waited}s 登录项仍未挂上 $MOUNT_POINT，兜底挂载 $SMB_URL"
+        echo "[mount] 等了 ${waited}s 登录项仍未挂上 $MOUNT_POINT，尝试通过系统挂载共享目录"
         /usr/bin/open "$SMB_URL" >/dev/null 2>&1 ||
             echo "[mount] open 调用失败——当前没有可用的图形会话？"
     fi

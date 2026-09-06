@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # --- 目录 ---
 # 除 BASE_DIR 外都可以单独指向别处：把体积大的任务数据放 NAS、模型放本地 SSD，
@@ -47,6 +48,10 @@ WHISPER_COMPUTE_TYPE = os.environ.get("OPENK_WHISPER_COMPUTE_TYPE", "int8").stri
 # 留空表示自动检测语言（支持中文 zh、英文 en 等）。
 WHISPER_LANGUAGE = os.environ.get("OPENK_WHISPER_LANGUAGE", "").strip()
 WHISPER_BATCH_SIZE = os.environ.get("OPENK_WHISPER_BATCH_SIZE", "4").strip()
+TRANSCRIBE_TIMEOUT = int(os.environ.get("OPENK_TRANSCRIBE_TIMEOUT", "1800"))
+ALIGN_TIMEOUT = int(os.environ.get("OPENK_ALIGN_TIMEOUT", "1200"))
+if TRANSCRIBE_TIMEOUT <= 0 or ALIGN_TIMEOUT <= 0:
+    raise ValueError("OPENK_TRANSCRIBE_TIMEOUT 和 OPENK_ALIGN_TIMEOUT 必须大于 0")
 
 # --- 歌词时间轴校正 ---
 # 歌词库（LRCLIB 等）的时间轴对的是录音室单曲，而我们处理的是 YouTube 视频。
@@ -143,6 +148,42 @@ REMOTE_FALLBACK_LOCAL = os.environ.get(
 # --- 服务 ---
 HOST = os.environ.get("OPENK_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENK_PORT", "8000"))
+
+
+def normalize_origin(value: str) -> str | None:
+    if not value or any(ord(char) <= 32 or ord(char) == 127 for char in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        if (parts.scheme not in {"http", "https"} or not parts.hostname
+                or parts.username is not None or parts.password is not None
+                or parts.path not in {"", "/"} or parts.query or parts.fragment):
+            return None
+        host = parts.hostname.encode("idna").decode("ascii").lower()
+        if any(char in host for char in "\\/%?#@,"):
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None and port != (443 if parts.scheme == "https" else 80):
+        authority += f":{port}"
+    return f"{parts.scheme}://{authority}"
+
+
+def parse_allowed_origins(value: str) -> tuple[str, ...]:
+    origins = []
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        origin = normalize_origin(item.strip())
+        if origin is None:
+            raise ValueError("OPENK_ALLOWED_ORIGINS 仅接受完整 http(s) 来源；不能使用 *、null、账号或路径")
+        origins.append(origin)
+    return tuple(dict.fromkeys(origins))
+
+
+ALLOWED_ORIGINS = parse_allowed_origins(os.environ.get("OPENK_ALLOWED_ORIGINS", ""))
 
 # HTTPS。浏览器只在「安全上下文」（https 或 localhost）下开放 getUserMedia，
 # 所以一旦不是在本机访问——比如手机连到局域网里的这台服务器——录音功能

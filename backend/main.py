@@ -16,17 +16,27 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import threading
 import time
+import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
+import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, pipeline
-from .jobs import extract_video_id, manager
+from . import config, pipeline, search
+from .jobs import JobCancelledError, JobConflictError, extract_video_id, manager
+from .operations import OperationStore, public_operation
+from .security import BrowserOriginMiddleware
 from .steps import local_media
 from .steps import playlist as playlist_step
 
@@ -47,18 +57,33 @@ class _QuietPollFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
 
 
+class ApiGZipMiddleware(GZipMiddleware):
+    async def __call__(self, scope, receive, send):
+        # 音轨的 Range 字节范围不能被传输压缩改变。
+        if scope["type"] == "http" and scope["path"].startswith("/api/"):
+            await super().__call__(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
 app = FastAPI(title="openk 卡拉OK", version="1.0.0")
+app.add_middleware(ApiGZipMiddleware, minimum_size=1024, compresslevel=5)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(config.ALLOWED_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BrowserOriginMiddleware, allowed_origins=config.ALLOWED_ORIGINS)
 
 from .remote.api import router as _worker_router  # noqa: E402
+from .rooms import router as _rooms_router  # noqa: E402
 app.include_router(_worker_router, prefix="/api")
+app.include_router(_rooms_router)
 
 _executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+_operations = OperationStore(config.DATA_DIR / "operations.json")
+_operation_lock = threading.RLock()
 
 
 def _resume_interrupted() -> None:
@@ -76,7 +101,11 @@ def _resume_interrupted() -> None:
     logging.getLogger("uvicorn.error").info(
         "重启续跑：重新排入 %d 个未完成任务", len(pending))
     for job_id in pending:
-        _executor.submit(pipeline.run, job_id)
+        job = manager.get(job_id)
+        if job is None:
+            logging.getLogger("uvicorn.error").warning("续跑任务 %s 已不存在", job_id)
+            continue
+        _executor.submit(pipeline.run, job_id, job["generation"])
 
 
 _resume_interrupted()
@@ -133,6 +162,7 @@ class LyricsAlignRequest(BaseModel):
 def _public_job(job: dict) -> dict:
     """给前端补充媒体访问 URL。"""
     job = dict(job)
+    job.pop("generation", None)
     jid = job["id"]
     media = {}
     stems = job.get("stems") or {}
@@ -176,6 +206,7 @@ def _public_job(job: dict) -> dict:
         except Exception:
             pass
     job["artist"], job["track"] = artist, track
+    job["search_index"] = search.index(job)
     return job
 
 
@@ -185,22 +216,16 @@ def create_job(req: CreateJobRequest) -> JSONResponse:
     if not url or not url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="请提供有效的视频链接（http/https）")
 
-    # 去重：同一 YouTube 视频若已处理完成，直接复用，避免重复下载与分离。
     video_id = extract_video_id(url)
-    existing = manager.find_reusable(video_id)
-    if existing:
-        pub = _public_job(existing)
-        pub["reused"] = True
-        return JSONResponse(pub)
-
-    job = manager.create(
+    job, reused = manager.create_or_reuse(
         url,
         video_id=video_id,
         language=(req.language or "").strip() or None,
         whisper_model=(req.whisper_model or "").strip() or None,
     )
-    _executor.submit(pipeline.run, job["id"])
-    return JSONResponse(_public_job(job))
+    if not reused:
+        _executor.submit(pipeline.run, job["id"], job["generation"])
+    return JSONResponse({**_public_job(job), "reused": reused})
 
 
 def _entry_status(entry: dict) -> tuple[str, str | None]:
@@ -299,7 +324,7 @@ def import_playlist(req: PlaylistImportRequest) -> dict:
                 "job_id": entry.get("job_id"),
             })
             continue
-        job = manager.create(
+        job, reused = manager.create_or_reuse(
             playlist_step.video_url(entry["video_id"]),
             video_id=entry["video_id"],
             language=language,
@@ -308,8 +333,12 @@ def import_playlist(req: PlaylistImportRequest) -> dict:
             playlist_id=data["playlist_id"],
             playlist_title=data["title"],
         )
-        _executor.submit(pipeline.run, job["id"])
-        created.append(_public_job(job))
+        if reused:
+            skipped.append({"video_id": entry["video_id"], "title": entry["title"],
+                            "reason": "曲库或处理队列里已有", "job_id": job["id"]})
+        else:
+            _executor.submit(pipeline.run, job["id"], job["generation"])
+            created.append(_public_job(job))
 
     return {
         "playlist_id": data["playlist_id"],
@@ -394,6 +423,11 @@ def import_local(req: LocalImportRequest) -> dict:
 
     if req.paths is not None:
         wanted = {p.strip() for p in req.paths if p and p.strip()}
+        try:
+            # 扫描返回规范路径；macOS 的 /var 与 /private/var 等别名也应匹配。
+            wanted.update(str(Path(p).resolve()) for p in tuple(wanted) if Path(p).is_absolute())
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="导入列表含无效文件路径") from exc
         entries = [e for e in entries if e["path"] in wanted or e["rel_path"] in wanted]
 
     language = (req.language or "").strip() or None
@@ -416,7 +450,7 @@ def import_local(req: LocalImportRequest) -> dict:
                 "job_id": entry.get("job_id"),
             })
             continue
-        job = manager.create(
+        job, reused = manager.create_or_reuse(
             entry["path"],
             source_type="local",
             local_path=entry["path"],
@@ -426,8 +460,12 @@ def import_local(req: LocalImportRequest) -> dict:
             language=language,
             whisper_model=whisper_model,
         )
-        _executor.submit(pipeline.run, job["id"])
-        created.append(_public_job(job))
+        if reused:
+            skipped.append({"path": entry["rel_path"], "title": entry["title"],
+                            "reason": "曲库或处理队列里已有", "job_id": job["id"]})
+        else:
+            _executor.submit(pipeline.run, job["id"], job["generation"])
+            created.append(_public_job(job))
 
     return {
         "created": created,
@@ -437,54 +475,50 @@ def import_local(req: LocalImportRequest) -> dict:
     }
 
 
+_catalog_lock = threading.Lock()
+_catalog_signature: tuple | None = None
+_catalog_public: list[dict] = []
+_catalog_body = b"[]"
+_catalog_etag = ""
+
+
+@app.get("/api/health")
+def health() -> dict:
+    # 算力节点可以离线；服务存活不应依赖曲库大小或 worker 是否上线。
+    return {"status": "ok"}
+
+
 @app.get("/api/jobs")
-def list_jobs(q: str | None = Query(None)) -> list[dict]:
-    jobs = manager.list()
-    if q:
-        kw = q.strip().lower()
-        jobs = [
-            j for j in jobs
-            if kw in (j.get("title") or "").lower()
-            or kw in (j.get("url") or "").lower()
-        ]
-    return [_public_job(j) for j in jobs]
-
-
-_ZH_CACHE: dict = {"sig": None, "map": {}}
+def list_jobs(request: Request, q: str | None = Query(None)) -> Response:
+    global _catalog_signature, _catalog_public, _catalog_body, _catalog_etag
+    with _catalog_lock:
+        jobs = manager.list()
+        signature = tuple((j["id"], j.get("updated_at"), j.get("title"), j.get("track"),
+                           j.get("artist"), j.get("lyrics_source")) for j in jobs)
+        if signature != _catalog_signature:
+            public = [_public_job(j) for j in jobs]
+            body = json.dumps(public, ensure_ascii=False, separators=(",", ":")).encode()
+            _catalog_public = public
+            _catalog_body = body
+            _catalog_etag = 'W/"' + hashlib.sha256(body).hexdigest() + '"'
+            _catalog_signature = signature
+        body, etag = _catalog_body, _catalog_etag
+        if q is not None:
+            matches = search.search_jobs(_catalog_public, q)
+            body = json.dumps(matches, ensure_ascii=False, separators=(",", ":")).encode()
+            etag = 'W/"' + hashlib.sha256(body).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache", "Vary": "Accept-Encoding"}
+    candidates = {value.strip().removeprefix("W/")
+                  for value in request.headers.get("if-none-match", "").split(",")}
+    if "*" in candidates or etag.removeprefix("W/") in candidates:
+        return Response(status_code=304, headers=headers)
+    return Response(body, media_type="application/json", headers=headers)
 
 
 @app.get("/api/zh-map")
 def zh_map() -> dict:
-    """曲库里出现过的繁体字 → 简体字对照表。
-
-    曲库是繁简混排的（港台卡拉OK带多为繁体，内地歌手多为简体），用户打
-    「梦然」搜不到「夢然」、打「曾经的你」搜不到「曾經的你」。前端搜索因此
-    需要做繁简归一，但把整张 OpenCC 表塞进前端太重——这里只导出曲库**实际
-    用到**的那些字，通常几百条、几 KB。
-
-    逐字转换而不是整串转换：zhconv 的词组规则可能改变长度，那样就没法把
-    结果跟原字一一对上了。
-    """
-    jobs = manager.list()
-    sig = (len(jobs), sum(len((j.get("track") or "") + (j.get("artist") or "")) for j in jobs))
-    if _ZH_CACHE["sig"] == sig:
-        return _ZH_CACHE["map"]
-
-    chars = set()
-    for j in jobs:
-        for field in ("track", "artist", "title"):
-            chars.update(ch for ch in (j.get(field) or "") if "\u3400" <= ch <= "\u9fff")
-    try:
-        import zhconv
-    except Exception:  # noqa: BLE001 - 没装就退化成空表，搜索仍可用
-        return {}
-    table = {}
-    for ch in chars:
-        simp = zhconv.convert(ch, "zh-hans")
-        if simp != ch and len(simp) == 1:
-            table[ch] = simp
-    _ZH_CACHE["sig"], _ZH_CACHE["map"] = sig, table
-    return table
+    """完整的单字繁→简表（进程内缓存），也覆盖只在搜索输入中出现的字。"""
+    return search.zh_map()
 
 
 @app.get("/api/jobs/{job_id}")
@@ -497,15 +531,10 @@ def get_job(job_id: str) -> dict:
 
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str) -> dict:
-    import shutil
-
-    job = manager.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    shutil.rmtree(manager.job_dir(job_id), ignore_errors=True)
-    # 从内存中移除
-    with manager._lock:  # noqa: SLF001 - 内部单例，受控访问
-        manager._jobs.pop(job_id, None)
+    with _operation_lock:
+        _operations.cancel_for(job_id)
+        if not manager.delete(job_id):
+            raise HTTPException(status_code=404, detail="任务不存在")
     return {"ok": True}
 
 
@@ -516,15 +545,7 @@ def retry_job(job_id: str, req: RetryJobRequest | None = Body(None)) -> JSONResp
     可选在请求体里传 ``language`` / ``whisper_model`` 覆盖原设置——自动检测把语言
     认错（如中文被判成拉丁语 la）导致歌词乱码 / 无对齐模型时，手动指定语言重试即可修正。
     """
-    job = manager.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if job.get("state") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail="任务正在处理中，无需重试")
-    fields: dict = dict(
-        state="queued", step="queued", progress=0,
-        message="已重新加入队列", error=None,
-    )
+    fields: dict = {}
     if req is not None:
         lang = (req.language or "").strip()
         if lang:
@@ -532,9 +553,39 @@ def retry_job(job_id: str, req: RetryJobRequest | None = Body(None)) -> JSONResp
         wm = (req.whisper_model or "").strip()
         if wm:
             fields["whisper_model"] = wm
-    manager.update(job_id, **fields)
-    _executor.submit(pipeline.run, job_id)
-    return JSONResponse(_public_job(manager.get(job_id)))
+    with _operation_lock:
+        if _operations.active_for(job_id):
+            raise HTTPException(status_code=409, detail="歌词正在更新，请等待完成")
+        try:
+            job = manager.retry_if_idle(job_id, **fields)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在") from exc
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _executor.submit(pipeline.run, job_id, job["generation"])
+    return JSONResponse(_public_job(job))
+
+
+def _publish_lyrics(job: dict, result: dict, directory: Path) -> dict:
+    result = dict(result)
+    if not result.get("lyrics_file"):
+        raise RuntimeError("对齐结果缺少歌词文件")
+    files = {key: result[key] for key in ("lyrics_file", "lrc_file") if result.get(key)}
+    updated = manager.commit_artifacts(
+        job["id"], job["generation"], directory, files,
+        language=result.get("language") or job.get("language"),
+        line_count=result.get("line_count"), lyrics_source=result.get("source"), lyrics_status="ok",
+    )
+    for key in files:
+        result[key] = updated[key]
+    return result
+
+
+def _lyrics_workspace(job: dict):
+    with manager.guard(job["id"], job["generation"]):
+        directory = manager.job_dir(job["id"]) / ".operations"
+        directory.mkdir(exist_ok=True)
+        return tempfile.TemporaryDirectory(prefix="lyrics-", dir=directory)
 
 
 @app.put("/api/jobs/{job_id}/lyrics")
@@ -542,18 +593,22 @@ def update_lyrics(job_id: str, req: LyricsUpdateRequest) -> dict:
     """保存用户手动修改的歌词（识别不准时可逐行纠正）。"""
     from .steps import transcribe
 
-    job = manager.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
     if not req.lines:
         raise HTTPException(status_code=400, detail="歌词不能为空")
-    source = (req.source or job.get("lyrics_source") or "手动编辑").strip()
-    if "已编辑" not in source:
-        source = f"{source} · 已编辑"
-    result = transcribe.save_edited_lyrics(
-        req.lines, req.language or job.get("language"), source, manager.job_dir(job_id)
-    )
-    manager.update(job_id, lyrics_source=result.get("source"), line_count=result.get("line_count"))
+    with _operation_lock:
+        job = manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if job["state"] != "done" or _operations.active_for(job_id):
+            raise HTTPException(status_code=409, detail="歌曲正在处理，请等待完成后编辑")
+        source = (req.source or job.get("lyrics_source") or "手动编辑").strip()
+        if "已编辑" not in source:
+            source = f"{source} · 已编辑"
+        with _lyrics_workspace(job) as directory:
+            result = transcribe.save_edited_lyrics(
+                req.lines, req.language or job.get("language"), source, Path(directory)
+            )
+            result = _publish_lyrics(job, result, Path(directory))
     return {"ok": True, **result}
 
 
@@ -572,28 +627,45 @@ def lyrics_search(q: str | None = Query(None), track: str | None = Query(None),
 
 
 @app.post("/api/jobs/{job_id}/lyrics/align")
-def align_lyrics(job_id: str, req: LyricsAlignRequest) -> dict:
-    """把选中的歌词库歌词强制对齐到该任务的人声，得到逐字时间戳并覆盖歌词。
-
-    用于 ASR 识别不准（语言误判成拼音/英文等）时，手动搜到正确歌词后重新对齐。
-    复用已分离的人声，不重新下载/分离。
-    """
-    from .steps import lyrics_sources as ls, transcribe
-
-    job = manager.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
+def align_lyrics(job_id: str, req: LyricsAlignRequest) -> JSONResponse:
+    """立即返回可恢复的操作 ID，不占用浏览器请求等待模型完成。"""
     if not req.lrclib_id:
         raise HTTPException(status_code=400, detail="缺少歌词 id")
+    with _operation_lock:
+        job = manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if job["state"] != "done":
+            raise HTTPException(status_code=409, detail="歌曲正在处理，请等待完成")
+        vocals = (job.get("stems") or {}).get("vocals")
+        if not vocals or not (manager.job_dir(job_id) / "stems" / vocals).is_file():
+            raise HTTPException(status_code=400, detail="人声文件不存在，请先重新处理")
+        operation, reused = _operations.create(job_id, job["generation"], req.model_dump())
+        if not reused:
+            _executor.submit(_operations.run, operation["id"], _perform_alignment)
+    return JSONResponse({"operation": public_operation(operation), "reused": reused}, status_code=202)
 
-    stems = job.get("stems") or {}
-    vocals = stems.get("vocals")
-    if not vocals:
-        raise HTTPException(status_code=400, detail="该任务还没有分离出人声，无法对齐")
-    vocals_path = manager.job_dir(job_id) / "stems" / vocals
-    if not vocals_path.exists():
-        raise HTTPException(status_code=400, detail="人声文件不存在，请先重新处理")
 
+@app.get("/api/operations/{operation_id}")
+def get_operation(operation_id: str) -> dict:
+    operation = _operations.get(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="操作不存在或历史已过期")
+    return public_operation(operation)
+
+
+def _perform_alignment(operation: dict) -> dict:
+    job_id = operation["job_id"]
+    with manager.execution(job_id, operation["generation"], allow_done=True) as job:
+        with _lyrics_workspace(job) as directory:
+            result = _align_into(job, LyricsAlignRequest(**operation["request"]), Path(directory))
+            return _publish_lyrics(job, result, Path(directory))
+
+
+def _align_into(job: dict, req: LyricsAlignRequest, directory: Path) -> dict:
+    from .steps import lyrics_sources as ls, transcribe
+
+    vocals_path = manager.job_dir(job["id"]) / "stems" / job["stems"]["vocals"]
     rec = ls.get_lrclib_by_id(req.lrclib_id)
     if not rec:
         raise HTTPException(status_code=404, detail="未找到该歌词")
@@ -610,7 +682,7 @@ def align_lyrics(job_id: str, req: LyricsAlignRequest) -> dict:
                 raise HTTPException(status_code=400, detail="歌词解析为空")
             language = lang_override or ls.detect_language(lines)
             result = transcribe.align_known_lyrics(
-                vocals_path, lines, language, manager.job_dir(job_id), base_src
+                vocals_path, lines, language, directory, base_src
             )
         elif plain:
             lines = ls.spread_plain(plain, job.get("duration"))
@@ -619,7 +691,7 @@ def align_lyrics(job_id: str, req: LyricsAlignRequest) -> dict:
             language = lang_override or ls.detect_language(lines)
             result = transcribe.save_line_lyrics(
                 lines, language, base_src + " · 近似时间轴",
-                manager.job_dir(job_id),
+                directory,
             )
         else:
             raise HTTPException(status_code=400, detail="该结果没有歌词内容")
@@ -627,44 +699,71 @@ def align_lyrics(job_id: str, req: LyricsAlignRequest) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"对齐失败：{exc}")
-    manager.update(
-        job_id,
-        language=result.get("language"),
-        lyrics_file=result.get("lyrics_file"),
-        line_count=result.get("line_count"),
-        lyrics_source=result.get("source"),
-    )
-    return {"ok": True, **result}
+    return result
 
 
 # ---- 录音：录制演唱的保存 / 列表 / 删除 ----
+MAX_RECORDING_BYTES = 100 * 1024 * 1024
+
+
+def _save_recording(job: dict, temporary: Path, filename: str, meta: dict) -> dict:
+    return manager.commit_recording(job["id"], temporary, filename, meta,
+                                    generation=job["generation"])
+
+
 @app.post("/api/jobs/{job_id}/recordings")
 async def upload_recording(
     job_id: str,
     request: Request,
     title: str | None = Query(None),
-    duration: float | None = Query(None),
+    duration: float | None = Query(None, ge=0, allow_inf_nan=False),
 ) -> dict:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="录音内容为空")
-    if len(body) > 100 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="录音文件过大（上限 100MB）")
-
-    rec_dir = manager.recordings_dir(job_id)
-    rec_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"rec_{int(time.time() * 1000)}.webm"
-    (rec_dir / filename).write_bytes(body)
-
-    rec = manager.add_recording(job_id, filename, {
-        "title": (title or "").strip() or None,
-        "duration": duration,
-        "created_at": time.time(),
-        "size": len(body),
-    })
+    mime = request.headers.get("content-type", "application/octet-stream").split(";")[0].strip().lower()
+    extensions = {
+        "audio/webm": ".webm", "video/webm": ".webm", "audio/mp4": ".mp4",
+        "video/mp4": ".mp4", "audio/ogg": ".ogg", "application/octet-stream": ".webm",
+    }
+    if mime not in extensions:
+        raise HTTPException(status_code=415, detail="不支持的录音格式")
+    length = request.headers.get("content-length")
+    if length:
+        try:
+            declared = int(length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="录音长度无效") from exc
+        if declared < 0:
+            raise HTTPException(status_code=400, detail="录音长度无效")
+        if declared > MAX_RECORDING_BYTES:
+            raise HTTPException(status_code=413, detail="录音文件过大（上限 100MB）")
+    staging = config.DATA_DIR / ".uploads"
+    await anyio.to_thread.run_sync(lambda: staging.mkdir(parents=True, exist_ok=True))
+    identifier = uuid.uuid4().hex
+    temporary = staging / f"{identifier}.part"
+    filename = f"rec_{identifier}{extensions[mime]}"
+    size = 0
+    try:
+        async with await anyio.open_file(temporary, "xb") as output:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_RECORDING_BYTES:
+                    raise HTTPException(status_code=413, detail="录音文件过大（上限 100MB）")
+                await output.write(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="录音内容为空")
+        rec = await anyio.to_thread.run_sync(
+            _save_recording, job, temporary, filename, {
+                "title": (title or "").strip() or None,
+                "duration": duration, "created_at": time.time(), "size": size, "mime_type": mime,
+            },
+        )
+    except JobCancelledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(lambda: temporary.unlink(missing_ok=True))
     return {"ok": True, "recording": {**rec, "url": f"/media/{job_id}/recordings/{filename}"}}
 
 
@@ -700,9 +799,71 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 
-# 媒体文件（分离音频 + 歌词）。StaticFiles 支持 HTTP Range，便于音频拖动进度；
-# 媒体按任务不可变，可放心长期缓存，故不加 no-cache。
-app.mount("/media", StaticFiles(directory=str(config.JOBS_DIR)), name="media")
+class MediaStaticFiles(StaticFiles):
+    TYPES = {
+        ".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac",
+        ".m4a": "audio/mp4", ".aac": "audio/aac", ".ogg": "audio/ogg",
+        ".opus": "audio/ogg", ".wma": "audio/x-ms-wma", ".aif": "audio/aiff",
+        ".aiff": "audio/aiff", ".mp4": "video/mp4", ".m4v": "video/mp4",
+        ".webm": "video/webm", ".mkv": "video/x-matroska", ".mka": "audio/x-matroska",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo", ".flv": "video/x-flv", ".ts": "video/mp2t",
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+        ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif",
+        ".bmp": "image/bmp", ".json": "application/json",
+        ".lrc": "text/plain; charset=utf-8", ".srt": "text/plain; charset=utf-8",
+        ".vtt": "text/plain; charset=utf-8", ".ass": "text/plain; charset=utf-8",
+    }
+
+    async def get_response(self, path: str, scope):
+        media_type = self.TYPES.get(Path(path).suffix.lower())
+        if media_type is None:
+            raise HTTPException(status_code=404, detail="媒体格式不可公开访问")
+        response = await super().get_response(path, scope)
+        # 下载的封面可能是 SVG/HTML；即使内容伪装成图片，也不能获得应用同源权限。
+        response.media_type = media_type
+        response.headers["Content-Type"] = media_type
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = (
+            "sandbox; default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        )
+        # 歌词和音轨都可能原地重做；复用缓存前按 ETag/修改时间校验。
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/media", MediaStaticFiles(directory=str(config.JOBS_DIR)), name="media")
+
+
+def _page(filename: str) -> FileResponse:
+    path = config.FRONTEND_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="页面未安装")
+    return FileResponse(path, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/tv", include_in_schema=False)
+@app.get("/tv/", include_in_schema=False)
+def tv_page() -> FileResponse:
+    return _page("tv.html")
+
+
+@app.get("/remote", include_in_schema=False)
+@app.get("/remote/", include_in_schema=False)
+def remote_page() -> FileResponse:
+    return _page("remote.html")
+
+
+@app.get("/admin", include_in_schema=False)
+@app.get("/admin/", include_in_schema=False)
+def admin_page() -> FileResponse:
+    return _page("index.html")
+
+
+if config.RESUME_ON_START:
+    for _operation in _operations.pending():
+        _executor.submit(_operations.run, _operation["id"], _perform_alignment)
+
 
 # 前端页面（放在最后挂载到根路径，避免遮蔽上面的 API 路由）。
 if config.FRONTEND_DIR.exists():

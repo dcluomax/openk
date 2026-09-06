@@ -7,20 +7,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
-import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .. import config
 from .retry import with_retry
 from .lyrics_layout import split_long_lines
+from .execution import run_cli, task_supervised
 from ..remote import client as remote
 
 log = logging.getLogger("openk.transcribe")
 
 ProgressCb = Optional[Callable[[int, str], None]]
+
+
+class AlignmentUnavailable(RuntimeError):
+    """Alignment model unavailable; valid line-level lyrics remain usable."""
 
 
 def _interpolate_words(words: List[Dict[str, Any]], seg_start: float, seg_end: float) -> List[Dict[str, Any]]:
@@ -334,16 +341,67 @@ def align_known_lyrics_local(vocals_path: str | Path, lines: List[Dict[str, Any]
                              language: str, out_dir: Path, source: str,
                              on_progress: ProgressCb = None) -> Dict[str, Any]:
     """在本机执行强制对齐（worker 进程直接调用这个函数）。"""
-    return with_retry(
-        lambda: _align_known_lyrics_local_once(vocals_path, lines, language, out_dir,
-                                               source, on_progress),
-        label="歌词对齐", on_progress=on_progress)
+    try:
+        return with_retry(
+            lambda: _align_supervised(vocals_path, lines, language, out_dir, source, on_progress),
+            label="歌词对齐", on_progress=on_progress)
+    except AlignmentUnavailable:
+        # Perform the known, safe degradation where the error type is available,
+        # including remote workers. Output/transport errors must still propagate.
+        log.warning("alignment_unavailable fallback=line_lyrics")
+        if on_progress:
+            on_progress(90, "逐词对齐不可用，保留已有逐行歌词")
+        return save_line_lyrics(lines, language, source, out_dir, on_progress)
+
+
+def _align_supervised(vocals_path, lines, language, out_dir, source, on_progress):
+    if task_supervised():
+        return _align_known_lyrics_local_once(
+            vocals_path, lines, language, out_dir, source, on_progress)
+    result = None
+    error = None
+
+    def on_line(line):
+        nonlocal result, error
+        prefix = "OPENK_ALIGN_EVENT "
+        if not line.startswith(prefix):
+            return
+        event = json.loads(line[len(prefix):])
+        if "progress" in event and on_progress:
+            on_progress(event["progress"], event["message"])
+        if "result" in event:
+            result = event["result"]
+        if "error" in event:
+            error = event
+
+    env = config.ca_env()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
+    code, recent = run_cli(
+        [sys.executable, "-m", "backend.steps.align_runner"],
+        timeout=getattr(config, "ALIGN_TIMEOUT", config.SEPARATOR_TIMEOUT),
+        label="歌词对齐", env=env, on_line=on_line,
+        input_text=json.dumps({"vocals_path": str(vocals_path), "lines": lines,
+                               "language": language, "out_dir": str(out_dir), "source": source}),
+    )
+    if error:
+        if error["kind"] == "unavailable":
+            raise AlignmentUnavailable(error["error"])
+        if error["kind"] == "io":
+            raise OSError(error["error"])
+        raise RuntimeError(error["error"])
+    if code != 0 or not isinstance(result, dict):
+        raise RuntimeError(f"歌词对齐失败（退出码 {code}）："
+                           f"{recent[-1] if recent else '未收到完整结果'}")
+    return result
 
 
 def _align_known_lyrics_local_once(vocals_path: str | Path, lines: List[Dict[str, Any]],
                                    language: str, out_dir: Path, source: str,
                                    on_progress: ProgressCb = None) -> Dict[str, Any]:
-    import whisperx  # 延迟导入，避免把 torch 载入 Web 进程
+    try:
+        import whisperx
+    except ImportError as exc:
+        raise AlignmentUnavailable("未安装逐词对齐依赖，可使用逐行歌词") from exc
 
     _ensure_nltk_punkt()  # 预先确保切句资源就绪，避免对齐时 SSL 下载失败
 
@@ -373,7 +431,12 @@ def _align_known_lyrics_local_once(vocals_path: str | Path, lines: List[Dict[str
         else:
             log.info("歌词时间轴与音频基本吻合（估计 %+.2fs），不作校正", offset)
 
-    model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
+    started = time.monotonic()
+    try:
+        model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
+    except Exception as exc:
+        raise AlignmentUnavailable(f"逐词对齐模型不可用：{exc}") from exc
+    log.info("ml_stage step=align phase=load duration_seconds=%.3f", time.monotonic() - started)
 
     segs: List[Dict[str, Any]] = []
     n = len(lines)
@@ -400,7 +463,12 @@ def _align_known_lyrics_local_once(vocals_path: str | Path, lines: List[Dict[str
 
     if on_progress:
         on_progress(45, "正在逐词对齐人声…")
-    result = whisperx.align(segs, model_a, metadata, audio, device, return_char_alignments=False)
+    started = time.monotonic()
+    try:
+        result = whisperx.align(segs, model_a, metadata, audio, device, return_char_alignments=False)
+    except Exception as exc:
+        raise AlignmentUnavailable(f"逐词对齐不可用：{exc}") from exc
+    log.info("ml_stage step=align phase=infer duration_seconds=%.3f", time.monotonic() - started)
     return _finalize(result.get("segments", []), language, source + " · 逐词对齐", out_dir, on_progress)
 
 
@@ -489,42 +557,34 @@ def _transcribe_local_once(
         cmd += ["--language", language]
 
     def _run(extra_args: List[str]) -> tuple[int, str]:
-        proc = subprocess.Popen(
-            cmd + extra_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, errors="replace", bufsize=1, env=config.ca_env(),
-        )
-        assert proc.stdout is not None
-        last = ""
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            last = line
+        def on_line(line: str) -> None:
             if on_progress and ("Transcrib" in line or "Align" in line or "%" in line):
                 on_progress(50, "正在识别并对齐歌词…")
-        return proc.wait(), last
 
-    code, last_line = _run([])
-    # whisperX 只对部分语言内置了逐词对齐模型；当语言被（常常是误）判成没有对齐
-    # 模型的语言（如拉丁语 la）时，会在对齐阶段抛 “No default align-model for
-    # language: xx” 而整段失败。这种情况退回“仅转写、不逐词对齐”，至少产出逐行
-    # 歌词而不是直接报错——用户可再手动选对语言重试或直接编辑歌词。
-    if code != 0 and "align-model" in last_line.lower():
-        if on_progress:
-            on_progress(50, "该语言无逐词对齐模型，改为仅转写…")
-        code, last_line = _run(["--no_align"])
-    if code != 0:
-        raise RuntimeError(f"歌词识别失败（退出码 {code}）：{last_line}")
+        code, recent = run_cli(
+            cmd + extra_args,
+            timeout=getattr(config, "TRANSCRIBE_TIMEOUT", config.SEPARATOR_TIMEOUT),
+            label="歌词识别", env=config.ca_env(), on_line=on_line,
+        )
+        return code, "\n".join(recent)
 
-    raw_json = out_dir / f"{audio_path.stem}.json"
-    if not raw_json.exists():
-        # 兜底：取目录里最新的 json
-        jsons = sorted(out_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not jsons:
-            raise RuntimeError("识别完成但未找到输出的 JSON 文件")
-        raw_json = jsons[0]
-
-    data = json.loads(raw_json.read_text(encoding="utf-8"))
+    # Each attempt gets an isolated CLI output directory. A stale lyrics.json
+    # from an earlier run must never be mistaken for successful ASR output.
+    with tempfile.TemporaryDirectory(prefix=".whisper-", dir=out_dir) as scratch:
+        cmd[cmd.index("--output_dir") + 1] = scratch
+        code, detail = _run([])
+        if code != 0 and "align-model" in detail.lower():
+            if on_progress:
+                on_progress(50, "该语言无逐词对齐模型，改为仅转写…")
+            code, detail = _run(["--no_align"])
+        if code != 0:
+            raise RuntimeError(f"歌词识别失败（退出码 {code}）：{detail}")
+        raw_json = Path(scratch) / f"{audio_path.stem}.json"
+        if not raw_json.is_file():
+            raise RuntimeError("识别完成但未找到本次任务输出的 JSON 文件")
+        data = json.loads(raw_json.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+            raise RuntimeError("识别输出 JSON 格式无效：缺少 segments 列表")
     return _finalize(
         data.get("segments", []),
         data.get("language") or language or None,

@@ -6,11 +6,24 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class SubtitleDescriptor(TypedDict, total=False):
+    path: str
+    lang: Optional[str]
+    auto: bool
+    origin: str
+    format: str
+
+
+class SubtitleError(ValueError):
+    """An explicitly supplied subtitle cannot be read or parsed."""
 
 _UA = "openk/1.0 (https://github.com/openk; karaoke maker)"
 _LRCLIB = "https://lrclib.net"
@@ -106,10 +119,10 @@ def parse_lrc(text: str) -> List[Dict[str, Any]]:
 
 def parse_vtt_srt(path: str | Path) -> List[Dict[str, Any]]:
     """解析 WebVTT 或 SRT 字幕为逐行歌词（去标签、去相邻重复）。"""
-    data = Path(path).read_text(encoding="utf-8", errors="ignore")
+    data = Path(path).read_text(encoding="utf-8-sig")
     ts = re.compile(
-        r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*"
-        r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})"
+        r"((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*"
+        r"((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})"
     )
     lines = data.splitlines()
     rows: List[Dict[str, Any]] = []
@@ -119,9 +132,7 @@ def parse_vtt_srt(path: str | Path) -> List[Dict[str, Any]]:
         if not m:
             i += 1
             continue
-        g = list(map(int, m.groups()))
-        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
-        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+        start, end = (_subtitle_time(value) for value in m.groups())
         i += 1
         buf: List[str] = []
         while i < len(lines) and lines[i].strip() and not ts.search(lines[i]):
@@ -139,6 +150,43 @@ def parse_vtt_srt(path: str | Path) -> List[Dict[str, Any]]:
             continue
         merged.append(r)
     return merged
+
+
+def _subtitle_time(value: str) -> float:
+    parts = value.strip().replace(",", ".").split(":")
+    if len(parts) not in (2, 3):
+        raise SubtitleError("字幕时间格式无效")
+    result = 0.0
+    for part in parts:
+        result = result * 60 + float(part)
+    return result
+
+
+def parse_ass(path: str | Path) -> List[Dict[str, Any]]:
+    fields = ["layer", "start", "end", "style", "name",
+              "marginl", "marginr", "marginv", "effect", "text"]
+    rows = []
+    in_events = False
+    for raw in Path(path).read_text(encoding="utf-8-sig").splitlines():
+        raw = raw.strip()
+        if raw.startswith("["):
+            in_events = raw.lower() == "[events]"
+        elif in_events and raw.lower().startswith("format:"):
+            fields = [field.strip().lower() for field in raw.split(":", 1)[1].split(",")]
+            if not {"start", "end", "text"}.issubset(fields) or fields[-1] != "text":
+                raise SubtitleError("不支持的 ASS Events 格式（需要 start/end，text 为末列）")
+        elif in_events and raw.lower().startswith("dialogue:"):
+            values = raw.split(":", 1)[1].split(",", len(fields) - 1)
+            if len(values) != len(fields):
+                raise SubtitleError("ASS Dialogue 字段数量不正确")
+            event = dict(zip(fields, values))
+            text = re.sub(r"\{[^}]*\}", "", event["text"])
+            text = re.sub(r"\\[Nnh]", " ", text)
+            text = _clean_cue(text)
+            if text:
+                rows.append({"start": _subtitle_time(event["start"]),
+                             "end": _subtitle_time(event["end"]), "text": text})
+    return sorted(rows, key=lambda row: row["start"])
 
 
 def _clean_cue(text: str) -> str:
@@ -466,24 +514,45 @@ def from_lrclib(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def from_subtitles(subtitles: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+def from_subtitles(subtitles: Optional[List[SubtitleDescriptor]],
+                   language: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """从下载到的字幕里挑最合适的一条并解析。官方字幕优先于自动字幕。"""
     if not subtitles:
         return None
+    if any(not isinstance(sub, dict) or not sub.get("path") for sub in subtitles):
+        raise SubtitleError("字幕描述无效：需要包含 path 的描述对象")
 
     def score(sub: Dict[str, Any]) -> tuple:
         # 官方 > 自动；中/英/日/韩优先
         lang = (sub.get("lang") or "").lower()
         base = lang.split("-")[0]
         pref = {"zh": 3, "en": 2, "ja": 2, "ko": 2}.get(base, 1)
-        return (0 if sub.get("auto") else 1, pref)
+        requested = (language or "").lower().split("-")[0]
+        return (bool(requested and base == requested), sub.get("auto") is False, pref)
 
     chosen = sorted(subtitles, key=score, reverse=True)[0]
-    lines = parse_vtt_srt(chosen["path"])
+    path = Path(chosen["path"])
+    fmt = (chosen.get("format") or path.suffix.lstrip(".")).lower()
+    try:
+        if fmt == "lrc":
+            lines = parse_lrc(path.read_text(encoding="utf-8-sig"))
+        elif fmt in {"vtt", "srt"}:
+            lines = parse_vtt_srt(path)
+        elif fmt == "ass":
+            lines = parse_ass(path)
+        else:
+            raise SubtitleError(f"不支持的字幕格式：{fmt or '未知'}")
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SubtitleError(f"无法解析 {fmt.upper()} 字幕：{exc}") from exc
     if not lines:
-        return None
+        raise SubtitleError(f"{fmt.upper()} 字幕中没有有效的带时间戳歌词")
+    if any(not math.isfinite(line["start"]) or not math.isfinite(line["end"])
+           or line["start"] < 0 or line["end"] < line["start"] for line in lines):
+        raise SubtitleError("字幕包含无效的起止时间")
     base_lang = (chosen.get("lang") or "").split("-")[0] or None
-    kind = "YouTube 自动字幕" if chosen.get("auto") else "YouTube 字幕"
+    kind = ("本地外挂字幕" if chosen.get("origin") == "local" else
+            "已有字幕（来源未记录）" if chosen.get("origin") == "legacy" else
+            "YouTube 自动字幕" if chosen.get("auto") else "YouTube 字幕")
     return {"lines": lines, "source": kind, "language": base_lang}
 
 
