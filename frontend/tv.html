@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#11121d">
+  <title>OpenK · 大屏舞台</title>
+  <link rel="stylesheet" href="/stage.css">
+  <script defer src="/vendor/qrcode.js"></script>
+  <script defer src="/room-client.js"></script>
+  <script defer src="/tv.js"></script>
+</head>
+<body class="tv-page">
+  <main class="tv-safe">
+    <header class="stage-header">
+      <a class="room-brand" href="/" aria-label="返回经典点歌台">open<span>k</span><small>THE LIVING ROOM STAGE</small></a>
+      <div class="stage-indicator"><span id="connection" role="status">连接中</span><span id="roomLabel">共享房间</span></div>
+    </header>
+    <section class="now-heading">
+      <img id="cover" class="stage-cover" alt="" hidden>
+      <div><p class="eyebrow" id="songEyebrow">今晚，轮到你发光</p>
+        <h1 id="songTitle">把客厅交给音乐</h1><p id="songArtist">手机点歌 · 大屏开唱</p></div>
+    </section>
+    <section class="lyric-stage" aria-label="歌词">
+      <p id="countdown" class="countdown"></p>
+      <div id="lyricCurrent" class="lyric-current">好歌，值得一起唱</div>
+      <div id="lyricNext" class="lyric-next">扫码加入房间，点一首喜欢的歌</div>
+    </section>
+    <div class="stage-bottom">
+      <div class="stage-progress"><span id="elapsed">0:00</span><div class="progress-track"><div id="progress"></div></div><span id="duration">0:00</span></div>
+      <div class="next-up"><span class="eyebrow">UP NEXT / 下一首</span><span id="nextSong">等待手机点歌</span><span id="audioStatus" role="status">请先启用电视声音</span></div>
+      <nav id="stageControls" class="stage-controls" aria-label="播放控制">
+        <button id="activate" class="primary">启用电视声音</button>
+        <button id="playPause" disabled>播放</button>
+        <button id="guide" aria-pressed="false" disabled>原唱 · 关</button>
+        <button id="restart" disabled>重唱</button>
+        <button id="next" disabled>下一首</button>
+        <button id="pair">手机点歌</button>
+        <button id="fullscreen">全屏</button>
+      </nav>
+      <p class="remote-hint">方向键选择 · 确认键操作 · 返回键打开配对面板<span>麦克风请连接外部卡拉 OK 设备</span></p>
+    </div>
+  </main>
+  <section id="pairPanel" class="room-overlay" role="dialog" aria-modal="true" aria-labelledby="pairTitle" hidden>
+    <div class="pair-card">
+      <button id="closePair" class="close-button" aria-label="关闭配对面板">✕</button>
+      <p class="eyebrow">ONE ROOM. EVERY VOICE.</p>
+      <h2 id="pairTitle">你的手机，就是点歌台</h2>
+      <p>连接同一 Wi-Fi，扫码加入。声音只在电视播放。</p>
+      <div class="pair-content"><div id="qr" class="qr-code" aria-label="手机配对二维码"></div>
+        <div><p class="eyebrow">配对码</p><strong id="pairCode" class="pair-code">··· ···</strong>
+          <p id="pairRoom"></p><p id="joinAddress" class="join-address"></p></div></div>
+      <p class="muted">不能扫码？手机打开上方地址，填写房间号和配对码。</p>
+      <p id="pairNotice" class="notice" role="status"></p>
+      <div class="pair-actions"><button id="pairActivate" class="primary">启用声音，开始今晚</button><button id="newRoom">创建新房间</button></div>
+    </div>
+  </section>
+  <div id="tvNotice" class="toast" role="status" hidden></div>
+  <audio id="instrumental" preload="auto"></audio>
+  <audio id="vocals" preload="auto"></audio>
+</body>
+</html>

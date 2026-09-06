@@ -7,18 +7,19 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional
 
 from .. import config
 from .retry import with_retry
+from .execution import run_cli
 from ..remote import client as remote
 
 ProgressCb = Optional[Callable[[int, str], None]]
@@ -84,7 +85,7 @@ def _downmix_to_stereo(src: Path, dst_dir: Path) -> Path:
     proc = subprocess.run(
         ["ffmpeg", "-nostdin", "-y", "-i", str(src),
          "-vn", "-ac", "2", "-c:a", "pcm_s16le", str(dst)],
-        capture_output=True, text=True, errors="replace",
+        capture_output=True, text=True, errors="replace", timeout=config.SEPARATOR_TIMEOUT,
     )
     if proc.returncode != 0 or not dst.exists():
         tail = (proc.stderr or "").strip().splitlines()
@@ -186,8 +187,15 @@ def _separate_local_once(
         cmd += ["--model_filename", model]
     # 模型放哪。不指定的话 audio-separator 默认写 /tmp，有些系统重启就清空，
     # 于是每次都要重新下几百 MB 的模型。
-    if config.MODELS_DIR:
-        cmd += ["--model_file_dir", str(Path(config.MODELS_DIR) / "audio-separator")]
+    model_dir = os.environ.get("AUDIO_SEPARATOR_MODEL_DIR") or (
+        str(Path(config.MODELS_DIR) / "audio-separator") if config.MODELS_DIR else None)
+    if model_dir:
+        model_dir = str(Path(model_dir).expanduser().resolve())
+        # audio-separator 要求环境变量指定的目录预先存在，不会替调用方创建。
+        Path(model_dir).mkdir(parents=True, exist_ok=True)
+        if os.environ.get("AUDIO_SEPARATOR_MODEL_DIR"):
+            os.environ["AUDIO_SEPARATOR_MODEL_DIR"] = model_dir
+        cmd += ["--model_file_dir", model_dir]
     # 低内存机器可通过减小段大小降低峰值内存（对 MDX 模型生效）。
     if config.SEPARATOR_SEGMENT_SIZE:
         cmd += ["--mdx_segment_size", config.SEPARATOR_SEGMENT_SIZE]
@@ -195,57 +203,16 @@ def _separate_local_once(
     if on_progress:
         on_progress(0, "正在加载分离模型（首次会自动下载模型文件，可能较慢）…")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # 进度输出里会带上文件名与源文件元数据，非 UTF-8 字节并不罕见；
-        # 严格解码会让一首本来能分离的歌直接失败。
-        errors="replace",
-        bufsize=1,
-        env=config.ca_env(),
-    )
-    assert proc.stdout is not None
+    def on_line(line: str) -> None:
+        if on_progress:
+            m = _PCT_RE.search(line)
+            if m:
+                pct = max(0, min(100, int(m.group(1))))
+                on_progress(pct, "正在分离人声与伴奏…")
 
-    # 超时保护：内存不足的机器上分离可能卡死，超时后中止，避免任务永久挂起。
-    timed_out = {"flag": False}
-
-    def _kill_on_timeout() -> None:
-        timed_out["flag"] = True
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-
-    timer = threading.Timer(config.SEPARATOR_TIMEOUT, _kill_on_timeout)
-    timer.daemon = True
-    timer.start()
-
-    last_line = ""
-    recent: deque[str] = deque(maxlen=40)
-    try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            last_line = line
-            recent.append(line)
-            if on_progress:
-                m = _PCT_RE.search(line)
-                if m:
-                    pct = max(0, min(100, int(m.group(1))))
-                    on_progress(pct, "正在分离人声与伴奏…")
-        code = proc.wait()
-    finally:
-        timer.cancel()
-
-    if timed_out["flag"]:
-        raise RuntimeError(
-            f"人声分离超时（超过 {config.SEPARATOR_TIMEOUT // 60} 分钟）。"
-            "多见于内存较小的机器（如 8GB）：请先关闭浏览器等占内存的程序后重试，"
-            "或减小 OPENK_SEPARATOR_SEGMENT_SIZE（如 128），也可换更小的模型。"
-        )
+    code, recent = run_cli(cmd, timeout=config.SEPARATOR_TIMEOUT, label="人声分离",
+                           env=config.ca_env(), on_line=on_line)
+    last_line = recent[-1] if recent else ""
     if code != 0:
         raise RuntimeError(f"人声分离失败（退出码 {code}）：{_failure_detail(recent, last_line)}")
 

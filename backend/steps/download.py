@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from .media_utils import check_duration
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -50,6 +51,9 @@ def download_audio(
         elif d.get("status") == "finished":
             on_progress(100, "下载完成，准备处理…")
 
+    def match_filter(info: Dict[str, Any], *, incomplete: bool = False) -> None:
+        check_duration(info.get("duration"))
+
     # 第一步：只下载音频（不带字幕），确保主流程一定成功。
     ydl_opts = {
         "format": "bestaudio/best",
@@ -59,6 +63,7 @@ def download_audio(
         "no_warnings": True,
         "writethumbnail": True,
         "progress_hooks": [hook],
+        "match_filter": match_filter,
         "ignoreerrors": False,
         # 抗 YouTube 偶发 403 / 限流：多留重试；分块下载可在中途换新链接续传。
         "retries": 10,
@@ -109,6 +114,8 @@ def download_audio(
                 f"（原始错误：{msg.splitlines()[-1] if msg else exc}）"
             ) from exc
         raise RuntimeError(f"下载失败：{msg.splitlines()[-1] if msg else exc}") from exc
+
+    check_duration(info.get("duration"))
 
     # prepare_filename 可能与实际后缀不一致，做一次兜底查找。
     if not audio_path.exists() or audio_path.suffix.lower() not in _AUDIO_EXTS:

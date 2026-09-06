@@ -1,49 +1,80 @@
 #!/bin/bash
-# openk 容器的完整启动参数。重建容器一律走这个脚本，不要手敲 docker run
-# ——漏掉任何一行都会以难以定位的方式坏掉：
-#   --user 3000:3000  漏了 → 作业目录变 root 属主，mini 经 SMB 全部读不到
-#   --group-add 1000  漏了 → 容器列不出 ktv 目录，导入后每首都报「路径不存在」
-#   --network openk-net 漏了 → 落到默认 bridge，nginx 解析不到 openk，8443 报 502
-set -e
+# 分布式部署示例：先配置宿主机目录与 UID/GID，再运行；不要在脚本内填写口令。
+# 数据目录必须持久化，媒体目录只读，归档目录单独可写。
+# 升级前停止提交新任务，并确认服务端与 worker 使用相同版本。
+set -euo pipefail
 
-NAME=openk
-NET=openk-net
-DATA=/mnt/MainPool/Media/openk/data
-MEDIA=/mnt/MainPool/Media/ktv
-# 下载归档目录：单独可写，/media/ktv 保持只读，对外服务碰不到既有媒体库
-LIB=/mnt/MainPool/Media/openk/library
+NAME="${OPENK_CONTAINER_NAME:-openk}"
+NET="${OPENK_NETWORK:-openk-net}"
+IMAGE="${OPENK_IMAGE:-ghcr.io/dcluomax/openk:stable}"
+DATA="${OPENK_HOST_DATA_DIR:?请设置宿主机数据目录 OPENK_HOST_DATA_DIR}"
+MEDIA="${OPENK_HOST_MEDIA_DIR:?请设置宿主机媒体目录 OPENK_HOST_MEDIA_DIR}"
+LIB="${OPENK_HOST_LIBRARY_DIR:?请设置宿主机归档目录 OPENK_HOST_LIBRARY_DIR}"
+RUN_UID="${OPENK_RUN_UID:-$(id -u)}"
+RUN_GID="${OPENK_RUN_GID:-$(id -g)}"
+BIND="${OPENK_BIND_ADDRESS:-127.0.0.1}"
+PORT="${OPENK_PUBLISHED_PORT:-8000}"
+TLS="${OPENK_TLS_CONTAINER:-}"
+BACKUP=""
 
-# token 等敏感变量从现有容器继承，不落到脚本或命令行里。
+for directory in "$DATA" "$MEDIA" "$LIB"; do
+  if [ ! -d "$directory" ]; then
+    echo "目录不存在：$directory；请先创建并设置容器用户的读写权限。" >&2
+    exit 1
+  fi
+done
+docker image inspect "$IMAGE" >/dev/null
+docker network inspect "$NET" >/dev/null
+if [ -n "$TLS" ]; then docker exec "$TLS" nginx -t; fi
+
+# 只读取所需变量；使用 docker -e NAME，避免把口令值放到进程参数中。
 if docker inspect "$NAME" >/dev/null 2>&1; then
-  mapfile -t ENVS < <(docker inspect "$NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    | grep -E '^(OPENK_WORKER_TOKEN|OPENK_REMOTE_STEPS)=')
-  docker rm -f "$NAME" >/dev/null
-elif [ -n "$OPENK_WORKER_TOKEN" ]; then
-  ENVS=("OPENK_WORKER_TOKEN=$OPENK_WORKER_TOKEN" "OPENK_REMOTE_STEPS=${OPENK_REMOTE_STEPS:-separate,transcribe,align}")
-else
-  echo "找不到现有容器，也没有 OPENK_WORKER_TOKEN；无法确定 worker 令牌。" >&2
-  exit 1
+  existing_env="$(docker inspect "$NAME" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+  while IFS= read -r entry; do
+    case "$entry" in
+      OPENK_WORKER_TOKEN=*|OPENK_REMOTE_STEPS=*|OPENK_ALLOWED_ORIGINS=*|FORWARDED_ALLOW_IPS=*) export "$entry" ;;
+    esac
+  done <<< "$existing_env"
+  BACKUP="${NAME}-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
-EXTRA=(); for e in "${ENVS[@]}"; do EXTRA+=(-e "$e"); done
+: "${OPENK_WORKER_TOKEN:?请先配置随机 worker 口令；不要把口令提交到仓库}"
+export OPENK_WORKER_TOKEN
+export OPENK_REMOTE_STEPS="${OPENK_REMOTE_STEPS-separate,transcribe,align}"
+export OPENK_ALLOWED_ORIGINS="${OPENK_ALLOWED_ORIGINS:-}"
+
+EXTRA=()
+if [ -n "${OPENK_MEDIA_GID:-}" ]; then EXTRA+=(--group-add "$OPENK_MEDIA_GID"); fi
+if [ -n "$BACKUP" ]; then
+  docker stop --time 30 "$NAME" >/dev/null
+  docker rename "$NAME" "$BACKUP"
+  docker update --restart=no "$BACKUP" >/dev/null
+  echo "已保留旧容器：$BACKUP（不会自动重启；同时保留旧 worker 代码以便回退）"
+fi
 
 docker run -d --name "$NAME" --restart unless-stopped \
-  --network "$NET" \
-  --user 3000:3000 --group-add 1000 \
-  -p 8100:8000 \
-  -v "$DATA":/data \
-  -v "$MEDIA":/media/ktv:ro \
-  -v "$LIB":/library \
+  --network "$NET" --user "$RUN_UID:$RUN_GID" \
+  -p "$BIND:$PORT:8000" \
+  -v "$DATA":/data -v "$MEDIA":/media/ktv:ro -v "$LIB":/library \
   -e HOME=/data \
   -e OPENK_LOCAL_MEDIA_DIRS=/media/ktv:/library \
   -e OPENK_LIBRARY_DIR=/library \
-  -e OPENK_LOCAL_MEDIA_MAX_ITEMS=1000 \
-  -e OPENK_MAX_SONG_SECONDS=780 \
-  "${EXTRA[@]}" openk:slim >/dev/null
+  -e OPENK_WORKER_TOKEN -e OPENK_REMOTE_STEPS \
+  -e OPENK_ALLOWED_ORIGINS -e FORWARDED_ALLOW_IPS \
+  "${EXTRA[@]}" "$IMAGE" >/dev/null
 
-sleep 8
-echo "容器：$(docker ps --filter name=$NAME --format '{{.Status}}')"
-echo "网络：$(docker inspect $NAME --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}({{$v.IPAddress}}){{end}}')"
-echo "媒体目录可见文件数：$(docker exec $NAME sh -c 'ls /media/ktv 2>/dev/null | wc -l')"
-echo "归档库可写：$(docker exec $NAME sh -c 'touch /library/.w 2>/dev/null && echo 是 && rm -f /library/.w || echo 否')"
-docker exec openk-tls nginx -s reload 2>/dev/null || true
-echo "HTTPS 入口：$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 https://localhost:8443/)"
+healthy=false
+for _ in $(seq 1 45); do
+  status="$(docker inspect "$NAME" --format '{{.State.Health.Status}}')"
+  if [ "$status" = healthy ]; then healthy=true; break; fi
+  if [ "$status" = unhealthy ]; then break; fi
+  sleep 2
+done
+if [ "$healthy" != true ]; then
+  echo "新容器未通过健康检查。请检查日志；旧容器 $BACKUP 仍保留，未删除任何数据。" >&2
+  exit 1
+fi
+
+docker exec "$NAME" sh -c 'test -r /media/ktv && test -w /data && test -w /library'
+if [ -n "$TLS" ]; then docker exec "$TLS" nginx -s reload; fi
+echo "容器：$(docker ps --filter "name=^${NAME}$" --format '{{.Status}}')"
+echo "服务地址：http://$BIND:$PORT（跨设备访问需显式配置可信网络地址或认证反向代理）"

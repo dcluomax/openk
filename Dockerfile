@@ -55,11 +55,12 @@ ENV OPENK_HOST=0.0.0.0 \
     NLTK_DATA=/data/cache/nltk_data \
     PYTHONUNBUFFERED=1
 
-RUN mkdir -p /data/cache
+# 开发机新文件可能只有属主可读；运行时的非 root UID 也必须能读取代码和静态资源。
+RUN chmod -R a+rX /app && mkdir -p /data/cache
 VOLUME ["/data"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8000/api/jobs >/dev/null || exit 1
+  CMD curl -fsS http://127.0.0.1:8000/api/health >/dev/null || exit 1
 
 CMD ["python", "-m", "backend.main"]

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#11121d">
+  <title>OpenK · 手机点歌</title>
+  <link rel="stylesheet" href="/stage.css">
+  <script defer src="/room-client.js"></script>
+  <script defer src="/search.js"></script>
+  <script defer src="/remote.js"></script>
+</head>
+<body class="remote-page">
+  <main class="remote-shell">
+    <header class="remote-header"><a class="room-brand" href="/">open<span>k</span></a>
+      <div class="remote-header-status"><span id="remoteConnection" role="status">尚未加入</span><button id="leaveRoom" class="text-button" hidden>退出房间</button></div></header>
+    <section id="joinScreen" class="join-screen">
+      <p class="eyebrow">THE NIGHT IS YOURS</p><h1>下一首，<br>你来选。</h1>
+      <p class="muted">手机负责点歌，电视负责舞台。<br>打开电视上的「手机点歌」面板开始。</p>
+      <form id="joinForm" class="join-form">
+        <label for="joinRoom">房间号</label><input id="joinRoom" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[a-fA-F0-9]{10}" required placeholder="电视显示的 10 位房间号">
+        <label for="joinCode">配对码</label><input id="joinCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required placeholder="6 位数字">
+        <button id="joinSubmit" class="primary" type="submit">加入房间 →</button>
+      </form><p id="joinError" class="notice" role="alert"></p><a class="subtle-link" href="/">只在本机唱？打开经典点歌台</a>
+    </section>
+    <section id="roomScreen" hidden>
+      <section class="remote-now">
+        <div class="remote-now-heading"><div><p class="eyebrow" id="remoteRoom">LIVE ROOM</p><h1 id="remoteTitle">为今晚点第一首歌</h1><p id="remoteArtist">点歌后，在电视上启用声音</p></div><span class="live-mark">LIVE</span></div>
+        <p id="playerStatus" class="player-status">等待电视连接</p>
+        <div class="remote-progress"><span id="remoteElapsed">0:00</span><input id="seek" type="range" min="0" max="100" value="0" step="1" aria-label="播放位置" disabled><span id="remoteDuration">0:00</span></div>
+        <nav class="transport" aria-label="房间播放控制">
+          <button id="remoteRestart" aria-label="重唱当前歌曲" disabled>↺<small>重唱</small></button>
+          <button id="remotePlay" class="play-round" aria-label="播放" disabled>▶</button>
+          <button id="remoteNext" aria-label="下一首" disabled>⇥<small>下一首</small></button>
+          <button id="remoteGuide" aria-pressed="false" disabled>原唱<small>已关闭</small></button>
+        </nav>
+      </section>
+      <div class="browse-heading"><h2>给今晚加一首</h2><span id="libraryCount" class="muted"></span></div>
+      <div class="remote-search"><span aria-hidden="true">⌕</span><input id="songSearch" type="search" autocomplete="off" placeholder="歌名 / 歌手 / 全拼 / 首字母，可组合" aria-label="搜索曲库"></div>
+      <div class="library-tools"><span class="eyebrow">YOUR KARAOKE COLLECTION</span><button id="refreshLibrary" class="text-button">刷新曲库</button></div>
+      <p id="libraryStatus" class="muted" role="status"></p><ul id="roomSongList" class="room-song-list" aria-label="可点歌曲"></ul>
+      <button id="showMore" class="load-more" hidden>显示更多歌曲</button>
+      <button id="openQueue" class="queue-dock"><span>☷ <strong>已点歌曲</strong> <span id="remoteQueueCount">0</span></span><span>查看队列 ↑</span></button>
+    </section>
+  </main>
+  <section id="queuePanel" class="queue-overlay" role="dialog" aria-modal="true" aria-labelledby="queueTitle" hidden>
+    <div class="queue-sheet"><header><div><p class="eyebrow">THE SETLIST</p><h2 id="queueTitle">今晚的歌单</h2></div><button id="closeQueue" class="close-button" aria-label="关闭队列">✕</button></header>
+      <p id="queueNow" class="queue-now"></p><div class="queue-tools"><span id="queueSummary"></span><button id="clearQueue" class="text-button">清空待唱</button></div>
+      <ol id="remoteQueue" class="remote-queue"></ol><p id="queueEmpty" class="empty">还没有下一首。把喜欢的歌加进来吧。</p>
+    </div>
+  </section>
+  <div id="remoteNotice" class="toast" role="status" hidden></div>
+</body>
+</html>

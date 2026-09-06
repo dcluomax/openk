@@ -3,23 +3,26 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#10101c" />
   <title>openk · 点歌台</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app">
     <!-- 顶部栏：搜索是点歌台最高频的操作，所以常驻在最显眼的位置 -->
     <header class="topbar">
-      <div class="brand" id="homeBtn" title="回到点歌台">
-        <span class="logo">🎤</span>
-        <h1>点歌台</h1>
-      </div>
+      <button class="brand" id="homeBtn" title="回到点歌台" type="button">
+        <span class="logo" aria-hidden="true">♫</span>
+        <span class="brand-name">openk<span class="brand-caption">你的私人点歌台</span></span>
+      </button>
       <div class="search-wrap">
         <input id="search" class="search-box" type="text"
-               placeholder="搜歌名 / 歌手 / 拼音首字母（如 pyzy）" autocomplete="off" />
-        <button id="searchClear" class="s-clear hidden" title="清空">✕</button>
+               placeholder="歌名 / 歌手 / 全拼 / 首字母，可组合" aria-label="搜索歌曲或歌手" autocomplete="off" />
+        <button id="searchClear" class="s-clear hidden" title="清空" aria-label="清空搜索">✕</button>
       </div>
       <div class="top-actions">
+        <a class="top-link" href="/tv" target="_blank" rel="noopener" title="在新窗口打开演唱大屏">大屏 ↗</a>
+        <a class="top-link" href="/remote" target="_blank" rel="noopener" title="在新窗口打开遥控点歌">遥控 ↗</a>
         <button id="queueBtn" class="top-btn" title="已点歌曲">
           📋 已点 <span id="queueCount" class="pill">0</span>
         </button>
@@ -29,21 +32,29 @@
       </div>
     </header>
 
+    <h1 class="visually-hidden">openk 点歌与演唱台</h1>
+    <p id="catalogStatus" class="notice hidden" role="status"></p>
+    <section id="pendingRecordingsWrap" class="notice pending-recordings hidden" aria-label="尚未保存的录音">
+      <strong>录音保存中心</strong>
+      <p class="muted small">保存失败的音频仍保留在本页。请重试或下载备份后再关闭页面。</p>
+      <ul id="pendingRecordings"></ul>
+    </section>
+
     <!-- 点歌台：已完成的歌按 KTV 节目单的方式陈列 -->
     <section id="browse" class="browse">
-      <nav class="tabs">
-        <button class="tab active" data-tab="all">全部</button>
-        <button class="tab" data-tab="artist">歌手</button>
-        <button class="tab" data-tab="new">最新</button>
+      <nav class="tabs" aria-label="曲库分类">
+        <button class="tab active" data-tab="all" aria-pressed="true">全部</button>
+        <button class="tab" data-tab="artist" aria-pressed="false">歌手</button>
+        <button class="tab" data-tab="new" aria-pressed="false">最新</button>
         <span class="tab-spacer"></span>
         <span id="browseCount" class="muted small"></span>
         <button id="viewToggle" class="view-toggle" title="在文字列表和封面墙之间切换">🖼 大图</button>
       </nav>
 
-      <div id="langBar" class="lang-bar"></div>
+      <div id="langBar" class="lang-bar" aria-label="语种筛选"></div>
 
       <ul id="songList" class="song-list"></ul>
-      <div id="grid" class="song-grid hidden"></div>
+      <div id="grid" class="song-grid hidden" role="list"></div>
       <div id="artistList" class="artist-list hidden"></div>
       <p id="browseEmpty" class="empty hidden"></p>
     </section>
@@ -72,7 +83,7 @@
 
         <div id="lyricSearch" class="lyric-search hidden">
           <div class="ls-bar">
-            <input id="lsQuery" type="text" placeholder="歌手 歌名，如：大壮 敬自己" autocomplete="off" />
+            <input id="lsQuery" type="text" placeholder="歌手 歌名，如：大壮 敬自己" aria-label="搜索歌词" autocomplete="off" />
             <button id="lsGo" class="lyr-btn primary">搜索</button>
             <button id="lsClose" class="lyr-btn">关闭</button>
           </div>
@@ -80,14 +91,16 @@
           <ul id="lsResults" class="ls-results"></ul>
         </div>
 
+        <p id="alignmentStatus" class="notice hidden" role="status"></p>
         <div id="lyrics" class="lyrics"></div>
 
         <div class="controls">
-          <button id="playBtn" class="round" title="播放/暂停">▶</button>
+          <button id="playBtn" class="round" title="播放/暂停" aria-label="播放或暂停">▶</button>
           <span id="curTime" class="time">0:00</span>
-          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" />
+          <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度" />
           <span id="durTime" class="time">0:00</span>
         </div>
+        <p id="audioStatus" class="audio-status" role="status"></p>
 
         <div class="mixer">
           <label class="mix">
@@ -121,12 +134,14 @@
           <label class="mon" title="麦克风离音箱太近会尖叫（啸叫）。开着会自动找到啸叫的频率并把它挖掉，实在压不住就临时调小外放">
             <input type="checkbox" id="howlGuard" checked /> 防啸叫
           </label>
+          <button id="resumeMonitor" class="lyr-btn hidden">恢复麦克风外放</button>
           <button id="recBtn" class="rec">🎤 开始录唱</button>
-          <span id="recStatus" class="muted small"></span>
-          <span id="micHint" class="hint"></span>
-          <span id="howlHint" class="hint howl hidden"></span>
+          <span id="recStatus" class="muted small" role="status"></span>
+          <span id="micHint" class="hint" role="status"></span>
+          <span id="howlHint" class="hint howl hidden" role="status"></span>
         </div>
 
+        <p id="recListStatus" class="muted small" role="status"></p>
         <div class="rec-list-wrap hidden" id="recListWrap">
           <h4>🎵 我的录音</h4>
           <ul id="recList" class="rec-list"></ul>
@@ -138,9 +153,9 @@
     </section>
 
     <!-- 已点歌曲抽屉 -->
-    <aside id="queuePanel" class="drawer hidden">
+    <aside id="queuePanel" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="queueHeading">
       <div class="drawer-head">
-        <strong>📋 已点歌曲</strong>
+        <strong id="queueHeading">📋 已点歌曲</strong>
         <span id="queueHint" class="muted small"></span>
         <span class="drawer-spacer"></span>
         <button id="queueClear" class="lyr-btn">清空</button>
@@ -151,9 +166,9 @@
     </aside>
 
     <!-- 后台：导入与处理进度。日常唱歌用不到，所以收进抽屉 -->
-    <aside id="adminPanel" class="drawer wide hidden">
+    <aside id="adminPanel" class="drawer wide hidden" role="dialog" aria-modal="true" aria-labelledby="adminHeading">
       <div class="drawer-head">
-        <strong>⚙️ 后台</strong>
+        <strong id="adminHeading">⚙️ 后台</strong>
         <span class="drawer-spacer"></span>
         <button id="adminClose" class="lyr-btn">关闭</button>
       </div>
@@ -161,7 +176,7 @@
       <div class="admin-sec">
         <h4>添加歌曲</h4>
         <div class="row">
-          <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接…" autocomplete="off" />
+          <input id="url" type="text" placeholder="粘贴 YouTube / 视频链接…" aria-label="视频或歌单链接" autocomplete="off" />
           <button id="go" class="primary">开始制作</button>
           <button id="plGo" title="粘贴歌单链接，一次把整个播放列表加入队列">🎵 歌单</button>
           <button id="lcGo" class="hidden" title="从服务器上已有的媒体目录批量导入">📁 本地文件</button>
@@ -223,7 +238,7 @@
             <div class="step" data-step="separate"><span>2</span>人声分离</div>
             <div class="step" data-step="transcribe"><span>3</span>歌词对齐</div>
           </div>
-          <div class="bar"><div id="progBar" class="bar-fill"></div></div>
+          <div id="progressMeter" class="bar" role="progressbar" aria-label="歌曲处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progBar" class="bar-fill"></div></div>
           <p id="progPct" class="muted small">0%</p>
           <p id="progError" class="error hidden"></p>
         </div>
@@ -236,16 +251,16 @@
     <!-- 常驻控制条：唱歌时不挡浏览区，切歌/重唱/原伴唱都在这一层 -->
     <div id="nowbar" class="nowbar hidden">
       <img id="nbCover" class="nb-cover" alt="" />
-      <div class="nb-meta" id="nbOpen" title="展开歌词页">
-        <p class="nb-title" id="nbTitle">—</p>
-        <p class="nb-artist" id="nbArtist"></p>
-      </div>
+      <button class="nb-meta" id="nbOpen" title="展开歌词页" aria-label="展开当前歌曲歌词">
+        <span class="nb-title" id="nbTitle">—</span>
+        <span class="nb-artist" id="nbArtist"></span>
+      </button>
       <div class="nb-mode">
-        <button id="modeInst" class="mode-btn active" title="只放伴奏，自己唱">伴唱</button>
-        <button id="modeOrig" class="mode-btn" title="放原唱，跟着学">原唱</button>
+        <button id="modeInst" class="mode-btn active" title="只放伴奏，自己唱" aria-pressed="true">伴唱</button>
+        <button id="modeOrig" class="mode-btn" title="放原唱，跟着学" aria-pressed="false">原唱</button>
       </div>
       <div class="nb-ctrl">
-        <button id="nbPlay" class="nb-btn" title="播放 / 暂停">⏸</button>
+        <button id="nbPlay" class="nb-btn" title="播放 / 暂停" aria-label="播放或暂停">⏸</button>
         <button id="nbReplay" class="nb-btn" title="从头再唱">↺ 重唱</button>
         <button id="nbSkip" class="nb-btn" title="切到下一首">⏭ 切歌</button>
         <button id="nbQueue" class="nb-btn strong" title="已点歌曲">📋 <span id="nbQueueCount">0</span></button>
@@ -259,6 +274,7 @@
     </footer>
   </div>
 
-  <script src="app.js"></script>
+  <script src="/search.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

@@ -40,6 +40,8 @@ print("@@" + json.dumps({
     "sep_env": os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", ""),
     "hf": os.environ.get("HF_HOME", ""),
     "torch": os.environ.get("TORCH_HOME", ""),
+    "transcribe_timeout": config.TRANSCRIBE_TIMEOUT,
+    "align_timeout": config.ALIGN_TIMEOUT,
 }))
 """ % str(ROOT)
 
@@ -104,10 +106,25 @@ def test_explicit_env_wins() -> None:
     check("用户显式设的 HF_HOME 不被覆盖", c["hf"] == "/tmp/my-own-hf", c["hf"])
 
 
+def test_ml_timeouts() -> None:
+    c = probe()
+    check("转写与对齐均有有限执行期限",
+          c["transcribe_timeout"] == 1800 and c["align_timeout"] == 1200)
+    c = probe(OPENK_TRANSCRIBE_TIMEOUT="123", OPENK_ALIGN_TIMEOUT="456")
+    check("执行期限可配置", c["transcribe_timeout"] == 123 and c["align_timeout"] == 456)
+    for key in ("OPENK_TRANSCRIBE_TIMEOUT", "OPENK_ALIGN_TIMEOUT"):
+        try:
+            probe(**{key: "0"})
+        except RuntimeError as exc:
+            check(f"{key} 拒绝无期限设置", "必须大于 0" in str(exc))
+        else:
+            check(f"{key} 拒绝无期限设置", False)
+
+
 def main() -> int:
     for fn in (test_defaults_unchanged, test_data_dir_moves_everything,
                test_each_path_overridable, test_models_dir_steers_every_library,
-               test_explicit_env_wins):
+               test_explicit_env_wins, test_ml_timeouts):
         print(f"\n── {fn.__name__} ──")
         try:
             fn()

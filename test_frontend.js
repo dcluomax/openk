@@ -5,11 +5,11 @@
  * 控制条没出来」「返回曲库把歌停了」这类只在交互后才暴露的问题。这里用
  * jsdom 把 index.html + app.js 真跑一遍，覆盖点歌台最关键的几条链路。
  *
- * 需要 jsdom：npm install jsdom（没装就跳过，不阻塞其它测试）。
+ * 需要项目声明的 jsdom 依赖；缺失时明确失败，不能把未执行当作通过。
  */
 try { require.resolve('jsdom'); } catch {
-  console.log('== 前端冒烟 ==\n  (跳过：未安装 jsdom，执行 `npm install jsdom` 后可运行)');
-  process.exit(0);
+  console.error('== 前端冒烟 ==\n  未安装 jsdom，请先安装项目依赖后重试');
+  process.exit(1);
 }
 const { JSDOM } = require('jsdom');
 const fs = require('fs');
@@ -66,6 +66,7 @@ w.fetch = (u) => Promise.resolve({
   json: async () => {
     const m = String(u).match(/\/api\/jobs\/([\w]+)$/);
     if (m) return jobs.find(j => j.id === m[1]);
+    if (String(u).includes('/recordings')) return [];
     if (String(u).includes('/api/jobs')) return jobs;
     if (String(u).includes('/api/zh-map')) return { '闊':'阔', '權':'权', '夢':'梦', '沒':'没' };
     if (String(u).includes('/api/local/status')) return { enabled:true };
@@ -82,6 +83,7 @@ w.onerror = (m) => errs.push('onerror: ' + m);
 
 // app.js 是严格模式，indirect eval 下顶层声明不会漏到 window 上，
 // 所以在末尾追一句显式导出，把要单测的几个纯函数取出来。
+w.eval(fs.readFileSync(D + '/search.js', 'utf8'));
 w.eval(fs.readFileSync(D + '/app.js', 'utf8')
   + '\n;window.__t = { findHowlPeak, makeHowlTracker, makeNotchBank, howlTick, HOWL };');
 
