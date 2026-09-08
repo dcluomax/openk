@@ -30,13 +30,16 @@ import shutil
 import sys
 import urllib.request
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.steps.audio_quality import analyse, quality_score  # noqa: E402
+from tools.job_files import artifact_path, job_directory  # noqa: E402
 
 DATA = os.environ.get("OPENK_DATA_DIR", "/data")
+JOBS = Path(os.environ.get("OPENK_JOBS_DIR", os.path.join(DATA, "jobs")))
 API = os.environ.get("OPENK_API", "http://127.0.0.1:8000")
 # 音质分差在这个范围内就算「听不出区别」，改看歌词。
 # 4 分约等于截止频率差 1kHz，或高频能量差 4dB——都在听感的噪声里。
@@ -110,19 +113,27 @@ def save_cache(cache: Dict[str, Any]) -> None:
 
 
 def measure(job: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
-    inst = os.path.join(DATA, "jobs", job["id"], "stems", "instrumental.mp3")
+    directory = job_directory(JOBS, job["id"])
+    stems = job.get("stems") or {}
+    reference = stems.get("instrumental", "instrumental.mp3")
     m = None
-    if os.path.exists(inst):
+    error = None
+    try:
+        inst = artifact_path(directory, reference, subdir="stems")
         # 用 mtime+大小 当版本号：重新分离过的歌会自动失效重算
         st = os.stat(inst)
-        key = "%s:%d:%d" % (job["id"], st.st_mtime_ns, st.st_size)
+        key = "%s:%s:%d:%d" % (job["id"], reference, st.st_mtime_ns, st.st_size)
         if key in cache:
             m = cache[key]
         else:
-            m = analyse(inst, job.get("duration"))
+            m = analyse(str(inst), job.get("duration"))
             cache[key] = m
+        if m is None:
+            error = "伴奏音质无法评估"
+    except (OSError, ValueError) as exc:
+        error = str(exc)
     return {"job": job, "m": m, "q": quality_score(m),
-            "lines": int(job.get("line_count") or 0)}
+            "lines": int(job.get("line_count") or 0), "error": error}
 
 
 def pick_best(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -188,9 +199,17 @@ def main() -> int:
           % (len([j for j in jobs if j.get("state") == "done"]),
              len(groups), sum(len(v) for v in groups.values())))
 
-    dropped, skipped, freed = 0, 0, 0
+    dropped, skipped, freed, failures = 0, 0, 0, 0
     for (grp_artist, _), members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        ranked = pick_best([measure(j, cache) for j in members])
+        measured = [measure(j, cache) for j in members]
+        if any(candidate.get("error") for candidate in measured):
+            failures += 1
+            print("无法比较全部版本，整组保留：", file=sys.stderr)
+            for candidate in measured:
+                if candidate.get("error"):
+                    print(f"  {candidate['job']['id']}：{candidate['error']}", file=sys.stderr)
+            continue
+        ranked = pick_best(measured)
         head = ranked[0]["job"]
         warn = "" if grp_artist else "   ⚠️ 歌手未知，仅凭歌名判定为同一首"
         print("· %s - %s  ×%d%s"
@@ -217,7 +236,7 @@ def main() -> int:
                 print("         源文件 → %s" % info)
 
             dropped += 1
-            d = os.path.join(DATA, "jobs", j["id"])
+            d = job_directory(JOBS, j["id"])
             freed += sum(os.path.getsize(os.path.join(r, f))
                          for r, _, fs in os.walk(d) for f in fs
                          if os.path.exists(os.path.join(r, f)))
@@ -233,7 +252,7 @@ def main() -> int:
     save_cache(cache)
     if not args.apply:
         print("这只是报告。确认无误后加 --apply 才会真的动手。")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

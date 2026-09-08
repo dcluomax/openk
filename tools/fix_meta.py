@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """批量校正曲库里的歌名 / 歌手。
 
-    python -m tools.fix_meta            # 只看建议，不改动（默认）
-    python -m tools.fix_meta --apply    # 写回 status.json
-    python -m tools.fix_meta --limit 20 # 先拿一小批试水
+    python -m tools library fix-meta            # 只看建议，不改动（默认）
+    python -m tools library fix-meta --apply    # 离线写回 status.json
+    python -m tools library fix-meta --limit 20 # 先拿一小批试水
 
 默认**只清洗歌名、不替换已有的歌手**：LRCLIB 是模糊搜索，同名歌和翻唱都会
 命中，批量替换歌手实测错得比对得多。歌手为空或是噪声时仍会补全。
 真要让曲库覆盖歌手名，加 `--replace-artist`，并且请逐条看过再写回。
 
-改动直接写进各任务的 status.json；点歌台的 `_public_job` 会优先用这两个字段，
-所以写完刷新页面就能看到，不需要重跑流水线。
+改动直接写进各任务的 status.json；写入前停止 API 与 worker，维护后重启服务
+以重新加载内存曲库。无需重跑流水线，仅刷新页面不能加载外部元数据修改。
 """
 from __future__ import annotations
 

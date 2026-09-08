@@ -506,13 +506,27 @@ function songRow(j, idx) {
   li.dataset.id = j.id;
   if (state.queue.includes(j.id)) li.classList.add('queued');
   li.innerHTML = `
-    <span class="sr-no">${idx + 1}</span>
+    <span class="sr-no">${String(idx + 1).padStart(2, '0')}</span>
+    <span class="sr-artwork" data-tone="${idx % 4}" aria-hidden="true">
+      <svg class="ui-icon"><use href="#icon-note"/></svg>
+    </span>
     <span class="sr-name"><span class="sr-title">${escapeHtml(si.title)}</span>
       ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}</span>
     <span class="sr-artist">${escapeHtml(si.artist || '未知歌手')}</span>
     <span class="sr-lang">${escapeHtml(si.lang)}</span>
     <span class="sr-dur">${j.duration ? fmt(j.duration) : ''}</span>
     <button class="sr-pick" data-act="pick" aria-label="点歌：${escapeHtml(si.title)}">点歌</button>`;
+  if (j.thumbnail) {
+    const image = document.createElement('img');
+    image.alt = '';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
+    image.width = image.height = 44;
+    image.src = j.thumbnail;
+    image.addEventListener('error', () => image.remove(), { once: true });
+    li.querySelector('.sr-artwork').appendChild(image);
+  }
   return li;
 }
 
@@ -2657,7 +2671,7 @@ function init() {
   /* 曲库视图切换 + 语种筛选 */
   $('#viewToggle').addEventListener('click', () => {
     state.view = state.view === 'list' ? 'grid' : 'list';
-    $('#viewToggle').textContent = state.view === 'list' ? '🖼 大图' : '📃 列表';
+    $('#viewToggle').textContent = state.view === 'list' ? '封面视图' : '列表视图';
     prefs.view = state.view; savePrefs();
     renderBrowse(true);
   });
@@ -2687,7 +2701,7 @@ function init() {
   $('#modeOrig').addEventListener('click', () => setSingMode('orig'));
   state.singMode = prefs.singMode;
   state.view = prefs.view || 'list';
-  $('#viewToggle').textContent = state.view === 'list' ? '🖼 大图' : '📃 列表';
+  $('#viewToggle').textContent = state.view === 'list' ? '封面视图' : '列表视图';
 
   bindPlayer();
   if (window.ResizeObserver) {
