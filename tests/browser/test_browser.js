@@ -176,6 +176,7 @@ async function main() {
   const browsers = [];
   const syncSamples = [];
   let server;
+  let browserDirectory;
   let serverLog = '', chromeLog = '';
   const artifacts = process.env.OPENK_TEST_ARTIFACTS;
   let cleanupPromise;
@@ -185,6 +186,9 @@ async function main() {
       for (const browser of browsers) await stop(browser);
       await stop(server);
       await fs.rm(directory, {recursive:true, force:true, maxRetries:4, retryDelay:200});
+      if (browserDirectory) {
+        await fs.rm(browserDirectory, {recursive:true, force:true, maxRetries:4, retryDelay:200});
+      }
     })();
   }
   const interrupted = () => { cleanup().finally(() => process.exit(130)); };
@@ -195,6 +199,13 @@ async function main() {
     cleanup().finally(() => process.exit(1));
   }, 180000);
   try {
+    // Chromium's SingletonSocket must fit sun_path even in deeply nested CI workspaces.
+    browserDirectory = await fs.mkdtemp(path.join(
+      process.platform === 'win32' ? os.tmpdir() : '/tmp', 'openk-chrome-'));
+    if (process.platform !== 'win32') {
+      const socket = path.join(await fs.realpath(browserDirectory), 'com.google.Chrome.XXXXXX', 'SingletonSocket');
+      assert.ok(Buffer.byteLength(socket) < 104, 'Chrome 临时套接字路径必须短于 Unix 路径上限');
+    }
     const binary = await chromePath();
     const python = process.env.OPENK_TEST_PYTHON || path.join(ROOT, '.venv/bin/python');
     const data = path.join(directory, 'data');
@@ -215,7 +226,7 @@ async function main() {
     server.stderr.on('data', chunk => { serverLog += chunk; });
     await waitFor(async () => (await fetch(base + '/api/health')).ok, '隔离服务启动');
     async function launchBrowser(label) {
-      const profile = path.join(directory, label);
+      const profile = path.join(browserDirectory, label);
       const browser = spawn(binary, [
         '--headless=new', '--remote-debugging-port=0',
         `--user-data-dir=${profile}`, '--no-first-run',
@@ -224,7 +235,8 @@ async function main() {
         '--disable-sync', '--no-pings', '--no-proxy-server',
         '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
         '--disable-background-timer-throttling', '--disable-renderer-backgrounding', 'about:blank',
-      ], {stdio:['ignore', 'pipe', 'pipe'], detached:true});
+      ], {env:{...process.env, TMPDIR:browserDirectory},
+        stdio:['ignore', 'pipe', 'pipe'], detached:true});
       browsers.push(browser);
       browser.on('error', error => { chromeLog += error.stack; });
       browser.stderr.on('data', chunk => { chromeLog += chunk; });
