@@ -7,6 +7,7 @@ venv/
 .git/
 .github/
 docs/
+tests/
 models/
 *.log
 cookies*.txt

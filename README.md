@@ -1,6 +1,11 @@
 # 🎤 openk — 简单好用的专业卡拉OK
 
-把任意 YouTube / 视频链接一键变成卡拉OK：**自动去除人声**、**逐字对齐歌词**，并提供带同步高亮歌词的播放器。
+把 yt-dlp 支持的 YouTube / 视频链接变成卡拉OK：**自动分离人声**、**逐字对齐歌词**，
+并提供搜索点歌、同步歌词、混音和录唱。
+
+[快速安装](#用-docker-运行跨平台最省事) · [使用说明书](docs/user-guide.md) ·
+[电视 / 手机双屏](docs/tv.md) · [NAS + worker 部署](docs/distributed.md) ·
+[程序与脚本索引](docs/project-layout.md) · [版本记录](CHANGELOG.md)
 
 **客厅模式**：电视打开 `/tv`，手机扫码进入 `/remote` 点歌；共享队列、遥控器焦点、
 大字逐词歌词、原唱切换和自动连唱。经典点歌台与录唱仍在 `/`，管理入口为 `/admin`。
@@ -10,10 +15,15 @@
 或放在具备身份认证的反向代理后，不要直接暴露到公网。见 [安全说明](SECURITY.md)。
 
 <p align="center">
-  <img src="docs/screenshots/tv-stage.png" alt="openk 电视舞台 —— 大字逐词歌词与手机共享点歌" width="860" />
+  <img src="docs/screenshots/songboard.png" alt="新版 openk 点歌台：深色薄荷绿主题、唱片装饰、封面列表和悬浮播放条" width="860" />
   <br/>
-  <sub>电视大屏演唱 · 手机扫码点歌 · 共享队列 · 逐词高亮 · 原唱切换</sub>
+  <sub>私人曲库 · 歌名 / 歌手 / 拼音搜索 · 电视与手机双屏 · 逐词歌词 · 混音录唱</sub>
 </p>
+
+> **版本说明**：本页截图和命令对应 `main` 分支。`stable` / `latest` 随正式版本发布更新，
+> 可能与开发版界面不同；固定版本请阅读相应标签下的文档。
+> 想体验本页新版界面，可运行 `main` 源码，或在对应构建成功后使用
+> `ghcr.io/dcluomax/openk:main`。正式版本见 [Releases](https://github.com/dcluomax/openk/releases)。
 
 - 🎸 **人声分离**：基于 [audio-separator](https://github.com/nomadkaraoke/python-audio-separator)（[Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) 的 MDX-Net / BS-Roformer / Demucs 模型封装），在 Apple Silicon 上自动启用 CoreML 加速。
 - 🎯 **优秀的歌词自动对齐**（多来源，自动择优）：
@@ -29,7 +39,9 @@
 - ⬇️ **下载**：基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)。
 - 🎚️ **卡拉OK播放器**：伴奏 / 导唱人声独立音量、进度拖动、逐字高亮、点歌词跳转、自动滚动、歌词来源标注。
 - 🎙️ **录唱与回放**：麦克风 + 伴奏实时合成录制，内置多种**混响**（KTV / 小房间 / 大厅 / 教堂）；录音自动保存，可回放、下载、删除。
-- 🗂️ **点歌台曲库**：已处理的歌曲进曲库，像 KTV 点歌台一样**按歌名 / 歌手搜索**、**按歌手分组**浏览（自动从标题 / LRCLIB 提取干净的歌名与歌手）；同一视频**自动去重**，不重复下载与分离；默认删除源音频以**节省空间**（只保留伴奏、人声与歌词，唱歌只看字幕、无需视频）。
+- 🗂️ **点歌台曲库**：已处理的歌曲进曲库，支持**歌名 / 歌手搜索**和**歌手分组**；
+  同一视频自动去重，避免重复下载与分离。任务内的临时源音频按保留 / 归档配置清理，
+  不删除本地导入的原文件，归档失败时保留源文件。
 - ✏️ **歌词可编辑**：识别偶有错字时可逐行手动修改，保存后**自动重建逐字时间轴**（未改动的行保留原有精确时间）。
 - 🔍 **搜歌词、重对齐**：识别把语言认错（中文被唱成**拼音**、或整首识别成英文）时，一键从歌词库**搜索正确歌词并重新对齐**到人声——有时间轴的做逐字对齐、纯文本的按时长铺开；复用已分离音轨，不重新下载 / 分离。
 - ↻ **失败一键重试**：下载 / 处理偶发失败（如 YouTube 限流）时，曲库项上会出现重试按钮；下载还内置自动退避重试。
@@ -43,13 +55,19 @@
 以下截图全部来自隔离演示环境：虚构曲目、原创示例歌词和程序生成的音轨／封面，
 不包含实际曲库、服务器地址或有效配对凭据。
 
-**点歌台** —— 首页默认是高密度列表，也能切换封面墙，像 KTV 机器一样点歌、排队、连播：
+**经典点歌台** —— 桌面、平板和手机使用同一入口 `/`；深色薄荷绿配色、
+唱片装饰和悬浮播放条，让点歌与正在演唱的内容分层呈现。
+首页默认是带小封面的紧凑列表，也能切换封面墙：
 
 <p align="center">
-  <img src="docs/screenshots/songboard.png" alt="经典点歌台：演示曲目列表、歌手分类与搜索" width="860" />
+  <img src="docs/screenshots/classic-phone.png" alt="经典点歌台手机列表：搜索、语种筛选与点歌按钮" width="280" />
+  <img src="docs/screenshots/classic-covers-phone.png" alt="经典点歌台窄屏封面视图" width="280" />
 </p>
 
-- **高密度曲目列表**：默认是文字列表（歌名 / 歌手 / 语种 / 时长 / 点歌），一屏十几首，找歌比翻封面快得多——商业点歌台也都是这么做的。想按 MV 画面认歌就点右上角切「🖼 大图」。
+- **紧凑曲目列表**：显示封面、歌名、歌手、语种、时长和点歌按钮；窄屏保留歌曲与主要操作，
+  不挤出横向滚动条。点「封面视图」切换封面墙，再点「列表视图」返回。
+  列表封面延迟加载、异步解码，不向图片来源发送页面地址；加载失败显示本地音符占位，
+  不影响点歌。界面不加载外部字体，支持减少动态效果偏好。
 - **搜索**：经典点歌台和手机遥控器共用歌名 / 歌手搜索，支持**全拼和拼音首字母**。
   例如 `周杰伦 稻香`、`稻香 zhoujielun`、`zjl dx`，词序不限；首字母只从头匹配，
   `dx` 不会误中「淚的小雨」的 `ldxy`。经典页面按 `/` 聚焦搜索框；输入法组词期间不刷新结果。
@@ -62,9 +80,24 @@
   歌手页按繁简、大小写、全半角归一，`夢然` 和 `梦然` 会合成一位，显示仍保留曲库中最常见的原写法；
   不会把 `A-Lin` 与 `ALin` 等标点不同的歌手强行合并。
 - **已点歌曲**：点一首就排进队列，可**置顶**、删除、清空；一首唱完自动接下一首。经典入口队列存在浏览器本地；电视／手机房间队列由服务端持久化，两种模式互不覆盖。
-- **常驻控制条**：唱歌时底部一直有「伴唱 / 原唱」「重唱」「切歌」「已点 N」，**浏览区照常可用**——一个人在唱、其他人接着点歌，这才是点歌台的正常用法。默认是**伴唱**。
-- **麦克风默认外放**：点歌开唱就自动接通麦克风并从音箱出声（和真 KTV 一样），带**自动防啸叫**（见下）；麦克风音量、混响、伴唱/原唱都记在本地偏好里。
-- **后台（⚙️）**：添加链接、导入歌单、导入本地文件、查看处理进度都收在这里，唱歌时不碍事；有任务在跑时按钮上会显示数量角标。
+- **悬浮播放条**：开始播放后，底部保留「伴唱 / 原唱」「重唱」「切歌」「已点 N」；
+  点击歌名回到歌词页，返回曲库仍能继续点歌。默认是**伴唱**。
+- **麦克风与监听**：默认勾选外放，但只有浏览器授权并启动音频引擎后才生效；
+  隐藏页面会暂停麦克风监听，回到页面后需明确恢复。音量、混响及原唱 / 伴唱选择保存在本地。
+- **后台**：添加链接、导入歌单、导入本地文件、查看处理进度都收在抽屉里；
+  有任务在跑时按钮显示数量角标，窄屏使用带提示的图标按钮。
+
+**演唱与歌词** —— 点击歌词可定位，正在唱的词逐字高亮，原唱与伴奏音量可独立调整：
+
+<p align="center">
+  <img src="docs/screenshots/player.png" alt="经典演唱页：逐词高亮歌词、混音、录唱和悬浮播放条" width="860" />
+</p>
+
+**电视舞台** —— 电视负责播放，手机通过共享房间点歌：
+
+<p align="center">
+  <img src="docs/screenshots/tv-stage.png" alt="电视舞台：大字歌词、当前歌曲与待唱队列" width="860" />
+</p>
 
 **手机点歌、组合搜索与共享队列** —— 手机只控制房间，声音从电视输出：
 
@@ -74,7 +107,7 @@
   <img src="docs/screenshots/remote-queue.png" alt="手机共享待唱队列" width="280" />
 </p>
 
-**后台管理**（「⚙️ 后台」）—— 添加链接、本地导入与任务管理；下图为无活跃任务的演示界面，
+**后台管理**（右上角「后台」或 `/admin`）—— 添加链接、本地导入与任务管理；下图为无活跃任务的演示界面，
 有任务时显示下载 → 人声分离 → 歌词对齐的进度：
 
 <p align="center">
@@ -114,7 +147,8 @@
 录音跟着就干净了；反过来若挖在录音路上，一旦误判就是永久性损伤。
 
 想关掉可以取消勾选「防啸叫」（控制条上，紧挨着「麦克风外放」）。
-**戴耳机监听时它永远不会触发**——伴奏不进空气，本来就没有环路。
+推荐用耳机监听，减少音箱与麦克风之间的反馈。算法不能代替合理的音量和设备摆放，
+不要把麦克风对着音箱；现场延迟与误判仍需实机调整。
 
 
 ---
@@ -150,6 +184,8 @@ YouTube 链接
 openk/
 ├── backend/
 │   ├── main.py            # FastAPI 服务与路由
+│   ├── rooms.py           # TV / 手机共享房间、队列与播放租约
+│   ├── security.py        # 浏览器跨来源写请求保护
 │   ├── search.py          # 归一、相关度排序、繁简表与缓存的拼音搜索索引
 │   ├── config.py          # 配置（可用环境变量覆盖）
 │   ├── jobs.py            # 任务管理（内存 + status.json 持久化）
@@ -170,15 +206,33 @@ openk/
 ├── frontend/              # 纯静态前端 (HTML/CSS/JS)，无构建步骤
 │   ├── index.html        # 点歌台 + 演唱页 + 已点/后台两个抽屉
 │   ├── app.js            # 曲库渲染、已点队列、播放器与录唱
+│   ├── tv.html / tv.js   # 电视舞台
+│   ├── remote.html / remote.js # 手机点歌
+│   ├── room-client.js    # 房间客户端
 │   ├── search.js         # 经典 / 手机共用的轻量检索，与后端算法一致
-│   └── styles.css
+│   └── styles.css / stage.css
 ├── worker/                # 可选：远程算力 worker（跑在算力机上）
-├── tools/                 # 运维小工具：dedupe.py（曲库除重，留音质最好的版本）
-├── scripts/               # seed_demo.py（演示曲）/ upgrade_word_align.py（逐字升级）/ make_cert.py（自签证书）
-├── deploy/                # 部署模板：环境变量、nginx TLS 反代、macOS 开机自启
-├── docs/screenshots/      # 界面截图（README 用）
+├── tools/                 # 统一运维入口：python -m tools（曲库 / 歌词 / 证书 / 演示）
+├── scripts/               # 回归运行器与旧命令的薄兼容入口
+├── tests/
+│   ├── python/            # 服务端、worker、工具与运行器回归
+│   ├── frontend/          # Node / jsdom 状态与交互回归
+│   └── browser/           # 真实 Chrome 端到端场景
+├── deploy/                # 全部部署模板：容器脚本、环境、TLS、worker 开机自启
+├── docs/                  # 部署 / TV / 程序脚本索引；screenshots/ 存放公开截图
+├── run.sh                 # 稳定的服务启动入口
 ├── requirements.txt       # 轻量依赖（Web + 下载）
+├── requirements-test.txt  # 回归依赖
 └── requirements-ml.txt    # 重量依赖（分离 + 识别）
+```
+
+完整用途、运行机器、写入边界与兼容命令见
+[程序与脚本索引](docs/project-layout.md)。所有命令在仓库根目录执行：
+
+```bash
+python -m tools --help
+python -m tools library --help
+python scripts/run_tests.py --group python
 ```
 
 ---
@@ -251,11 +305,13 @@ pip install -r requirements-ml.txt
 python -m backend.main
 ```
 
-浏览器打开 <http://127.0.0.1:8000> ，粘贴视频链接，点击「开始制作」。
+浏览器打开 <http://127.0.0.1:8000>，点击右上角「后台」（或打开 `/admin`），
+粘贴视频链接后点击「开始制作」。处理完成后回到曲库点歌。
+日常操作、录音保存和排查步骤见[使用说明书](docs/user-guide.md)。
 
 ### 批量导入播放列表
 
-粘贴歌单链接后点「🎵 导入歌单」，会先列出整个列表让你挑，确认后一次性排队：
+在「后台」粘贴歌单链接后点「歌单」，会先列出列表让你挑选，再点「导入选中」排队：
 
 - **不会白干**：曲库里已有的、正在排队的、已失效的、以及超过
   `OPENK_MAX_SONG_SECONDS` 的长视频，都在**下载之前**就标出来并默认不勾选；
@@ -336,8 +392,8 @@ docker run -d --name openk -p 8000:8000 \
 归成一组（繁简、大小写、空格标点都会先归一），每组只留一版：
 
 ```bash
-python tools/dedupe.py            # 试运行，只打报告不动数据
-python tools/dedupe.py --apply    # 真的删
+python -m tools library dedupe            # 预览，不删任务；可能更新音质缓存
+python -m tools library dedupe --apply    # 通过在线 API 删除淘汰任务
 ```
 
 **为什么不比文件大小或码率？** 分离出来的 stem 一律按固定码率重编码——同一个任务的
@@ -362,15 +418,21 @@ python tools/dedupe.py --apply    # 真的删
 
 > 媒体目录通常是 `:ro` 挂载的，这个工具要往里写 `_重复/`，得在一个可写的容器里跑。
 > 移不动源文件时它会**放弃删除这一首**——否则任务没了、文件还在，下次扫描又导回来。
+> 如果任一版本的伴奏缺失或音质无法评估，整组保留，不在信息不全时决定删除。
+> 设置 `OPENK_API`、`OPENK_DATA_DIR`，以及需要时的 `OPENK_JOBS_DIR`，
+> 让此工具访问对应服务及其本地挂载；音轨路径使用任务登记值，支持嵌套发布结果。
 
 ### 先体验界面（无需 ML 依赖）
 
 ```bash
-python scripts/seed_demo.py     # 生成一首合成演示曲
+python -m tools demo seed      # 生成两首合成演示曲；已有同 ID 目录不会覆盖
 ./run.sh
 ```
 
-在页面左侧「我的曲库」打开 **openk 演示曲**，即可体验播放器、逐字高亮与导唱人声音量。
+在「我的曲库」打开 **一起唱首歌** 或 **星光练习曲**，即可体验播放器、逐字高亮与音轨混合。
+这里只生成合成音调和原创歌词，不下载音乐；请在演示环境启动服务之前运行。
+`python -m tools demo seed /tmp/openk-demo` 可生成到独立工作区，启动时同样设置
+`OPENK_DATA_DIR=/tmp/openk-demo`；公开截图样本可加 `--showcase`。
 
 ---
 
@@ -448,10 +510,13 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 **1. 生成自签证书**（把地址换成你自己的）：
 
 ```bash
-python -m scripts.make_cert 192.0.2.10 nas.example localhost 127.0.0.1
+python -m pip install cryptography
+export OPENK_CERTS_DIR="$PWD/data/certs"
+python -m tools setup cert 192.0.2.10 nas.example localhost 127.0.0.1
 ```
 
-证书写到 `OPENK_CERTS_DIR`（默认 `<data>/certs`）。
+上例显式指定证书目录；不设置时默认写入 `<OPENK_DATA_DIR>/certs`。
+命令会生成或覆盖该目录里的 `openk.crt` / `openk.key`，重做证书前请保留旧文件。
 
 > 证书的 SAN 里**必须包含你实际访问用的那个 IP**。只写域名的话，
 > 用 IP 访问时即使点了「继续前往」，浏览器仍然不认为是安全上下文，麦克风照样打不开。
@@ -460,8 +525,8 @@ python -m scripts.make_cert 192.0.2.10 nas.example localhost 127.0.0.1
 
 ```bash
 export OPENK_HOST=0.0.0.0
-export OPENK_SSL_CERTFILE=~/.openk/certs/openk.crt
-export OPENK_SSL_KEYFILE=~/.openk/certs/openk.key
+export OPENK_SSL_CERTFILE="$OPENK_CERTS_DIR/openk.crt"
+export OPENK_SSL_KEYFILE="$OPENK_CERTS_DIR/openk.key"
 python -m backend.main
 ```
 
@@ -490,11 +555,15 @@ python -m backend.main
   校正范围和灵敏度可用 `OPENK_LYRICS_OFFSET_*` 调整，设 `OPENK_LYRICS_OFFSET_AUTO=false` 可完全关闭。
 - **歌词只有整行高亮、没有逐字**：whisperX 逐词对齐依赖 NLTK 的 `punkt_tab` 资源，首次运行需联网下载；
   macOS 自带 Python 常因缺根证书报 `SSL: CERTIFICATE_VERIFY_FAILED`，程序已用 certifi 证书自动补齐（`_ensure_nltk_punkt`）。
-  若此前已生成为整行歌词的旧任务，可就地升级为逐字（复用已分离人声，无需重下/重分离）：
+  优先使用在线界面的「搜歌词、重对齐」，由运行中的 worker 处理。
+  如需离线升级已有逐行歌词，可复用已分离人声，无需重下/重分离：
   ```bash
-  python -m scripts.upgrade_word_align <job_id>   # job_id 见曲库项或 data/jobs/ 目录
+  python -m tools lyrics align JOB_ID           # 先预览，JOB_ID 为 12 位十六进制 ID
+  # 停止 API / worker，在具备 ML 依赖且可读写共享任务目录的机器执行：
+  python -m tools lyrics align JOB_ID --apply --offline
   ```
-  升级后在浏览器刷新即可看到逐字高亮。
+  此命令强制本机推理，不向离线进程私有队列派单；维护后重启服务加载结果。
+  原音轨和歌词保留，新 JSON / LRC 作为完整文件组发布。
 - **遇到 `HTTP 403 Forbidden` / 拿不到音频**：最常见原因是缺少 JS runtime。请确认已 `brew install deno`，且 yt-dlp 为 nightly（`pip install -U --pre "yt-dlp[default]"`）。
 - **遇到 `HTTP 429` 或「Sign in to confirm you're not a bot」**：这是 YouTube 对频繁请求的限流。
   字幕抓取失败不会影响主流程（仍可用 LRCLIB）；若音频也无法下载，请配置 cookies：

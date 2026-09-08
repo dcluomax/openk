@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """给歌词太少的歌重新取一次歌词，取不到的标记成「无歌词」不再重试。
 
-    python -m tools.refetch_lyrics              # 试运行，只报告
-    python -m tools.refetch_lyrics --apply      # 写盘
+    python -m tools lyrics refetch              # 试运行，只报告
+    python -m tools lyrics refetch --apply      # 离线写盘
+
+写入前停止 API 与 worker，维护后重启服务重新加载元数据；预览也会查询 LRCLIB。
 
 为什么会有一批歌只有零星几行：取歌词是按「歌手 - 歌名」查歌词库的，
 而这些歌当初入库时名字还是 ``似是故人來 梅艷芳 Karaoke MP4_AAC Stereo``

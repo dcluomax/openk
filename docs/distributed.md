@@ -409,7 +409,7 @@ curl -s http://<服务端>:8000/api/worker/status
 
 ### 参数化容器模板
 
-[`deploy-openk.sh.example`](../deploy-openk.sh.example) 不包含实际 NAS 路径或固定账户编号。
+[`deploy/deploy-openk.sh.example`](../deploy/deploy-openk.sh.example) 不包含实际 NAS 路径或固定账户编号。
 使用前设置 `OPENK_HOST_DATA_DIR`、`OPENK_HOST_MEDIA_DIR`、`OPENK_HOST_LIBRARY_DIR`，
 并确保目录对 `OPENK_RUN_UID` / `OPENK_RUN_GID` 指定的容器用户可读写；媒体库只读挂载。
 需要额外媒体组时设置 `OPENK_MEDIA_GID`。
@@ -520,15 +520,19 @@ WireGuard / Tailscale，或在前面放个 TLS 反代——不要直接把这些
 
 ## 自测
 
+测试按 `tests/python/`、`tests/frontend/`、`tests/browser/` 分类，
+统一运行器负责隔离数据和依赖检查。完整命令及维护脚本见
+[程序与脚本索引](project-layout.md)。
+
 ```bash
-python test_remote.py
+python scripts/run_tests.py test_remote.py
 ```
 
 覆盖：任务往返、类型过滤、**worker 离线时排队而非失败**、状态上报、
 **租约到期自动重排**、路径映射边界、HTTP 层鉴权与全链路。
 
 ```bash
-python test_lyrics.py
+python scripts/run_tests.py test_lyrics.py
 ```
 
 覆盖歌词时间轴校正：能否找回已知偏移、**时间轴本来就准时不乱动**、
@@ -536,7 +540,7 @@ python test_lyrics.py
 输入异常时安全退化。用合成音频，不需要 torch / whisperX。
 
 ```bash
-python test_config.py
+python scripts/run_tests.py test_config.py
 ```
 
 覆盖存储路径的可配置性：**不设环境变量时行为与以前完全一致**、
@@ -544,7 +548,7 @@ python test_config.py
 用户已有的 `HF_HOME` 会不会被覆盖。
 
 ```bash
-python test_playlist.py
+python scripts/run_tests.py test_playlist.py
 ```
 
 覆盖播放列表批量导入：链接解析、**同一歌单导入两次不会重复排队**（幂等）、
@@ -553,7 +557,7 @@ python test_playlist.py
 用假的 yt-dlp 作答，不联网、也不需要装 yt-dlp。
 
 ```bash
-python test_local_media.py
+python scripts/run_tests.py test_local_media.py
 ```
 
 覆盖本地媒体导入，重点在**安全边界**：未配置白名单时功能是否真的关着（404 而非 403）、
@@ -562,7 +566,7 @@ python test_local_media.py
 以及**重启续跑**：queued/running 的任务重启后回到 queued 而不是 error，并且只会被重排一次。
 
 ```bash
-python test_meta.py
+python scripts/run_tests.py test_meta.py
 ```
 
 覆盖标题 →（歌手, 歌名）的拆分规则。点歌台按歌手浏览、按拼音首字母检索都靠这一层，
@@ -570,14 +574,14 @@ python test_meta.py
 （破折号、书名号前后、KTV 编号碟、官方 MV 后缀、罗马音混排）。
 
 ```bash
-python test_retry.py
+python scripts/run_tests.py test_retry.py
 ```
 
 覆盖 ML 步骤的瞬时崩溃重试。重点是**不该重试的别重试**：依赖没装、路径不对这类错误
 必须立刻抛出，否则真正的配置问题会被拖到几分钟后才报出来。
 
 ```bash
-node test_frontend.js       # 需要先 npm install jsdom，没装会自动跳过
+python scripts/run_tests.py --group frontend test_frontend.js  # 先 npm install --ignore-scripts
 ```
 
 前端没有构建步骤，也就没有编译期检查。这个冒烟测试用 jsdom 把 `index.html` + `app.js`

@@ -3,31 +3,42 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="theme-color" content="#10101c" />
+  <meta name="theme-color" content="#101416" />
   <title>openk · 点歌台</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-note" viewBox="0 0 24 24"><path d="M9 17V5l11-2v12M9 9l11-2"/><ellipse cx="6" cy="17" rx="3" ry="2.5"/><ellipse cx="17" cy="15" rx="3" ry="2.5"/></symbol>
+    <symbol id="icon-tv" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="3"/><path d="M8 21h8m-4-4v4"/></symbol>
+    <symbol id="icon-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4m-3 14h2"/></symbol>
+    <symbol id="icon-queue" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h8m6-3v6m-3-3h6"/></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></symbol>
+  </svg>
   <div class="app">
     <!-- 顶部栏：搜索是点歌台最高频的操作，所以常驻在最显眼的位置 -->
     <header class="topbar">
       <button class="brand" id="homeBtn" title="回到点歌台" type="button">
-        <span class="logo" aria-hidden="true">♫</span>
+        <span class="logo" aria-hidden="true"><svg class="ui-icon"><use href="#icon-note"/></svg></span>
         <span class="brand-name">openk<span class="brand-caption">你的私人点歌台</span></span>
       </button>
       <div class="search-wrap">
         <input id="search" class="search-box" type="text"
-               placeholder="歌名 / 歌手 / 全拼 / 首字母，可组合" aria-label="搜索歌曲或歌手" autocomplete="off" />
+               placeholder="搜索歌名、歌手，也支持拼音" aria-label="搜索歌曲或歌手" autocomplete="off" />
         <button id="searchClear" class="s-clear hidden" title="清空" aria-label="清空搜索">✕</button>
       </div>
       <div class="top-actions">
-        <a class="top-link" href="/tv" target="_blank" rel="noopener" title="在新窗口打开演唱大屏">大屏 ↗</a>
-        <a class="top-link" href="/remote" target="_blank" rel="noopener" title="在新窗口打开遥控点歌">遥控 ↗</a>
-        <button id="queueBtn" class="top-btn" title="已点歌曲">
-          📋 已点 <span id="queueCount" class="pill">0</span>
+        <a class="top-link" href="/tv" target="_blank" rel="noopener" title="在新窗口打开演唱大屏" aria-label="打开演唱大屏">
+          <svg class="ui-icon" aria-hidden="true"><use href="#icon-tv"/></svg><span class="action-label">大屏</span>
+        </a>
+        <a class="top-link" href="/remote" target="_blank" rel="noopener" title="在新窗口打开遥控点歌" aria-label="打开手机点歌">
+          <svg class="ui-icon" aria-hidden="true"><use href="#icon-phone"/></svg><span class="action-label">遥控</span>
+        </a>
+        <button id="queueBtn" class="top-btn queue-button" title="已点歌曲">
+          <svg class="ui-icon" aria-hidden="true"><use href="#icon-queue"/></svg>已点 <span id="queueCount" class="pill">0</span>
         </button>
-        <button id="adminBtn" class="top-btn" title="导入与处理进度（后台）">
-          ⚙️ 后台 <span id="adminBadge" class="pill busy hidden">0</span>
+        <button id="adminBtn" class="top-btn" title="导入与处理进度（后台）" aria-label="打开后台管理">
+          <svg class="ui-icon" aria-hidden="true"><use href="#icon-settings"/></svg><span class="action-label">后台</span> <span id="adminBadge" class="pill busy hidden">0</span>
         </button>
       </div>
     </header>
@@ -42,27 +53,43 @@
 
     <!-- 点歌台：已完成的歌按 KTV 节目单的方式陈列 -->
     <section id="browse" class="browse">
-      <nav class="tabs" aria-label="曲库分类">
-        <button class="tab active" data-tab="all" aria-pressed="true">全部</button>
-        <button class="tab" data-tab="artist" aria-pressed="false">歌手</button>
-        <button class="tab" data-tab="new" aria-pressed="false">最新</button>
-        <span class="tab-spacer"></span>
-        <span id="browseCount" class="muted small"></span>
-        <button id="viewToggle" class="view-toggle" title="在文字列表和封面墙之间切换">🖼 大图</button>
-      </nav>
+      <div class="browse-intro">
+        <div class="intro-copy">
+          <p class="eyebrow">YOUR PERSONAL STAGE</p>
+          <h2>好歌在这里，<span>现在就开唱。</span></h2>
+          <p class="intro-description">找一首喜欢的歌，让客厅成为你的舞台。</p>
+        </div>
+        <div class="intro-art" aria-hidden="true">
+          <div class="record-sleeve"><span>openk<br/>SIDE A</span></div>
+          <div class="vinyl-record"><span><svg class="ui-icon"><use href="#icon-note"/></svg></span></div>
+          <span class="record-caption">MADE FOR YOUR VOICE</span>
+        </div>
+      </div>
 
-      <div id="langBar" class="lang-bar" aria-label="语种筛选"></div>
-
-      <ul id="songList" class="song-list"></ul>
-      <div id="grid" class="song-grid hidden" role="list"></div>
-      <div id="artistList" class="artist-list hidden"></div>
-      <p id="browseEmpty" class="empty hidden"></p>
+      <div class="library-panel">
+        <div class="library-heading">
+          <div class="library-title"><h2>我的曲库</h2><span id="browseCount" class="muted small"></span></div>
+          <nav class="tabs" aria-label="曲库分类">
+            <button class="tab active" data-tab="all" aria-pressed="true">全部</button>
+            <button class="tab" data-tab="artist" aria-pressed="false">歌手</button>
+            <button class="tab" data-tab="new" aria-pressed="false">最新</button>
+          </nav>
+        </div>
+        <div class="library-toolbar">
+          <div id="langBar" class="lang-bar" aria-label="语种筛选"></div>
+          <button id="viewToggle" class="view-toggle" title="在文字列表和封面墙之间切换">封面视图</button>
+        </div>
+        <ul id="songList" class="song-list"></ul>
+        <div id="grid" class="song-grid hidden" role="list"></div>
+        <div id="artistList" class="artist-list hidden"></div>
+        <p id="browseEmpty" class="empty hidden"></p>
+      </div>
     </section>
 
     <!-- 演唱页 -->
     <section id="stage" class="stage hidden">
       <button id="backBtn" class="back-btn">‹ 返回点歌台</button>
-<div id="player" class="player hidden">
+      <div id="player" class="player hidden">
         <div class="player-head">
           <div class="ph-left">
             <h3 id="playerTitle"></h3>

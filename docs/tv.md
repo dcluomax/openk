@@ -2,6 +2,7 @@
 
 OpenK 保留经典单机点歌台，并增加共享房间。新界面不改变媒体存储位置：
 歌曲、伴奏、歌词和录音仍在服务端；电视流式播放，手机只负责控制。
+经典入口的搜索、混音和录唱步骤见[使用说明书](user-guide.md)。
 
 | 入口 | 用途 |
 | --- | --- |
@@ -77,7 +78,9 @@ npm install --ignore-scripts
 python scripts/run_tests.py
 ```
 
-运行所有根目录 `test_*.py` 和 `test_*.js`。测试任务目录与真实曲库隔离；
+运行 `tests/python/`、`tests/frontend/` 和 `tests/browser/` 下的全部套件。
+可用 `--group python|frontend|browser` 或测试文件名选择范围；未知名称会报错。
+测试任务目录与真实曲库隔离；
 浏览器用标准库生成的合成音轨，不下载音乐、不执行模型推理。
 
 真实浏览器回归使用已安装 Chrome 的 DevTools 协议，无额外自动化框架。
@@ -91,6 +94,7 @@ python scripts/run_tests.py
 
 浏览器回归涵盖 TV 建房、手机配对点歌、双轨播放、暂停、原唱切换、
 自动接歌、手机刷新与断线重连，以及遥控器焦点、手机和平板布局。
+经典点歌台覆盖 320–1440px 的列表布局、窄屏封面视图与核心控件触摸尺寸。
 录唱回归通过原生合成 `MediaStream` 驱动真实 Web Audio 混音和 `MediaRecorder`，
 覆盖切歌后的录音归属与上传，不打开机器的真实麦克风。麦克风授权拒绝与超时由
 状态回归覆盖；物理设备的权限、驱动和输入延迟仍需实机确认。
@@ -101,12 +105,12 @@ python scripts/run_tests.py
 重拍文档使用的虚构展示场景：
 
 ```bash
-mkdir -p .test-artifacts/screenshots/runtime
-TMPDIR="$PWD/.test-artifacts/screenshots/runtime" \
-OPENK_TEST_PYTHON=.venv/bin/python \
-OPENK_TEST_ARTIFACTS=.test-artifacts/screenshots/images \
-node test_browser.js
+OPENK_TEST_ARTIFACTS="$PWD/.test-artifacts/screenshots/images" \
+.venv/bin/python scripts/run_tests.py --group browser
 ```
+
+对应实现位于 `tests/browser/test_browser.js`；演示素材由 `tools/demo.py` 统一生成。
+公开图片清单和复制步骤见[截图生成说明](screenshots/README.md)，不要提交失败诊断图或配对码。
 
 Fire TV 实机还应覆盖：从电视实际地址加载、声音解锁、两轨缓冲与切换、
 连续播放、遥控器返回行为、休眠唤醒和外部音响延迟。自动化不替代这些设备差异。

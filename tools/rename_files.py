@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """按校正后的「歌手 - 歌名」重命名本地源文件。
 
-    python -m tools.rename_files            # 试运行
-    python -m tools.rename_files --apply    # 真的改名
+    python -m tools library rename            # 试运行
+    python -m tools library rename --apply    # 离线改名
 
-会同步更新 status.json 里的 local_path，所以改完点歌台照常能播。
+会同步更新 status.json 里的 local_path。写入前停止 API 与 worker，
+维护后重启服务重新加载元数据。
 
 保留原文件名里的 ``[videoID]`` 后缀：曲库里有好几首同名不同版本的歌
 （三个《沒那麼簡單》），去掉 ID 就会互相覆盖——那是不可逆的数据丢失。
