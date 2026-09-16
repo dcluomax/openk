@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenK · 设备设置</title>
+<link rel="stylesheet" href="/stage.css">
+<link rel="stylesheet" href="/account.css">
+<link rel="stylesheet" href="/devices.css">
+<script defer src="/room-client.js"></script>
+<script defer src="/account.js"></script>
+<script defer src="/user-state.js"></script>
+<script defer src="/devices.js"></script>
+</head>
+<body class="settings-page">
+<a class="skip-link" href="#main">跳到主要内容</a>
+<header class="settings-header">
+  <a class="back-link" href="/">← OpenK</a>
+  <h1>设备设置</h1>
+  <div id="accountChip" class="account-chip" hidden></div>
+</header>
+
+<main id="main" class="settings-main">
+  <nav class="settings-nav" aria-label="账号页面">
+    <a href="/devices" aria-current="page">设备设置</a>
+    <a href="/history">播放历史</a>
+  </nav>
+  <p id="pageStatus" class="page-status" role="status"></p>
+
+  <section class="card" aria-labelledby="topologyTitle">
+    <h2 id="topologyTitle">在哪台设备上播放</h2>
+    <p class="muted">
+      设置同时跟着人和这台机器走：账号保存下面这些通用偏好，每个浏览器保存自己那份
+      与硬件有关的覆盖项。选定首选播放器，就是告诉 OpenK 一首歌该从哪台设备开始唱。
+      浏览器只有在有人打开 OpenK 并亲手启用之后才会出声，所以这个选择只是引导播放，
+      不会自己打开另一台设备的喇叭。
+    </p>
+    <div id="topology" class="topology" role="img" aria-label="你的设备连接示意图"></div>
+    <p id="topologyText" class="visually-hidden"></p>
+    <div class="row">
+      <label for="preferredPlayer">首选播放器</label>
+      <select id="preferredPlayer">
+        <option value="">不指定 · 在哪台设备启用就在哪台唱</option>
+      </select>
+    </div>
+    <p id="topologyHint" class="hint"></p>
+    <p class="muted small">
+      麦克风只属于采集它的那台设备。OpenK 不会把手机麦克风的声音传到电视上，所以
+      「本机麦克风」这个角色只表示那台设备能采集它自己听得到的声音。
+    </p>
+  </section>
+
+  <section class="card" aria-labelledby="defaultsTitle">
+    <h2 id="defaultsTitle">账号默认设置</h2>
+    <p class="muted">这些设置跟着账号走，在你登录的每台设备上都生效。</p>
+    <form id="defaultsForm" class="settings-form">
+      <div class="row">
+        <label for="d_sing_mode">默认演唱模式</label>
+        <select id="d_sing_mode" data-key="sing_mode">
+          <option value="inst">伴唱</option>
+          <option value="orig">原唱</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="d_reverb">混响</label>
+        <select id="d_reverb" data-key="reverb">
+          <option value="none">干声</option>
+          <option value="room">小房间</option>
+          <option value="ktv">KTV</option>
+          <option value="hall">大厅</option>
+          <option value="church">教堂</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="d_view">曲库视图</label>
+        <select id="d_view" data-key="view">
+          <option value="list">列表视图</option>
+          <option value="grid">封面视图</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="d_accompaniment_volume">伴奏音量</label>
+        <input id="d_accompaniment_volume" type="range" min="0" max="100" step="1" data-key="accompaniment_volume">
+        <output data-out="accompaniment_volume">100%</output>
+      </div>
+      <div class="row">
+        <label for="d_guide_volume">导唱人声音量</label>
+        <input id="d_guide_volume" type="range" min="0" max="100" step="1" data-key="guide_volume">
+        <output data-out="guide_volume">0%</output>
+      </div>
+      <div class="row">
+        <label for="d_mic_volume">麦克风音量</label>
+        <input id="d_mic_volume" type="range" min="0" max="200" step="1" data-key="mic_volume">
+        <output data-out="mic_volume">110%</output>
+      </div>
+      <div class="row check">
+        <input id="d_mic_monitor" type="checkbox" data-key="mic_monitor">
+        <label for="d_mic_monitor">默认开启麦克风外放</label>
+      </div>
+      <div class="row check">
+        <input id="d_howl_guard" type="checkbox" data-key="howl_guard">
+        <label for="d_howl_guard">保持防啸叫开启</label>
+      </div>
+    </form>
+    <p class="muted small">
+      存下来的偏好本身不会打开麦克风，也不会自己开始播放：浏览器仍然会询问授权，
+      出声仍然需要一次真实的点击或按键。
+    </p>
+  </section>
+
+  <section class="card" aria-labelledby="deviceTitle">
+    <h2 id="deviceTitle">这台设备</h2>
+    <p id="deviceSummary" class="muted"></p>
+    <div class="row">
+      <label for="deviceLabel">名称</label>
+      <input id="deviceLabel" type="text" maxlength="40" autocomplete="off" spellcheck="false"
+             placeholder="例如：客厅电视">
+      <button id="saveLabel" type="button">重命名</button>
+    </div>
+    <fieldset class="roles">
+      <legend>角色</legend>
+      <label><input type="checkbox" data-role="player"> 播放器（负责出声）</label>
+      <label><input type="checkbox" data-role="controller"> 遥控器（点歌）</label>
+      <label><input type="checkbox" data-role="microphone"> 麦克风（仅本机）</label>
+    </fieldset>
+    <form id="overridesForm" class="settings-form">
+      <p class="muted">勾选后，只在这个浏览器上覆盖账号默认值。</p>
+      <div class="row">
+        <label class="toggle"><input type="checkbox" data-override="mic_volume"><span>覆盖</span></label>
+        <label for="o_mic_volume">麦克风音量</label>
+        <input id="o_mic_volume" type="range" min="0" max="200" step="1" data-key="mic_volume">
+        <output data-out="mic_volume">110%</output>
+      </div>
+      <div class="row">
+        <label class="toggle"><input type="checkbox" data-override="output_volume"><span>覆盖</span></label>
+        <label for="o_output_volume">本机输出音量</label>
+        <input id="o_output_volume" type="range" min="0" max="100" step="1" data-key="output_volume">
+        <output data-out="output_volume">100%</output>
+      </div>
+      <div class="row check">
+        <label class="toggle"><input type="checkbox" data-override="mic_monitor"><span>覆盖</span></label>
+        <input id="o_mic_monitor" type="checkbox" data-key="mic_monitor">
+        <label for="o_mic_monitor">麦克风外放</label>
+      </div>
+      <div class="row check">
+        <label class="toggle"><input type="checkbox" data-override="howl_guard"><span>覆盖</span></label>
+        <input id="o_howl_guard" type="checkbox" data-key="howl_guard">
+        <label for="o_howl_guard">防啸叫</label>
+      </div>
+      <div class="row">
+        <label class="toggle"><input type="checkbox" data-override="audio_input"><span>覆盖</span></label>
+        <label for="o_audio_input">麦克风设备</label>
+        <select id="o_audio_input" data-key="audio_input" aria-label="麦克风输入设备"></select>
+      </div>
+      <div class="row">
+        <label class="toggle"><input type="checkbox" data-override="audio_output"><span>覆盖</span></label>
+        <label for="o_audio_output">扬声器设备</label>
+        <select id="o_audio_output" data-key="audio_output" aria-label="音频输出设备"></select>
+      </div>
+    </form>
+    <p id="mediaHint" class="hint"></p>
+    <div class="actions">
+      <button id="clearOverrides" type="button">这台设备改用账号默认设置</button>
+      <button id="importLocal" type="button" hidden>导入这个浏览器保存的设置</button>
+    </div>
+    <p class="muted small">
+      麦克风和扬声器的编号由这个浏览器为本站生成，不会复制到别的设备上——
+      同一套硬件在别处的编号并不一样。
+    </p>
+  </section>
+
+  <section class="card" aria-labelledby="listTitle">
+    <h2 id="listTitle">已注册的设备</h2>
+    <p class="muted">只有你能看到或修改它们。设备编号只代表一次浏览器安装，
+      没有登录就什么也代表不了。</p>
+    <ul id="deviceList" class="device-list"></ul>
+  </section>
+</main>
+</body>
+</html>

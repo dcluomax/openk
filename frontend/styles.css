@@ -1,6 +1,6 @@
 :root {
   color-scheme: dark;
-  --bg: #101416;
+  --bg: #10161d;
   --bg-soft: #161c1f;
   --card: #1b2326;
   --card-2: #273336;
@@ -43,9 +43,14 @@ body { min-height: 100vh; background: radial-gradient(ellipse 900px 420px at 15%
 
 /* 顶部 */
 .topbar {
-  display: flex; align-items: center; gap: 16px;
-  margin-bottom: 30px;
+  display: grid; grid-template-columns: auto minmax(160px, 1fr) auto auto;
+  grid-template-areas: "brand search actions account"; align-items: center; gap: 16px;
+  margin-bottom: 24px;
 }
+.topbar .brand { grid-area: brand; }
+.topbar .search-wrap { grid-area: search; }
+.topbar .top-actions { grid-area: actions; }
+.topbar .account-chip { grid-area: account; }
 .brand {
   display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 0 0 auto;
   border: 0; padding: 0; min-height: 46px; background: none; color: var(--text); text-align: left;
@@ -98,6 +103,15 @@ body { min-height: 100vh; background: radial-gradient(ellipse 900px 420px at 15%
 .top-link { display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); text-decoration: none; font-size: 13px; padding: 10px 8px; min-width: 44px; min-height: 46px; border-radius: 10px; align-self: center; white-space: nowrap; }
 .top-link:hover { color: var(--accent-2); background: var(--card); }
 
+.room-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 14px 18px; margin-bottom: 20px; border: 1px solid #395049; border-radius: 16px; background: #1c2d2a; }
+.room-summary[hidden] { display: none; }
+.room-summary-copy { display: grid; gap: 5px; flex: 1; min-width: 0; }
+.room-summary-copy a { color: var(--text); text-decoration: none; min-width: 0; }
+.room-summary-copy strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-summary-copy span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.room-summary > button { flex: 0 0 auto; }
+body.account-mode .browse-intro { display: none; }
+
 .browse-intro {
   position: relative; display: flex; align-items: center; justify-content: space-between;
   min-height: 166px; padding: 26px 32px; margin-bottom: 26px;
@@ -132,6 +146,8 @@ body { min-height: 100vh; background: radial-gradient(ellipse 900px 420px at 15%
 .library-title h2 { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -.5px; }
 .library-title .small { overflow-wrap: anywhere; }
 .library-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.sr-name .catalog-plays { margin-left: 6px; }
+.sc-body > .catalog-plays { display: block; margin-top: 5px; }
 
 /* 卡片 */
 .card {
@@ -296,6 +312,25 @@ select {
 .drawer-head > strong { font-size: 19px; font-weight: 600; }
 .drawer-open { overflow: hidden; }
 .drawer-spacer { flex: 1; }
+.drawer.remote-qr-dialog {
+  top: 50%; right: auto; bottom: auto; left: 50%; transform: translate(-50%, -50%);
+  width: min(420px, calc(100vw - 28px)); max-height: calc(100vh - 28px);
+  max-height: calc(100dvh - 28px); border: 1px solid var(--line); border-radius: 20px;
+  box-shadow: var(--shadow);
+}
+.remote-qr-dialog .drawer-head { margin-bottom: 16px; }
+.remote-qr-dialog .lyr-btn { min-height: 44px; }
+.remote-qr-code {
+  width: min(260px, 100%); margin: 0 auto 16px; background: #fff; color: #111;
+  border-radius: 12px; overflow: hidden; text-align: center;
+}
+.remote-qr-code svg { display: block; width: 100%; height: auto; }
+#remoteQRHint { line-height: 1.6; }
+.remote-qr-open { display: flex; align-items: center; justify-content: center; text-decoration: none; }
+.remote-qr-address { text-align: center; overflow-wrap: anywhere; margin-bottom: 0; }
+@media (max-height: 680px) {
+  .remote-qr-code { width: min(210px, 100%); }
+}
 .admin-sec { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
 .admin-sec:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
 .admin-sec h4 { margin: 0 0 10px; font-size: 14px; }
@@ -322,6 +357,8 @@ select {
 .p-pct { font-size: 12px; color: var(--muted); flex: 0 0 auto; }
 .proc-item.error { border-color: var(--bad); }
 .proc-item.running { border-color: var(--warn); }
+.proc-item .lyr-btn { flex: 0 0 auto; min-width: 44px; min-height: 44px; }
+.proc-delete { color: var(--bad); }
 
 /* ---------------- 提示气泡 ---------------- */
 .toast {
@@ -438,7 +475,7 @@ select {
 }
 
 /* 歌词编辑 */
-.lyrics-tools { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 4px 2px 0; min-height: 28px; }
+.lyrics-tools { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 4px 2px 0; min-height: 28px; flex-wrap: wrap; }
 .lyr-btn {
   background: var(--card-2); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; padding: 8px 12px; min-height: 40px; cursor: pointer; font-size: 13px;
@@ -446,12 +483,58 @@ select {
 .lyr-btn:hover { border-color: var(--accent); }
 .lyr-btn.primary { background: var(--accent-grad); border-color: transparent; color: var(--ink); }
 .edit-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.player.is-editing .lyrics-tools {
+  position: sticky; top: 0; z-index: 4; padding: 8px 0;
+  background: var(--bg-soft); border-bottom: 1px solid var(--line);
+}
 .lyric-edit {
   display: block; width: 100%; margin: 3px 0; padding: 6px 10px; box-sizing: border-box;
   background: var(--card-2); border: 1px solid var(--line); border-radius: 8px;
   color: var(--text); font-size: 16px; text-align: center;
 }
 .lyric-edit:focus { outline: none; border-color: var(--accent); }
+.lyric-timing-tools {
+  margin-top: 10px; padding: 12px; min-width: 0;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card-2);
+  scroll-margin-top: 72px;
+}
+.lyric-timing-help { margin: 0 0 10px; line-height: 1.6; }
+.lyric-offset-bar { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px; }
+.lyric-offset-bar label { display: grid; gap: 5px; font-size: 12px; }
+.lyric-offset-bar input { width: 110px; }
+.lyric-offset-bar input, .lyric-time-input {
+  min-width: 0; min-height: 44px; padding: 8px; box-sizing: border-box;
+  color: var(--text); background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; font-size: 16px; font-variant-numeric: tabular-nums;
+}
+.lyric-timing-tools .lyr-btn, .lyric-edit-row .lyr-btn { min-height: 44px; }
+.lyric-timing-tools .small { margin-top: 8px; margin-bottom: 0; overflow-wrap: anywhere; }
+.lyric-edit-transport { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.lyric-edit-transport .seek { min-width: 100px; flex: 1 1 180px; }
+.lyric-edit-transport .time { min-width: 0; width: auto; }
+.lyric-timing-notice { min-height: 1.5em; color: var(--accent); }
+.lyric-timing-notice.error { color: var(--bad); }
+.lyrics.is-editing { mask-image: none; -webkit-mask-image: none; padding: 8px 0; min-height: 220px; max-height: 58vh; }
+.lyric-edit-row {
+  min-width: 0; margin-bottom: 10px; padding: 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+}
+.lyric-edit-row.is-current { border-color: var(--accent); }
+.lyric-edit-row:focus-within { box-shadow: inset 3px 0 var(--accent-2); }
+.lyric-edit-label { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+.lyric-edit-row .lyric-edit { min-height: 44px; margin: 0 0 10px; text-align: left; }
+.lyric-time-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.lyric-time-fields label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+.lyric-time-input { width: 100%; }
+.lyric-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.lyric-time-input[aria-invalid="true"] { border-color: var(--bad); }
+@media (max-width: 600px) {
+  .edit-bar > .muted { display: none; }
+}
+@media (max-width: 380px) {
+  .lyric-time-fields { grid-template-columns: minmax(0, 1fr); }
+  .lyric-edit-actions .lyr-btn { flex: 1 1 84px; }
+}
 
 /* 搜歌词重对齐 */
 .lyric-search {
@@ -700,12 +783,24 @@ body.has-nowbar .app { padding-bottom: calc(var(--nowbar-height) + 28px); }
 .nb-btn:hover { border-color: var(--accent); }
 .nb-btn.strong { background: var(--accent-grad); border-color: transparent; color: var(--ink); font-weight: 600; }
 
+@media (max-width: 1100px) {
+  .topbar { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "brand account" "search actions"; gap: 14px; }
+  .search-wrap { min-width: 0; }
+  .top-actions { min-width: 0; gap: 6px; }
+}
+@media (max-width: 700px) {
+  .topbar { grid-template-areas: "brand account" "search search" "actions actions"; gap: 12px; }
+  .top-actions { justify-content: space-between; flex-wrap: wrap; }
+  .top-actions > * { flex: 1 1 auto; }
+  .topbar .top-link .action-label { display: inline; }
+  body.account-mode .browse-intro { min-height: 0; padding: 16px 18px; }
+  body.account-mode .browse-intro .eyebrow { display: none; }
+  body.account-mode .intro-copy h2 { font-size: 22px; }
+  body.account-mode .intro-description { margin-top: 6px; }
+}
 @media (max-width: 760px) {
   .app { padding: 18px 14px 40px; }
-  .topbar { gap: 14px 10px; flex-wrap: wrap; }
-  .search-wrap { order: 3; flex-basis: 100%; min-width: 0; }
   .search-box { font-size: 16px; }
-  .top-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
   .top-btn { padding: 10px; min-height: 44px; }
   .brand-caption { display: none; }
   .browse-intro { padding: 24px; min-height: 158px; margin-bottom: 20px; }
@@ -794,6 +889,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   .library-title { flex-basis: 100%; justify-content: space-between; }
   .tabs { width: 100%; }
   .tab { flex: 1; }
+  .library-panel .tab { padding-inline: 10px; }
   .song-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .song-row { grid-template-columns: 40px minmax(0, 1fr) 62px; grid-template-areas: "artwork name pick" "artwork artist pick"; gap: 0 9px; }
   .sr-artwork { width: 40px; height: 40px; border-radius: 8px; }
@@ -824,6 +920,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   .topbar { gap: 10px 6px; }
   .top-actions { gap: 4px; }
   .top-btn, .top-link { padding-inline: 6px; }
+  .topbar .top-link .action-label { display: none; }
+  .room-summary { padding: 12px; gap: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }

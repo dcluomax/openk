@@ -66,6 +66,8 @@ w.fetch = (u) => Promise.resolve({
   json: async () => {
     const m = String(u).match(/\/api\/jobs\/([\w]+)$/);
     if (m) return jobs.find(j => j.id === m[1]);
+    // 独立部署（没有账号服务）：曲库必须保持原来的本地播放器行为
+    if (String(u).includes('/api/account')) return { enabled:false };
     if (String(u).includes('/recordings')) return [];
     if (String(u).includes('/api/jobs')) return jobs;
     if (String(u).includes('/api/zh-map')) return { '闊':'阔', '權':'权', '夢':'梦', '沒':'没' };
@@ -84,6 +86,9 @@ w.onerror = (m) => errs.push('onerror: ' + m);
 // app.js 是严格模式，indirect eval 下顶层声明不会漏到 window 上，
 // 所以在末尾追一句显式导出，把要单测的几个纯函数取出来。
 w.eval(fs.readFileSync(D + '/search.js', 'utf8'));
+w.eval(fs.readFileSync(D + '/library.js', 'utf8'));
+w.eval(fs.readFileSync(D + '/room-client.js', 'utf8'));
+w.eval(fs.readFileSync(D + '/account.js', 'utf8'));
 w.eval(fs.readFileSync(D + '/app.js', 'utf8')
   + '\n;window.__t = { findHowlPeak, makeHowlTracker, makeNotchBank, howlTick, HOWL };');
 

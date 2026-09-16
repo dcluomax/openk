@@ -27,7 +27,7 @@ log = logging.getLogger("openk.jobs")
 
 
 class JobConflictError(RuntimeError):
-    """An active job already owns this execution."""
+    """An operation conflicts with the job's current lifecycle state."""
 
 
 class JobCancelledError(RuntimeError):
@@ -304,11 +304,14 @@ class JobManager:
         with self._lock:
             self._queues.add(task_queue)
 
-    def cancel(self, job_id: str) -> bool:
+    def cancel(self, job_id: str, *, failed_only: bool = False) -> bool:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return False
+            if failed_only and (job.get("state") not in {"error", "cancelled"}
+                                or job_id in self._executing):
+                raise JobConflictError("任务仍在处理或已完成，只能删除失败或已取消的任务")
             self._jobs[job_id] = {**job, "state": "cancelled", "generation": uuid.uuid4().hex,
                                  "message": "任务已取消", "updated_at": time.time()}
             try:
@@ -323,8 +326,8 @@ class JobManager:
             task_queue.cancel_where(lambda task: task.job_id == job_id)
         return True
 
-    def delete(self, job_id: str) -> bool:
-        if not self.cancel(job_id):
+    def delete(self, job_id: str, *, failed_only: bool = False) -> bool:
+        if not self.cancel(job_id, failed_only=failed_only):
             return False
         with self._lock:
             path = self.job_dir(job_id)

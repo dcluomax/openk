@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenK · 播放历史</title>
+<link rel="stylesheet" href="/stage.css">
+<link rel="stylesheet" href="/account.css">
+<link rel="stylesheet" href="/devices.css">
+<script defer src="/room-client.js"></script>
+<script defer src="/account.js"></script>
+<script defer src="/user-state.js"></script>
+<script defer src="/history.js"></script>
+</head>
+<body class="settings-page">
+<a class="skip-link" href="#main">跳到主要内容</a>
+<header class="settings-header">
+  <a class="back-link" href="/">← OpenK</a>
+  <h1>播放历史</h1>
+  <div id="accountChip" class="account-chip" hidden></div>
+</header>
+
+<main id="main" class="settings-main">
+  <nav class="settings-nav" aria-label="账号页面">
+    <a href="/devices">设备设置</a>
+    <a href="/history" aria-current="page">播放历史</a>
+  </nav>
+  <p id="pageStatus" class="page-status" role="status"></p>
+
+  <section class="card" aria-labelledby="historyTitle">
+    <h2 id="historyTitle">你的设备唱过的歌</h2>
+    <p class="muted">
+      只有当你自己的设备拿到了房间的播放权、而且歌曲真的在往前走时，才会留下一条记录 ——
+      把歌排进队列、按了播放却没响、标签页被浏览器挡住，都不会产生记录。这里的进度是
+      播放端上报的数字，不是对房间里声音的测量。
+    </p>
+    <p class="muted small">
+      只有你能看到这份列表。访客不会留下任何记录，别人的播放也不会出现在这里，
+      记录里不包含录音和文件位置。
+    </p>
+    <p id="historyCount" class="muted small" role="status"></p>
+    <ul id="historyList" class="history-list"></ul>
+    <div class="actions">
+      <button id="loadMore" type="button" hidden>显示更早的记录</button>
+      <button id="clearHistory" class="danger" type="button">清空我的播放历史…</button>
+    </div>
+  </section>
+</main>
+</body>
+</html>

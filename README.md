@@ -3,16 +3,129 @@
 把 yt-dlp 支持的 YouTube / 视频链接变成卡拉OK：**自动分离人声**、**逐字对齐歌词**，
 并提供搜索点歌、同步歌词、混音和录唱。
 
+界面、无障碍标签及操作提示统一使用简体中文；品牌名、歌曲信息、用户自定义名称
+和接口字段保留原文。
+
 [快速安装](#用-docker-运行跨平台最省事) · [使用说明书](docs/user-guide.md) ·
 [电视 / 手机双屏](docs/tv.md) · [NAS + worker 部署](docs/distributed.md) ·
 [程序与脚本索引](docs/project-layout.md) · [版本记录](CHANGELOG.md)
+
+## Overview
+
+OpenK turns a video link into a karaoke track: it downloads the audio, separates
+the accompaniment from the vocals, and produces word-level lyric timing. It then
+serves a browser player, a shared room, a phone remote and a television stage.
+The whole interface is Simplified Chinese; brand names, song metadata,
+user-supplied names and API field names are kept as they are.
+
+What the public source contains:
+
+- **Catalog and search.** Browse by pinyin, by artist or by newest, narrow by
+  language, and expand an **A–Z initial index** (digits and other scripts fall
+  under `#`). Songs, covers and artists are paged **24 items at a time** instead
+  of rendering the whole catalog. Typing a query searches the **full catalog**
+  regardless of the current page, initial or artist, keeping only the language
+  filter. Matching accepts full pinyin, pinyin initials and multi-word input in
+  any order, and normalizes traditional/simplified, case, width and punctuation.
+- **Player and room.** The main entry `/` is the full player: accompaniment and
+  guide-vocal faders, word-by-word highlighting, click-to-seek lyrics, recording
+  and mixing. With account integration enabled it is bound to the account's
+  **current room**, so picking a song, skipping and seeking act on that shared
+  room instead of a browser-only queue. `/tv` is the big-screen stage and
+  `/remote` is the controller-only phone layout; a room allows exactly one
+  playing device at a time.
+- **Queue behavior.** A queued song starts only on a receiver that was
+  explicitly activated by a user gesture, and the queue then advances
+  automatically when a song ends. Appending songs never resumes a song that was
+  deliberately paused. An explicit skip starts the next entry from zero even
+  if the previous song was paused; an exhausted queue stops.
+- **QR remote and device roles.** The player can show a locally generated QR
+  code for `/remote`; nothing is sent to an external QR service. Connected
+  devices are labelled `播放器` / `遥控器` / `麦克风`. These labels are
+  descriptive, not credentials, and do not themselves grant playback or capture.
+- **Per-account and per-browser settings.** Portable defaults (sing mode, reverb,
+  view, mixer levels) follow the account; hardware-sensitive values (output
+  volume, selected input/output device) are keyed to that browser/device rather
+  than copied to other devices. Account and device values persist on the server.
+  `/devices` manages names, roles, the preferred player and overrides. See
+  [devices, settings and playback history](docs/devices.md).
+- **Personal playback history and frequent-played.** In account mode, `/history`
+  records validated receiver progress, not queue clicks or seeking. The `常唱`
+  view counts **your own last 500
+  retained records** — it is a personal statistic, **not** a global popularity
+  chart, and clearing history removes the corresponding counts.
+- **Lyrics editing.** Line text and start/end times are editable by hand, with
+  whole-song shift, an "align the whole song" gesture, 0.1 s nudges and preview.
+  Re-fetching or re-aligning lyrics refreshes other players **version-aware**:
+  they load the new version without resetting playback position, tracks or the
+  microphone, never overwrite a draft being edited, and keep the old lyrics if a
+  refresh fails.
+- **Recording and microphone boundaries.** Recording mixes the local microphone
+  with the accompaniment **on the device that is playing**. OpenK does not stream
+  a phone microphone to a television. Controllers can command an activated
+  receiver, but cannot bypass its audio activation or microphone permissions.
+  Saved monitoring settings do not bypass those browser controls.
+- **Failed-job cleanup.** A processing row in `error` offers both Retry and
+  Delete; a `cancelled` row offers Delete, so a job whose file cleanup failed can
+  be cleaned up again. Deleting asks for confirmation first and states plainly
+  that the job and its own working files are removed while imported originals
+  **outside** the job directory are kept. The action is opt-in — the client sends
+  `DELETE /api/jobs/{id}?failed_only=true` — and the server re-checks the state
+  under its lifecycle lock, so a job that started running, finished, or is still
+  executing its cleanup or a retry is rejected rather than deleted. A rejection
+  returns HTTP 409 and does not cancel an in-flight lyric operation. Current
+  playback, the queue and the microphone are untouched by a delete.
+
+Authentication and deployment boundary:
+
+- The application **does not implement a login system** and does not include the
+  private native Django account service used by the author's own deployment.
+  Account mode is an optional integration: a trusted reverse proxy authenticates
+  the user and forwards a verified profile plus a private hop key. Without that
+  key OpenK keeps its standalone room-pairing behavior. See
+  [accounts and the current room](docs/accounts.md).
+- **Treat this source as not internet-safe on its own.** Run it on a trusted
+  network or behind a proxy that authenticates the entire site, including media,
+  imports and administration. Room pairing codes only protect a shared room. See
+  [安全说明](SECURITY.md).
+- The one-song guest trial at `/try` is **disabled by default**. It requires a
+  matching guest-session gateway implementing the anonymous contract in
+  [guest trials](docs/guest-trials.md). Enabling the flag without a hop key fails
+  startup; the gateway is separately required to issue valid guest assertions.
+  The limit is one selection per issued browser session, not per-person DRM.
+
+Detailed Chinese documentation follows, plus
+[使用说明书](docs/user-guide.md) · [电视 / 手机双屏](docs/tv.md) ·
+[NAS + worker 部署](docs/distributed.md).
 
 **客厅模式**：电视打开 `/tv`，手机扫码进入 `/remote` 点歌；共享队列、遥控器焦点、
 大字逐词歌词、原唱切换和自动连唱。经典点歌台与录唱仍在 `/`，管理入口为 `/admin`。
 见 [电视／Fire TV 与手机点歌指南](docs/tv.md)。
 
-**部署边界**：当前没有全站账号登录；房间配对仅保护共享控制。请部署在可信网络，
-或放在具备身份认证的反向代理后，不要直接暴露到公网。见 [安全说明](SECURITY.md)。
+**聚会大厅**：打开 `/rooms` 汇总、创建和加入不同房间；每个房间独立保存歌单，
+显示成员、点歌人和多人演唱名单。手机建房后可允许电视用配对码加入，每房间仅一台
+播放设备。合唱名单是演唱安排，不代表已实现手机麦克风传输。
+
+**账号房间模式**：接入受信任的账号代理后，每位用户始终使用一个当前房间。
+登录后恢复原房间，没有房间则自动创建私人单人房；组队就是切换房间，退出组队回到
+单人房。昵称来自持久个人资料，同一账号的手机和电视是同一个成员，不再各起一个名字。
+此模式下 `/` 进入当前房间，曲库维护在 `/library`。见[账号与当前房间](docs/accounts.md)。
+
+**Devices and playback history**: a signed-in account keeps portable defaults on
+the server while each browser keeps its own hardware overrides. `/devices` names
+your browsers, gives them roles, picks the preferred player and clears overrides;
+`/history` lists what your own devices actually played. See
+[devices, settings and playback history](docs/devices.md).
+
+**One-song guest trial**: an optional, separate `/try` player lets visitors choose
+one song without registering, then sign in to continue. It requires a matching
+guest-session gateway and is disabled by default; it does not expose the normal
+library-management or account APIs. See [guest trials](docs/guest-trials.md).
+
+**部署边界**：应用本身不内置全站账号登录；房间配对仅保护共享控制。请部署在可信网络，
+或放在具备身份认证的反向代理后，不要直接暴露到公网。账号资料由外部账号服务管理，
+不能靠客户端自报身份开启账号模式。**本仓库不包含作者自用的原生 Django 账号服务**，
+公开源码本身不构成可直接暴露到公网的认证方案。见 [安全说明](SECURITY.md)。
 
 <p align="center">
   <img src="docs/screenshots/songboard.png" alt="新版 openk 点歌台：深色薄荷绿主题、唱片装饰、封面列表和悬浮播放条" width="860" />
@@ -38,13 +151,26 @@
     伴奏照样能唱，只是没字幕，也不会被反复重试。
 - ⬇️ **下载**：基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)。
 - 🎚️ **卡拉OK播放器**：伴奏 / 导唱人声独立音量、进度拖动、逐字高亮、点歌词跳转、自动滚动、歌词来源标注。
+  点击顶部「遥控」可弹出本地生成的二维码，手机扫码后打开遥控页；账号部署中，
+  手机登录同一账号即可控制当前房间。弹窗不打断演唱，也保留在本机直接打开遥控页的入口。
+  空房间也能先「启用播放器」等待点歌；第一首入队后自动开唱，后续歌曲自动接播，
+  追加歌曲不会取消当前歌曲的手动暂停。房间设备分别标明播放器、遥控器和麦克风角色。
 - 🎙️ **录唱与回放**：麦克风 + 伴奏实时合成录制，内置多种**混响**（KTV / 小房间 / 大厅 / 教堂）；录音自动保存，可回放、下载、删除。
 - 🗂️ **点歌台曲库**：已处理的歌曲进曲库，支持**歌名 / 歌手搜索**和**歌手分组**；
   同一视频自动去重，避免重复下载与分离。任务内的临时源音频按保留 / 归档配置清理，
   不删除本地导入的原文件，归档失败时保留源文件。
-- ✏️ **歌词可编辑**：识别偶有错字时可逐行手动修改，保存后**自动重建逐字时间轴**（未改动的行保留原有精确时间）。
+- ✏️ **歌词与时间可编辑**：逐行修改文字和起止时间；漏算前奏时，可整体提前/延后，或在某一句开口时用**对齐整首**。支持试听、0.1 秒微调和还原本次时间，逐字节奏随行时间移动；保存后同步到其他播放设备。
 - 🔍 **搜歌词、重对齐**：识别把语言认错（中文被唱成**拼音**、或整首识别成英文）时，一键从歌词库**搜索正确歌词并重新对齐**到人声——有时间轴的做逐字对齐、纯文本的按时长铺开；复用已分离音轨，不重新下载 / 分离。
+  完成后，主播放器和同房间的电视会自动载入新版歌词，不重置播放进度、音轨或麦克风；
+  正在编辑的草稿不会被覆盖，临时加载失败会保留旧歌词并自动重试。
 - ↻ **失败一键重试**：下载 / 处理偶发失败（如 YouTube 限流）时，曲库项上会出现重试按钮；下载还内置自动退避重试。
+- 🗑️ **Failed-task deletion**: `error` rows offer `重试` and `删除`; cancelled
+  tasks remain removable after a failed cleanup. Confirmation removes only that
+  job and its working files, preserving imported originals outside its directory.
+  The opt-in `failed_only=true` action rejects stale active/completed tasks with
+  `409`, fences stale polling, and refreshes the badge without playback commands.
+  Inspecting a cancelled task stops after its terminal response. Unflagged DELETE
+  retains its existing semantics.
 
 > ⚠️ 请仅用于你**拥有版权或授权**（如知识共享许可）的内容。本项目不鼓励侵犯版权。
 
@@ -54,6 +180,10 @@
 
 以下截图全部来自隔离演示环境：虚构曲目、原创示例歌词和程序生成的音轨／封面，
 不包含实际曲库、服务器地址或有效配对凭据。
+
+> These synthetic screenshots predate the newer account, browsing and deletion
+> controls. They illustrate the earlier layouts, not every current feature;
+> current behavior is described here and in the [user guide](docs/user-guide.md).
 
 **经典点歌台** —— 桌面、平板和手机使用同一入口 `/`；深色薄荷绿配色、
 唱片装饰和悬浮播放条，让点歌与正在演唱的内容分层呈现。
@@ -77,13 +207,25 @@
   全拼由 NAS 上的 `pypinyin` 按元数据缓存预计算，多音字读音以其词库为准；不依赖 CDN 或外网服务。
   字符表加载失败时仍可用原文和服务端全拼；旧版 / 模拟曲目没有搜索索引时仅回退到浏览器首字母估算。
 - **分类**：全部（按拼音排序）/ 歌手（先选人再选歌）/ 最新，外加一条**语种**筛选（国语 / 粤语 / 日语 / 韩语 / 英语…，从标题里的标记识别）。
+  展开「首字母」可按 **A–Z** 筛选，数字与其他文字归入 `#`；歌手页按歌手首字母，
+  进入歌手后按歌名首字母，「返回歌手列表」保留原来的字母和页码。
+  歌曲、封面和歌手列表**每页最多 24 项**，用「上一页 / 下一页」翻页，不一次展开整个曲库；
+  输入关键词时搜索**整个曲库**，不受当前页码、首字母、歌手或常唱榜限制。
+  账号模式下另有「常唱」：按**你自己最近 500 条保留的有效播放记录**统计，
+  属于个人统计而**非全网热度**，清除播放历史会同时移除对应次数。
   歌手页按繁简、大小写、全半角归一，`夢然` 和 `梦然` 会合成一位，显示仍保留曲库中最常见的原写法；
   不会把 `A-Lin` 与 `ALin` 等标点不同的歌手强行合并。
-- **已点歌曲**：点一首就排进队列，可**置顶**、删除、清空；一首唱完自动接下一首。经典入口队列存在浏览器本地；电视／手机房间队列由服务端持久化，两种模式互不覆盖。
+- **已点歌曲**: picking songs appends them to the queue; entries can be moved,
+  removed or cleared, and playback advances automatically. In standalone mode
+  the classic player uses a browser-local queue. In account mode the full player,
+  TV and remote all use the account's current server-persisted room queue.
 - **悬浮播放条**：开始播放后，底部保留「伴唱 / 原唱」「重唱」「切歌」「已点 N」；
   点击歌名回到歌词页，返回曲库仍能继续点歌。默认是**伴唱**。
-- **麦克风与监听**：默认勾选外放，但只有浏览器授权并启动音频引擎后才生效；
-  隐藏页面会暂停麦克风监听，回到页面后需明确恢复。音量、混响及原唱 / 伴唱选择保存在本地。
+- **麦克风与监听**: monitoring requires browser permission and an activated audio
+  engine; hiding the page pauses monitoring and returning requires explicit
+  recovery. Standalone preferences stay in local storage. Account deployments
+  persist portable defaults and browser-specific overrides separately, as
+  described in [devices and settings](docs/devices.md).
 - **后台**：添加链接、导入歌单、导入本地文件、查看处理进度都收在抽屉里；
   有任务在跑时按钮显示数量角标，窄屏使用带提示的图标按钮。
 
@@ -185,6 +327,9 @@ openk/
 ├── backend/
 │   ├── main.py            # FastAPI 服务与路由
 │   ├── rooms.py           # TV / 手机共享房间、队列与播放租约
+│   ├── user_state.py      # 账号偏好、设备拓扑与播放记录（见 docs/devices.md）
+│   ├── identity.py        # 可选：校验受信任代理转发的账号 / 访客身份（见 docs/accounts.md）
+│   ├── trials.py          # 可选：免登录试唱一首的受限接口与状态（见 docs/guest-trials.md）
 │   ├── security.py        # 浏览器跨来源写请求保护
 │   ├── search.py          # 归一、相关度排序、繁简表与缓存的拼音搜索索引
 │   ├── config.py          # 配置（可用环境变量覆盖）
@@ -206,6 +351,12 @@ openk/
 ├── frontend/              # 纯静态前端 (HTML/CSS/JS)，无构建步骤
 │   ├── index.html        # 点歌台 + 演唱页 + 已点/后台两个抽屉
 │   ├── app.js            # 曲库渲染、已点队列、播放器与录唱
+│   ├── library.js        # 首字母索引、24 项分页与「我的常唱」
+│   ├── account.js        # 读取账号服务返回的身份与账号菜单（不保存口令）
+│   ├── user-state.js     # 账号默认值 / 本机覆盖、设备与播放记录客户端
+│   ├── devices.html / devices.js   # /devices 设备、角色、拓扑与覆盖项
+│   ├── history.html / history.js   # /history 本账号设备的播放记录
+│   ├── trial/            # 可选：/try 免登录试唱页（默认关闭）
 │   ├── tv.html / tv.js   # 电视舞台
 │   ├── remote.html / remote.js # 手机点歌
 │   ├── room-client.js    # 房间客户端
@@ -219,7 +370,7 @@ openk/
 │   ├── frontend/          # Node / jsdom 状态与交互回归
 │   └── browser/           # 真实 Chrome 端到端场景
 ├── deploy/                # 全部部署模板：容器脚本、环境、TLS、worker 开机自启
-├── docs/                  # 部署 / TV / 程序脚本索引；screenshots/ 存放公开截图
+├── docs/                  # 部署 / TV / 账号 / 设备 / 试唱 / 程序脚本索引；screenshots/ 存放公开截图
 ├── run.sh                 # 稳定的服务启动入口
 ├── requirements.txt       # 轻量依赖（Web + 下载）
 ├── requirements-test.txt  # 回归依赖
@@ -492,6 +643,8 @@ cp deploy/worker.env.example worker.env    # 远程算力节点（可选）
 | `OPENK_MAX_WORKERS` | `1` | 并发处理任务数 |
 | `OPENK_SSL_CERTFILE` | 空 | HTTPS 证书路径；与下一项同时设置才启用 |
 | `OPENK_SSL_KEYFILE` | 空 | HTTPS 私钥路径 |
+| `OPENK_IDENTITY_KEY_FILE` | 空 | 可选：受信任账号代理的私密跳点口令文件（只读挂载）。留空＝保持单机配对模式；配置错误直接启动失败，不会静默关闭认证。见 [账号与当前房间](docs/accounts.md) |
+| `OPENK_GUEST_TRIAL_ENABLED` | `false` | 可选：开启 `/try` 免登录试唱一首。需要配套的访客会话网关与上面的跳点口令，缺一则启动失败。见 [免登录试唱](docs/guest-trials.md) |
 
 > **想用麦克风唱歌，就必须走 HTTPS。** 浏览器只在「安全上下文」下开放
 > `getUserMedia`，`http://<局域网IP>` 不算，所以在别的设备上打开会提示无法录音。
@@ -585,15 +738,39 @@ python -m backend.main
 | GET | `/api/jobs?q=` | 与点歌台相同的歌名 / 歌手多词、繁简、全拼和首字母检索，按相关度排序；也保留 URL 子串搜索。返回预计算的 `search_index`；`q` 为空时按歌名拼音稳定排序，省略 `q` 则保留原有最新优先顺序 |
 | GET | `/api/zh-map` | 完整单字繁 → 简对照表（进程内缓存，不依赖曲库内容），供前端搜索归一 |
 | GET | `/api/jobs/{id}` | 任务状态（含媒体 URL 与录音列表） |
-| DELETE | `/api/jobs/{id}` | 删除任务及其文件 |
+| DELETE | `/api/jobs/{id}` | Delete a job and its files. Optional `?failed_only=true` permits only idle `error` / `cancelled` jobs; stale active/completed work or a lyric operation returns `409` without cancellation. Unflagged requests retain their existing semantics. |
 | POST | `/api/jobs/{id}/retry` | 重试失败任务（body 可选 `{language?, whisper_model?}` 覆盖语言/模型） |
-| PUT | `/api/jobs/{id}/lyrics` | 保存手动编辑的歌词（重建逐字时间轴） |
+| PUT | `/api/jobs/{id}/lyrics` | 保存文字与起止时间；可用 `base_lyrics_url` 防止覆盖其他设备的新版本 |
 | GET | `/api/lyrics/search?q=` | 在 LRCLIB 歌词库搜索候选歌词 |
 | POST | `/api/jobs/{id}/lyrics/align` | 用选中的歌词库歌词重新对齐到人声 `{lrclib_id, language?}` |
 | POST | `/api/jobs/{id}/recordings?duration=&title=` | 上传录音（请求体为音频字节） |
 | GET | `/api/jobs/{id}/recordings` | 录音列表 |
 | DELETE | `/api/jobs/{id}/recordings/{file}` | 删除单条录音 |
 | GET | `/media/{id}/...` | 分离音频 / 歌词 / 录音（支持 Range） |
+
+Account-aware room and user APIs are summarized below; see
+[accounts and rooms](docs/accounts.md) and [devices/history](docs/devices.md).
+Current-room and `/api/user/*` routes require account integration and return
+`404` when disabled. `/api/account` instead reports `{enabled:false}`, and
+ordinary room/pairing APIs remain available in standalone mode.
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/account` | Disabled-mode status, or verified current identity and account-service links |
+| POST | `/api/rooms/current` | Resume or create the caller's current account room |
+| POST | `/api/rooms` | Create a room |
+| POST | `/api/rooms/{id}/join`, `/api/rooms/{id}/leave`, `/api/rooms/{id}/invitation` | Join, leave or rotate the host's invitation |
+| DELETE | `/api/rooms/{id}` | End a room |
+| GET/POST | `/api/user/state` | Read state or register this browser; return defaults, devices, topology and effective settings |
+| PUT | `/api/user/defaults`, `/api/user/topology` | Save defaults or preferred-player topology |
+| PATCH/DELETE | `/api/user/devices/{id}` | Update overrides/roles/name, or remove the device |
+| GET/DELETE | `/api/user/history` | Read paginated history or clear the caller's history |
+| DELETE | `/api/user/history/{entry}` | Remove one retained history entry |
+| GET | `/api/user/library-stats` | Personal retained-play counts, not global popularity |
+
+The optional `/api/trial/*` surface reads the restricted trial catalog/state and
+accepts selection/completion requests. It does not expose normal management,
+room or recording APIs. See [guest trials](docs/guest-trials.md).
 
 启用[分布式部署](docs/distributed.md)后额外提供（均需 `Authorization: Bearer <OPENK_WORKER_TOKEN>`）：
 

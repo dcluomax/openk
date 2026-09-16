@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -181,7 +182,7 @@ def rebuild_line_words(text: str, start: float, end: float,
     n = len(toks)
     if n == 0:
         return []
-    span = max(0.2, float(end) - float(start))
+    span = max(0.0, float(end) - float(start))
     step = span / n
     return [
         {"text": tok,
@@ -194,18 +195,38 @@ def rebuild_line_words(text: str, start: float, end: float,
 def save_edited_lyrics(lines_in: List[Dict[str, Any]], language: Optional[str],
                        source: str, out_dir: Path) -> Dict[str, Any]:
     """保存用户编辑后的歌词：重建逐字时间戳并写回 lyrics.json / lyrics.lrc。"""
+    def valid_time(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0)
+
     out_lines: List[Dict[str, Any]] = []
-    for ln in lines_in:
-        text = str(ln.get("text", "")).strip()
+    for index, ln in enumerate(lines_in):
+        if not isinstance(ln.get("text"), str):
+            raise ValueError(f"第 {index + 1} 行歌词文字格式不正确")
+        text = ln["text"].strip()
         if not text:
             continue
-        start = float(ln.get("start", 0.0) or 0.0)
-        end = float(ln.get("end", start) or start)
-        if end < start:
-            end = start
-        words = rebuild_line_words(text, start, end, ln.get("words") or [])
+        start, end = ln.get("start"), ln.get("end")
+        if not valid_time(start) or not valid_time(end) or end < start:
+            raise ValueError(f"第 {index + 1} 行时间无效：开始不能小于零，结束不能早于开始")
+        existing = ln.get("words", [])
+        if not isinstance(existing, list):
+            raise ValueError(f"第 {index + 1} 行逐字时间格式不正确")
+        canonical = []
+        for word in existing:
+            if not isinstance(word, dict):
+                raise ValueError(f"第 {index + 1} 行逐字时间格式不正确")
+            word_text = word.get("text", word.get("word"))
+            ws, we = word.get("start"), word.get("end")
+            if (not isinstance(word_text, str) or not valid_time(ws)
+                    or not valid_time(we) or we < ws):
+                raise ValueError(f"第 {index + 1} 行逐字时间无效")
+            canonical.append({**word, "text": word_text})
+        words = rebuild_line_words(text, start, end, canonical)
         out_lines.append({"start": round(start, 3), "end": round(end, 3),
                           "text": text, "words": words})
+    if not out_lines:
+        raise ValueError("歌词不能为空，请至少保留一行")
     out_lines.sort(key=lambda x: x["start"])
     return _write_lyrics({"language": language, "lines": out_lines}, source, out_dir)
 

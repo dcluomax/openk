@@ -7,41 +7,161 @@
   <meta name="theme-color" content="#11121d">
   <title>OpenK · 手机点歌</title>
   <link rel="stylesheet" href="/stage.css">
+  <link rel="stylesheet" href="/account.css">
+  <link rel="stylesheet" href="/library.css">
   <script defer src="/room-client.js"></script>
+  <script defer src="/account.js"></script>
+  <script defer src="/user-state.js"></script>
+  <script defer src="/vendor/qrcode.js"></script>
   <script defer src="/search.js"></script>
+  <script defer src="/library.js"></script>
   <script defer src="/remote.js"></script>
 </head>
 <body class="remote-page">
   <main class="remote-shell">
-    <header class="remote-header"><a class="room-brand" href="/">open<span>k</span></a>
-      <div class="remote-header-status"><span id="remoteConnection" role="status">尚未加入</span><button id="leaveRoom" class="text-button" hidden>退出房间</button></div></header>
-    <section id="joinScreen" class="join-screen">
-      <p class="eyebrow">THE NIGHT IS YOURS</p><h1>下一首，<br>你来选。</h1>
-      <p class="muted">手机负责点歌，电视负责舞台。<br>打开电视上的「手机点歌」面板开始。</p>
-      <form id="joinForm" class="join-form">
-        <label for="joinRoom">房间号</label><input id="joinRoom" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[a-fA-F0-9]{10}" required placeholder="电视显示的 10 位房间号">
-        <label for="joinCode">配对码</label><input id="joinCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required placeholder="6 位数字">
-        <button id="joinSubmit" class="primary" type="submit">加入房间 →</button>
-      </form><p id="joinError" class="notice" role="alert"></p><a class="subtle-link" href="/">只在本机唱？打开经典点歌台</a>
+    <header class="remote-header">
+      <a class="room-brand" href="/">open<span>k</span></a>
+      <span id="remoteConnection" class="remote-connection" role="status">正在连接</span>
+      <div id="accountChip" class="account-chip" hidden></div>
+    </header>
+    <nav class="room-navigation" aria-label="当前房间操作">
+      <button id="switchRoom" class="text-button" hidden>房间大厅</button>
+      <a id="playHere" class="text-button" href="/?view=player" hidden>本机开唱 ↗</a>
+      <button id="leaveRoom" class="text-button" hidden>退出房间</button>
+    </nav>
+    <section id="startupScreen" class="join-screen">
+      <p class="eyebrow">OPENK</p><h1>连接你的点歌台</h1>
+      <p id="startupStatus" class="notice" role="status">正在读取登录状态，请稍候。</p>
+      <button id="startupRetry" class="primary" type="button" hidden>重新连接</button>
     </section>
-    <section id="roomScreen" hidden>
+    <section id="signInScreen" class="join-screen" hidden>
+      <p class="eyebrow">PRIVATE PARTY</p><h1>请先登录</h1>
+      <p class="muted">这台点歌台只对已登录的成员开放。登录后会自动回到你的房间。</p>
+      <p id="signInNotice" class="notice" role="alert"></p>
+      <a id="signInLink" class="primary" href="/auth/login/">登录 OpenK</a>
+    </section>
+    <section id="joinScreen" class="join-screen" hidden>
+      <div class="lobby-heading"><p class="eyebrow">ROOMS</p><h1>聚会大厅</h1>
+        <p class="muted">找一间房，和朋友一起唱。</p></div>
+      <p id="currentRoomBanner" class="notice current-room-banner" role="status" hidden><span id="currentRoomText"></span><button id="returnRoom" type="button">返回我的房间</button></p>
+      <div class="lobby-grid">
+        <aside class="lobby-entry">
+          <label class="field-label" for="displayName" id="displayNameLabel">演唱昵称（可选）</label>
+          <input id="displayName" autocomplete="nickname" maxlength="40" placeholder="朋友怎么称呼你">
+          <p id="profileHint" class="muted small-copy" hidden>使用账号昵称 · <a id="profileLink" href="/auth/">修改资料</a></p>
+          <details class="room-settings" id="createRoomPanel"><summary id="newPartyShortcut">＋ 创建房间</summary>
+            <form id="createRoomForm" class="join-form">
+              <label for="newRoomName">房间名称</label><input id="newRoomName" required maxlength="60" placeholder="例如：周末客厅">
+              <label class="check-label"><input id="newRoomListed" type="checkbox" checked><span>在大厅展示，加入仍需配对码</span></label>
+              <label class="check-label"><input id="newRoomScreens" type="checkbox" checked><span>允许电视加入，每房间一台播放</span></label>
+              <button id="createRoom" class="primary" type="submit">创建房间</button>
+            </form>
+          </details>
+          <details class="room-settings" id="joinRoomPanel"><summary id="joinCodeShortcut">用配对码加入</summary>
+            <form id="joinForm" class="join-form">
+              <label for="joinRoom">房间号</label><input id="joinRoom" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[a-fA-F0-9]{10}" required placeholder="10 位房间号">
+              <label for="joinCode">配对码</label><input id="joinCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required placeholder="6 位数字">
+              <button id="joinSubmit" class="primary" type="submit">加入房间 →</button>
+            </form>
+          </details>
+          <p id="joinError" class="notice" role="alert"></p>
+          <a class="subtle-link" href="/">打开经典点歌台 ↗</a>
+        </aside>
+        <div class="lobby-directory">
+          <section id="roomLobby" class="lobby-section" aria-labelledby="lobbyTitle">
+            <div class="browse-heading"><h2 id="lobbyTitle">正在聚会</h2><button id="refreshRooms" class="text-button">刷新</button></div>
+            <p id="lobbyStatus" class="muted" role="status"></p><ul id="lobbyList" class="room-song-list" aria-label="大厅房间"></ul>
+          </section>
+          <section id="recentRooms" class="lobby-section" aria-labelledby="recentTitle" hidden>
+            <h2 id="recentTitle">本机已加入</h2><ul id="recentList" class="room-song-list"></ul>
+            <p class="muted small-copy">保留本机房间凭据，不代表仍有人在线。</p>
+          </section>
+        </div>
+      </div>
+    </section>
+    <section id="roomScreen" class="room-dashboard" hidden>
+      <h1 class="screen-reader-only">房间点歌台</h1>
+      <aside class="room-sidebar">
       <section class="remote-now">
-        <div class="remote-now-heading"><div><p class="eyebrow" id="remoteRoom">LIVE ROOM</p><h1 id="remoteTitle">为今晚点第一首歌</h1><p id="remoteArtist">点歌后，在电视上启用声音</p></div><span class="live-mark">LIVE</span></div>
-        <p id="playerStatus" class="player-status">等待电视连接</p>
+        <button id="remotePlay" class="play-round now-play" aria-label="播放" disabled>▶</button>
+        <details id="playbackPanel" class="playback-panel">
+          <summary id="playbackToggle" class="remote-now-heading"><span class="now-copy">
+            <span class="eyebrow" id="remoteRoom">当前房间</span>
+            <span id="remoteTitle" class="remote-title">先点一首喜欢的歌</span>
+            <span id="remoteArtist">点歌后，在播放设备上启用声音</span>
+            <span id="playerStatus" class="player-status">等待播放设备</span>
+          </span><span class="playback-label">播放控制</span></summary>
+        <div class="playback-body">
         <div class="remote-progress"><span id="remoteElapsed">0:00</span><input id="seek" type="range" min="0" max="100" value="0" step="1" aria-label="播放位置" disabled><span id="remoteDuration">0:00</span></div>
         <nav class="transport" aria-label="房间播放控制">
           <button id="remoteRestart" aria-label="重唱当前歌曲" disabled>↺<small>重唱</small></button>
-          <button id="remotePlay" class="play-round" aria-label="播放" disabled>▶</button>
           <button id="remoteNext" aria-label="下一首" disabled>⇥<small>下一首</small></button>
           <button id="remoteGuide" aria-pressed="false" disabled>原唱<small>已关闭</small></button>
         </nav>
+        <div class="party-participation"><p id="currentSingers" class="muted small-copy"></p><button id="singCurrent" class="sing-song" disabled aria-pressed="false">我要唱</button></div>
+        <p id="soloHint" class="solo-hint" hidden>这是你的私人房间，一个人也能开唱。</p>
+        </div></details>
       </section>
-      <div class="browse-heading"><h2>给今晚加一首</h2><span id="libraryCount" class="muted"></span></div>
-      <div class="remote-search"><span aria-hidden="true">⌕</span><input id="songSearch" type="search" autocomplete="off" placeholder="歌名 / 歌手 / 全拼 / 首字母，可组合" aria-label="搜索曲库"></div>
-      <div class="library-tools"><span class="eyebrow">YOUR KARAOKE COLLECTION</span><button id="refreshLibrary" class="text-button">刷新曲库</button></div>
-      <p id="libraryStatus" class="muted" role="status"></p><ul id="roomSongList" class="room-song-list" aria-label="可点歌曲"></ul>
-      <button id="showMore" class="load-more" hidden>显示更多歌曲</button>
+      <div class="room-secondary">
+      <details class="room-settings" id="membersPanel"><summary id="memberSummary">成员</summary>
+        <ul id="roomMembers" class="member-list" aria-label="同房成员"></ul>
+        <section id="remoteDevices" class="room-device-section" aria-label="房间设备及角色" hidden></section>
+        <form id="memberForm" class="member-form"><label class="field-label" for="memberName">我的演唱昵称</label><input id="memberName" required maxlength="40" autocomplete="nickname"><button id="saveMember" type="submit">更新昵称</button></form>
+        <p id="memberProfileHint" class="muted small-copy" hidden>你在房间里的名字来自账号资料：<a id="memberProfileLink" href="/auth/">修改昵称与密码</a>。</p>
+        <p id="memberIdentityHint" class="muted small-copy">名单按配对设备显示，仅代表演唱安排，不会打开手机麦克风。</p>
+      </details>
+      <details class="room-settings" id="hostControls" hidden><summary>邀请与设置</summary>
+        <form id="roomSettingsForm" class="join-form">
+          <label for="roomName">房间名称</label><input id="roomName" required maxlength="60">
+          <label class="check-label"><input id="roomListed" type="checkbox"><span>在聚会大厅展示</span></label>
+          <label class="check-label"><input id="roomScreens" type="checkbox"><span>允许电视用配对码加入；关闭会断开已配对的电视</span></label>
+          <button id="saveRoomSettings" type="submit">保存房间设置</button>
+        </form>
+        <section id="roomInvite" hidden>
+          <p class="field-label">房间号：<strong id="inviteRoom"></strong> · 配对码：<strong id="inviteCode"></strong></p>
+          <div id="inviteQR" class="qr-code" aria-label="手机配对二维码"></div>
+          <div class="invite-links"><a id="phoneInviteLink" target="_blank" rel="noopener">打开手机加入页</a><a id="screenInviteLink" target="_blank" rel="noopener">让这个屏幕播放</a></div>
+          <p class="muted small-copy">其他电视打开 /tv，输入房间号与配对码即可加入。房主凭据不会发送给电视。</p>
+        </section>
+        <p id="inviteUnavailable" class="muted small-copy" hidden>本机没有保存配对码，请从原来的电视或创建房间的设备查看。</p>
+        <button id="refreshInvite" class="text-button" type="button" hidden>生成新的配对码</button>
+        <p id="invitePrivacy" class="muted small-copy" hidden>服务器只保存配对码的摘要。换一台设备登录时，点上面的按钮生成新的配对码；旧配对码会立即失效。</p>
+        <button id="endRoom" class="danger-button" type="button">结束房间</button>
+        <p class="muted small-copy">结束会移除本房间歌单并让所有设备退出，不会删除曲库歌曲。</p>
+      </details>
+      </div>
       <button id="openQueue" class="queue-dock"><span>☷ <strong>已点歌曲</strong> <span id="remoteQueueCount">0</span></span><span>查看队列 ↑</span></button>
+      </aside>
+      <section class="room-library" aria-labelledby="pickTitle">
+        <div class="browse-heading">
+          <h2 id="pickTitle">点一首歌</h2><span id="libraryCount" class="muted"></span>
+          <details id="remoteBrowseOptions" class="catalog-options">
+            <summary id="remoteBrowseSummary" aria-label="曲库排序与拼音筛选">拼音</summary>
+            <div class="catalog-menu">
+              <div class="catalog-controls">
+                <select id="libraryOrder" aria-label="曲库排序">
+                  <option value="all">拼音排序</option>
+                  <option value="popular" hidden>我的常唱</option>
+                  <option value="new">最新入库</option>
+                </select>
+              </div>
+              <details id="remoteAlphabet" class="catalog-alphabet" open>
+                <summary id="remoteAlphabetLabel">歌名首字母 · 全部</summary>
+                <nav id="remoteIndex" class="catalog-index" aria-label="拼音首字母筛选"></nav>
+              </details>
+            </div>
+          </details>
+          <button id="refreshLibrary" class="text-button">刷新</button>
+        </div>
+        <div class="remote-search"><span aria-hidden="true">⌕</span><input id="songSearch" type="search" autocomplete="off" placeholder="搜歌名、歌手或拼音" aria-label="搜索曲库"></div>
+        <p id="remotePopularityNote" class="catalog-note" role="status" hidden></p>
+        <p id="libraryStatus" class="muted" role="status"></p><ul id="roomSongList" class="room-song-list" aria-label="可点歌曲"></ul>
+        <nav id="remotePager" class="catalog-pager" aria-label="曲库分页" hidden>
+          <button id="showPrevious" type="button" data-page-step="-1">上一页</button>
+          <span data-page-info role="status"></span>
+          <button id="showMore" type="button" data-page-step="1">下一页</button>
+        </nav>
+      </section>
     </section>
   </main>
   <section id="queuePanel" class="queue-overlay" role="dialog" aria-modal="true" aria-labelledby="queueTitle" hidden>

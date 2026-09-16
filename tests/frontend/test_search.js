@@ -77,6 +77,19 @@ test('artist grouping folds case/width/scripts without merging distinct punctuat
   assert.notEqual(search.artistKey('A-Lin'), search.artistKey('A Lin'));
 });
 
+test('letter browsing uses phrase-aware server pinyin and separates song and artist initials', () => {
+  const search = Search.create(fixtures.map);
+  const find = id => fixtures.jobs.find(job => job.id === id);
+  assert.equal(search.initial(find('rice')), 'D');
+  assert.equal(search.initial(find('rice'), 1), 'Z');
+  assert.equal(search.initial(find('polyphonic')), 'C');
+  assert.equal(search.initial(find('accent')), 'D');
+  assert.equal(search.initial({ track: '123 木头人' }), '#');
+  assert.equal(search.initial({ track: '🎤' }), '#');
+  assert.equal(search.initial({ track: '歌曲', artist: '' }, 1), '#');
+  assert.equal(search.initial({ track: '稻香' }), 'D');
+});
+
 function remoteFixture(t) {
   const frontend = path.join(root, 'frontend');
   const dom = new JSDOM(fs.readFileSync(path.join(frontend, 'remote.html'), 'utf8'), {
@@ -99,7 +112,10 @@ function remoteFixture(t) {
         { id: 'unplayable', state: 'done', media: {} }];
     },
   };
+  // Catalog projection tests do not start a room or a lobby polling loop.
+  w.OpenKAccount = { load: () => new Promise(() => {}) };
   w.eval(fs.readFileSync(path.join(frontend, 'search.js'), 'utf8'));
+  w.eval(fs.readFileSync(path.join(frontend, 'library.js'), 'utf8'));
   w.eval(fs.readFileSync(path.join(frontend, 'remote.js'), 'utf8'));
   const phone = w.openkRemote, $ = selector => w.document.querySelector(selector);
   t.after(() => { phone.destroy(); w.close(); });
@@ -135,7 +151,7 @@ test('remote uses shared ranking, matched counts, global terms and useful empty 
   assert.equal(f.titles().length, 0);
   assert.equal(f.$('#libraryCount').textContent, `0 / ${fixtures.jobs.length} 首`);
   assert.match(f.$('#libraryStatus').textContent, /没有匹配/);
-  assert.equal(f.$('#showMore').hidden, true);
+  assert.equal(f.$('#remotePager').hidden, true);
   assert.equal(f.$('#libraryStatus img'), null);
   f.input('');
   f.flush();
@@ -149,7 +165,7 @@ test('remote defers IME filtering, cancels pending input, and keeps committed re
   await f.phone.loadLibrary();
   f.input('周杰倫 稻香');
   f.flush();
-  f.phone.limit = 100;
+  f.phone.libraryPage = 3;
   f.input('a pending debounce');
   assert.equal(f.timers.size, 1);
   f.$('#songSearch').dispatchEvent(new f.w.CompositionEvent('compositionstart'));
@@ -161,7 +177,7 @@ test('remote defers IME filtering, cancels pending input, and keeps committed re
   f.$('#songSearch').value = '海阔天空';
   f.$('#songSearch').dispatchEvent(new f.w.CompositionEvent('compositionend'));
   assert.deepEqual(f.titles(), ['海闊天空']);
-  assert.equal(f.phone.limit, 50);
+  assert.equal(f.phone.libraryPage, 1);
   f.input('in progress', true);
   assert.equal(f.timers.size, 0);
   assert.deepEqual(f.titles(), ['海闊天空']);
@@ -175,12 +191,17 @@ test('remote paging counts all matches, and failed map/catalog loads retain usab
   }));
   f.input('dx');
   f.flush();
-  assert.equal(f.titles().length, 50);
+  assert.equal(f.titles().length, 24);
   assert.equal(f.$('#libraryCount').textContent, '61 / 61 首');
-  assert.equal(f.$('#showMore').hidden, false);
+  assert.equal(f.$('#remotePager').hidden, false);
   f.$('#showMore').click();
-  assert.equal(f.titles().length, 61);
-  assert.equal(f.$('#showMore').hidden, true);
+  assert.equal(f.titles().length, 24);
+  assert.equal(f.phone.libraryPage, 2);
+  f.$('#showMore').click();
+  assert.equal(f.titles().length, 13);
+  assert.equal(f.$('#showMore').disabled, true);
+  f.$('#showPrevious').click();
+  assert.equal(f.phone.libraryPage, 2);
   f.fail(true, false);
   await f.phone.loadLibrary();
   f.input('海闊天空');
@@ -195,4 +216,52 @@ test('remote paging counts all matches, and failed map/catalog loads retain usab
   assert.deepEqual(f.titles(), before);
   assert.match(f.$('#libraryStatus').textContent, /catalog offline/);
   assert.equal(f.$('#refreshLibrary').disabled, false);
+  f.phone.renderLibrary();
+  assert.match(f.$('#libraryStatus').textContent, /catalog offline/, 'other view updates cannot hide a catalog failure');
+});
+
+test('remote initial browsing preserves global search and selected-letter return', async t => {
+  const f = remoteFixture(t);
+  await f.phone.loadLibrary();
+  f.$('#remoteIndex [data-letter="C"]').click();
+  assert.deepEqual(f.titles(), ['重慶森林']);
+  assert.equal(f.phone.libraryPage, 1);
+  f.input('dx zjl');
+  f.flush();
+  assert.deepEqual(f.titles(), ['稻香']);
+  assert.equal(f.$('#remoteAlphabet').hidden, true);
+  f.input('');
+  f.flush();
+  assert.deepEqual(f.titles(), ['重慶森林']);
+  assert.equal(f.$('#remoteAlphabet').hidden, false);
+  f.$('#remoteIndex [data-letter=""]').click();
+  assert.equal(f.titles().length, fixtures.jobs.length);
+});
+
+test('remote shows truthful personal play counts and keeps search independent of the ranking', async t => {
+  const f = remoteFixture(t);
+  await f.phone.loadLibrary();
+  f.phone.account = { enabled: true, user: { id: 'account-a' } };
+  let value = { account_id: 'account-a', songs: [
+    { job_id: 'sea', play_count: 9, last_played_at: 1 },
+    { job_id: 'rice', play_count: 2, last_played_at: 2 },
+  ], history_limit: 500, total_plays: 11 };
+  f.w.OpenKUserState = { libraryStats: async () => value };
+  f.phone.renderLibrary();
+  f.$('#libraryOrder').value = 'popular';
+  f.$('#libraryOrder').dispatchEvent(new f.w.Event('change'));
+  await f.phone.refreshPopularity();
+  assert.deepEqual(f.titles(), ['海闊天空', '稻香']);
+  assert.equal(f.$('.catalog-plays').textContent, '播放 9 次');
+  assert.match(f.$('#remotePopularityNote').textContent, /非全网热度/);
+  f.input('chongqing');
+  f.flush();
+  assert.deepEqual(f.titles(), ['重慶森林']);
+  assert.equal(f.$('#remotePopularityNote').hidden, true);
+  f.input('');
+  f.flush();
+  value = { ...value, songs: [], total_plays: 0 };
+  await f.phone.refreshPopularity(true);
+  assert.equal(f.titles().length, 0);
+  assert.match(f.$('#libraryStatus').textContent, /还没有常唱记录/);
 });

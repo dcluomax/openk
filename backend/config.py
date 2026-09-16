@@ -148,6 +148,10 @@ REMOTE_FALLBACK_LOCAL = os.environ.get(
 # --- 服务 ---
 HOST = os.environ.get("OPENK_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENK_PORT", "8000"))
+# Optional authenticated-proxy integration; never reuse the worker credential.
+IDENTITY_KEY_FILE = os.environ.get("OPENK_IDENTITY_KEY_FILE", "").strip()
+GUEST_TRIAL_ENABLED = os.environ.get(
+    "OPENK_GUEST_TRIAL_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def normalize_origin(value: str) -> str | None:

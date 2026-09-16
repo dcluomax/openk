@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#10161d" />
+  <meta name="referrer" content="same-origin" />
+  <meta name="robots" content="noindex" />
+  <title>openk · 免登录试唱</title>
+  <!-- The guest page loads only its own two public assets; it never pulls the signed-in
+       application bundle, a font service or any other external resource. -->
+  <link rel="stylesheet" href="/trial-assets/trial.css" />
+  <script src="/trial-assets/trial.js" defer></script>
+</head>
+<body class="trial-body">
+  <svg class="trial-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="trial-icon-note" viewBox="0 0 24 24"><path d="M9 17V5l11-2v12M9 9l11-2"/><ellipse cx="6" cy="17" rx="3" ry="2.5"/><ellipse cx="17" cy="15" rx="3" ry="2.5"/></symbol>
+    <symbol id="trial-icon-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3m-3 0h6"/></symbol>
+    <symbol id="trial-icon-check" viewBox="0 0 24 24"><path d="m5 13 4 4 10-11"/></symbol>
+  </svg>
+
+  <div class="trial">
+    <header class="trial-top">
+      <div class="trial-brand">
+        <span class="trial-logo" aria-hidden="true"><svg class="trial-ui-icon"><use href="#trial-icon-note"/></svg></span>
+        <span class="trial-brand-name">openk<span class="trial-brand-caption">免登录试唱</span></span>
+      </div>
+      <a class="trial-signin" id="topSignIn" href="/auth/login/?next=%2F">登录</a>
+    </header>
+
+    <main class="trial-main">
+      <h1 class="trial-heading">不用注册，先唱一首。</h1>
+      <p class="trial-lede" id="trialLede">
+        挑一首歌，直接在这里开唱。本次试唱只属于这个浏览器会话——每个访客会话可以唱一首，唱完登录即可继续。
+      </p>
+
+      <div class="trial-alert" id="trialAlert" role="alert" hidden>
+        <p class="trial-alert-text" id="trialAlertText"></p>
+        <div class="trial-alert-actions">
+          <button class="trial-button ghost" id="trialRetry" type="button" hidden>重试</button>
+          <a class="trial-button ghost" id="trialAlertLink" href="/auth/login/?next=%2F" hidden>登录</a>
+        </div>
+      </div>
+
+      <section class="trial-card" id="loadingView" aria-labelledby="loadingTitle">
+        <h2 class="trial-card-title" id="loadingTitle">正在打开访客试唱…</h2>
+        <p class="trial-muted" id="loadingText" role="status">正在检查本次试唱额度…</p>
+      </section>
+
+      <section class="trial-card" id="chooseView" aria-labelledby="chooseTitle" hidden>
+        <h2 class="trial-card-title" id="chooseTitle">选择你要唱的那一首</h2>
+        <p class="trial-muted">
+          本次访客会话只能选一首，选定后不能更换。搜索可试唱的歌曲，再确认你要唱的那一首。
+        </p>
+        <div class="trial-search">
+          <label class="trial-visually-hidden" for="songSearch">搜索可试唱的歌曲</label>
+          <input class="trial-search-box" id="songSearch" type="search" autocomplete="off"
+                 maxlength="120" placeholder="搜索歌名或歌手" />
+          <button class="trial-search-clear" id="searchClear" type="button" aria-label="清空搜索" hidden>✕</button>
+        </div>
+        <p class="trial-muted small" id="catalogStatus" role="status">正在加载可试唱的歌曲…</p>
+        <ul class="trial-songs" id="catalogList" aria-label="可以试唱的歌曲"></ul>
+        <p class="trial-footnote" id="sessionNote"></p>
+      </section>
+
+      <section class="trial-card player" id="playerView" aria-labelledby="trialTitle" hidden>
+        <div class="trial-song-head">
+          <div class="trial-song-id">
+            <h2 class="trial-card-title" id="trialTitle">你的歌曲</h2>
+            <p class="trial-muted" id="trialArtist"></p>
+          </div>
+          <p class="trial-countdown" id="trialRemaining" role="status"></p>
+        </div>
+
+        <div class="trial-transport">
+          <button class="trial-button primary big" id="playBtn" type="button" aria-label="开始演唱">开始演唱</button>
+          <div class="trial-progress">
+            <label class="trial-visually-hidden" for="seek">播放进度</label>
+            <input class="trial-range seek" id="seek" type="range" min="0" max="1000" value="0" step="1" />
+            <div class="trial-times"><span id="elapsed">0:00</span><span id="duration">0:00</span></div>
+          </div>
+        </div>
+        <p class="trial-muted small" id="audioStatus" role="status"></p>
+
+        <div class="trial-mixer">
+          <div class="trial-mix-row">
+            <label for="musicVol">伴奏</label>
+            <input class="trial-range" id="musicVol" type="range" min="0" max="100" value="80" step="1" />
+          </div>
+          <div class="trial-mix-row" id="guideRow" hidden>
+            <label for="guideVol">原唱</label>
+            <input class="trial-range" id="guideVol" type="range" min="0" max="100" value="0" step="1" />
+          </div>
+        </div>
+
+        <div class="trial-lyrics-wrap">
+          <div class="trial-lyrics" id="lyrics" aria-live="off"></div>
+          <p class="trial-muted small" id="lyricsFallback" hidden>
+            这首歌没有同步歌词，可跟着伴奏演唱。
+          </p>
+        </div>
+
+        <div class="trial-mic">
+          <button class="trial-button ghost" id="micToggle" type="button" aria-pressed="false">
+            <svg class="trial-ui-icon" aria-hidden="true"><use href="#trial-icon-mic"/></svg>
+            <span id="micToggleLabel">打开麦克风监听</span>
+          </button>
+          <p class="trial-muted small" id="micNote">
+            可选功能，默认关闭。只把你的声音通过这台设备放出来——不录音、不保存、也不会上传。请戴耳机：外放时麦克风会啸叫。
+          </p>
+          <p class="trial-muted small" id="micStatus" role="status"></p>
+        </div>
+
+        <p class="trial-footnote">
+          这是本次访客会话唯一的一首歌。唱完之后，本次试唱就用完了。
+        </p>
+      </section>
+
+      <section class="trial-card done" id="doneView" aria-labelledby="doneTitle" hidden>
+        <span class="trial-done-mark" aria-hidden="true"><svg class="trial-ui-icon"><use href="#trial-icon-check"/></svg></span>
+        <h2 class="trial-card-title" id="doneTitle">你的试唱歌曲已唱完</h2>
+        <p class="trial-muted" id="doneMessage">
+          感谢试唱。本次试唱额度已用完。
+        </p>
+        <div class="trial-done-actions">
+          <a class="trial-button primary" id="loginCta" href="/auth/login/?next=%2F">登录后继续演唱</a>
+          <a class="trial-button ghost" id="guestEntry" href="/auth/guest/" hidden>打开试唱入口</a>
+        </div>
+      </section>
+
+      <p class="trial-legal">
+        访客试唱按浏览器会话计算。清除 Cookie 或换一个浏览器会开启新的会话，因此无法按个人限制试唱次数。麦克风的声音不会离开这台设备。
+      </p>
+    </main>
+  </div>
+
+  <audio id="instAudio" preload="auto"></audio>
+  <audio id="guideAudio" preload="auto"></audio>
+</body>
+</html>

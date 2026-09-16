@@ -66,20 +66,31 @@ function browser(page, url, storage = {}) {
   windows.push(w);
   w.AbortController = globalThis.AbortController;
   for (const [key, value] of Object.entries(storage)) w.localStorage.setItem(key, JSON.stringify(value));
-  const network = { calls: [], offline: false, dropCommand: false, stateRequests: 0, maximum: 0 };
+  const network = { calls: [], offline: false, dropCommand: false, stateRequests: 0, maximum: 0,
+    holdNextLyrics: false, releaseLyrics: null };
   w.fetch = async (resource, options = {}) => {
     const target = new URL(resource, w.location.href);
     assert.equal(target.origin, w.location.origin, 'room never calls external services');
     network.calls.push({ url: target, options });
     if (network.offline) throw new TypeError('offline');
-    const state = /^\/api\/rooms\/[a-f0-9]+$/.test(target.pathname) && (!options.method || options.method === 'GET');
+    const state = /^\/api\/rooms\/[a-f0-9]+$/.test(target.pathname) && (!options.method || options.method === 'GET')
+      || /^\/api\/rooms\/[a-f0-9]+\/presence$/.test(target.pathname) && options.method === 'POST';
     if (state) {
       network.stateRequests++;
       network.maximum = Math.max(network.maximum, network.stateRequests);
       await sleep(10);
     }
     try {
+      if (network.lyricsStatus && target.pathname.endsWith('/lyrics.json')) {
+        return new Response(JSON.stringify({ detail: 'Synthetic media failure' }), {
+          status: network.lyricsStatus, headers: { 'Content-Type': 'application/json' },
+        });
+      }
       const response = await fetch(target, options);
+      if (network.holdNextLyrics && target.pathname.endsWith('/lyrics.json')) {
+        network.holdNextLyrics = false;
+        return new Promise(resolve => { network.releaseLyrics = () => resolve(response); });
+      }
       if (network.dropCommand && target.pathname.endsWith('/commands')) {
         network.dropCommand = false;
         throw new TypeError('response lost after commit');
@@ -110,8 +121,12 @@ function browser(page, url, storage = {}) {
   };
   w.addEventListener('error', event => errors.push(event.error || event.message));
   w.eval(fs.readFileSync(path.join(frontend, 'room-client.js'), 'utf8'));
-  if (page === 'remote') w.eval(fs.readFileSync(path.join(frontend, 'search.js'), 'utf8'));
-  if (page === 'tv') w.eval(fs.readFileSync(path.join(frontend, 'vendor/qrcode.js'), 'utf8'));
+  w.eval(fs.readFileSync(path.join(frontend, 'account.js'), 'utf8'));
+  if (page === 'remote') {
+    w.eval(fs.readFileSync(path.join(frontend, 'search.js'), 'utf8'));
+    w.eval(fs.readFileSync(path.join(frontend, 'library.js'), 'utf8'));
+  }
+  w.eval(fs.readFileSync(path.join(frontend, 'vendor/qrcode.js'), 'utf8'));
   w.eval(fs.readFileSync(path.join(frontend, page + '.js'), 'utf8'));
   return { w, network, $: selector => w.document.querySelector(selector) };
 }
@@ -154,6 +169,12 @@ async function run() {
   check('Phone → API → TV starts same unique queue item', stage.client.state.current.id === phone.client.state.current.id
     && tv.$('#songTitle').textContent === '稻香');
   check('No audio autoplays before TV gesture', stage.music.paused && !stage.armed);
+  const commandsBeforeSilentPlay = remote.network.calls.filter(call => call.url.pathname.endsWith('/commands')).length;
+  remote.$('#remotePlay').click();
+  await sleep(30);
+  check('Offline remote does not report success or show pause without a receiver',
+    remote.network.calls.filter(call => call.url.pathname.endsWith('/commands')).length === commandsBeforeSilentPlay
+    && remote.$('#remotePlay').textContent === '▶' && remote.$('#remoteNotice').textContent.includes('还没有播放设备'));
   stage.music.currentTime = 1;
   stage.lyrics();
   check('TV shows intro countdown and next lyric', tv.$('#countdown').textContent.includes('前奏')
@@ -174,14 +195,37 @@ async function run() {
   await stage.activate();
   check('Audio play rejection is visible and recoverable', stage.status === 'blocked' && !stage.armed && !tv.$('#activate').hidden);
   stage.music._rejectPlay = false;
-  await stage.activate();
-  check('TV gesture claims lease and starts music', stage.armed && !stage.music.paused && !!stage.playerToken);
+  tv.$('#closePair').click();
+  tv.$('#playPause').click();
+  await until(() => stage.armed && !stage.music.paused && !!stage.playerToken, 'ordinary TV play button activates sound');
+  check('TV play button itself claims lease and starts music', stage.armed && !stage.music.paused && !!stage.playerToken);
   const competingTV = browser('tv', origin + '/tv', { 'openk.tv.room': stage.host });
   await until(() => competingTV.w.openkStage?.client?.state, 'second TV opening existing room');
   competingTV.w.openkStage.client.stop();
   await competingTV.w.openkStage.activate();
   check('A second TV tab cannot acquire the live player lease', !competingTV.w.openkStage.armed
     && competingTV.w.openkStage.music.paused && !stage.music.paused);
+  const competingClient = competingTV.w.openkStage.client;
+  await competingClient.refresh();
+  const departingPresence = competingClient.presenceId;
+  const departingConnection = competingClient.presenceClient;
+  competingTV.w.dispatchEvent(new competingTV.w.PageTransitionEvent('pagehide', { persisted: true }));
+  await until(async () => {
+    await stage.client.refresh();
+    return !stage.client.state.devices.some(device => device.id === departingPresence);
+  }, 'departing pairing TV presence is removed without waiting for expiry');
+  check('TV pagehide stops polling and deletes only its own connection with keepalive',
+    !competingClient.running && competingClient.presenceId === null
+    && competingTV.network.calls.some(call => call.options.method === 'DELETE'
+      && call.options.keepalive && call.url.pathname.endsWith('/presence/' + departingConnection))
+    && stage.client.state.devices.some(device => device.id === stage.client.presenceId && device.player));
+  competingTV.w.dispatchEvent(new competingTV.w.PageTransitionEvent('pageshow', { persisted: true }));
+  await until(() => competingClient.running && competingClient.presenceId
+    && competingClient.presenceId !== departingPresence, 'cached TV page reconnects with a fresh presence');
+  await stage.client.refresh();
+  check('Restored pairing TV has no ghost row and never bypasses sound activation',
+    stage.client.state.devices.filter(device => device.member_id === stage.client.state.viewer.id).length === 2
+    && !competingTV.w.openkStage.armed && competingTV.w.openkStage.music.paused && !stage.music.paused);
   competingTV.w.openkStage.destroy();
   await phone.client.refresh();
   check('Controller sees actual player status', phone.client.state.player.online && phone.client.state.player.status === 'playing');
@@ -208,6 +252,70 @@ async function run() {
   await phone.client.command('guide', { enabled: true });
   await stage.client.refresh();
   check('Guide can be retried by toggling it', !stage.voice.paused);
+
+  const itemBeforeLyrics = stage.loadedItem;
+  const epochBeforeLyrics = stage.mediaEpoch;
+  const playsBeforeLyrics = stage.music._playCount;
+  const positionBeforeLyrics = stage.music.currentTime;
+  const publishRevision = async text => {
+    const value = { source: 'Synthetic revision', lines: [
+      { start: 0, end: 30, text, words: [{ text, start: 0, end: 30 }] },
+      { start: 30, end: 40, text: 'Another line' },
+    ] };
+    const publication = await fetch(origin + '/api/jobs/song-a/lyrics', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+    });
+    assert.equal(publication.status, 200);
+  };
+  await publishRevision('Updated words');
+  await stage.client.refresh();
+  await until(() => stage.lines[0]?.text === 'Updated words', 'TV refreshes lyrics on the same queue item');
+  stage.lyrics();
+  check('Published lyric revisions replace TV words without reloading either track',
+    stage.loadedItem === itemBeforeLyrics && stage.mediaEpoch === epochBeforeLyrics
+    && stage.music._playCount === playsBeforeLyrics && stage.music.currentTime === positionBeforeLyrics
+    && !stage.music.paused && tv.$('#lyricCurrent').textContent === 'Updated words');
+
+  tv.network.holdNextLyrics = true;
+  tv.network.releaseLyrics = null;
+  await publishRevision('Obsolete words');
+  await stage.client.refresh();
+  await until(() => tv.network.releaseLyrics, 'an older lyric response is held');
+  const held = tv.network.calls.filter(call => call.url.pathname.endsWith('/lyrics.json')).slice(-1)[0];
+  await stage.client.refresh();
+  check('Unchanged room polls do not restart an in-flight lyric request',
+    tv.network.calls.filter(call => call.url.pathname === held.url.pathname).length === 1);
+  await publishRevision('Latest words');
+  await stage.client.refresh();
+  await until(() => stage.lines[0]?.text === 'Latest words', 'the newer lyric revision loads first');
+  tv.network.releaseLyrics();
+  await sleep(30);
+  check('A late lyric response cannot replace a newer revision of the same song',
+    held.options.signal.aborted && stage.lines[0].text === 'Latest words'
+    && stage.music.currentTime === positionBeforeLyrics && !stage.music.paused);
+
+  const originalNow = tv.w.Date.now;
+  let lyricNow = originalNow();
+  tv.w.Date.now = () => lyricNow;
+  tv.network.lyricsStatus = 503;
+  await publishRevision('Recovered words');
+  await stage.client.refresh();
+  await until(() => !stage.lyricsRequest && stage.lyricsRetryAt > lyricNow, 'failed lyric fetch schedules retry');
+  check('A failed refresh preserves the current TV lyrics and shows a retry notice',
+    stage.lines[0].text === 'Latest words' && tv.$('#tvNotice').textContent.includes('自动重试'));
+  const failedRequests = tv.network.calls.filter(call => call.url.pathname.endsWith('/lyrics.json')).length;
+  await stage.client.refresh();
+  check('Lyric failure retries are bounded across room heartbeats',
+    tv.network.calls.filter(call => call.url.pathname.endsWith('/lyrics.json')).length === failedRequests);
+  lyricNow += 5000;
+  tv.network.lyricsStatus = 0;
+  await stage.client.refresh();
+  await until(() => stage.lines[0]?.text === 'Recovered words', 'a subsequent room poll retries the failed revision');
+  tv.w.Date.now = originalNow;
+  check('A recovered TV lyric fetch preserves the audio session and position',
+    stage.mediaEpoch === epochBeforeLyrics && stage.music._playCount === playsBeforeLyrics
+    && stage.music.currentTime === positionBeforeLyrics && !stage.music.paused);
+
   stage.music.dispatchEvent(new tv.w.Event('waiting'));
   check('Buffering has a visible state and pauses guide', stage.status === 'buffering' && stage.voice.paused);
   stage.music.dispatchEvent(new tv.w.Event('playing'));
@@ -228,10 +336,10 @@ async function run() {
   remote.$('#openQueue').click();
   check('Queue sheet opens with server-authoritative contents', !remote.$('#queuePanel').hidden
     && remote.$('#remoteQueue').children.length === 2);
-  remote.$('#remoteQueue').children[1].querySelector('button').click();
+  remote.$('#remoteQueue').children[1].querySelector('button[title="置顶"]').click();
   await until(() => phone.client.state.queue[0].job_id === 'song-b', 'move-to-top');
   check('Phone move-to-top changes shared queue', phone.client.state.queue[0].job_id === 'song-b');
-  remote.$('#remoteQueue').children[1].querySelectorAll('button')[1].click();
+  remote.$('#remoteQueue').children[1].querySelector('button[title="移除"]').click();
   await until(() => phone.client.state.queue.length === 1, 'remove repeat');
   await phone.client.command('add', { job_id: 'song-a' });
   await stage.client.refresh();
@@ -280,7 +388,7 @@ async function run() {
   stage.overlay(false);
   tv.$('#pair').focus();
   tv.w.document.dispatchEvent(new tv.w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-  check('D-pad arrows move focus to visible TV controls', tv.w.document.activeElement === tv.$('#fullscreen'));
+  check('D-pad arrows move focus to visible TV controls', tv.w.document.activeElement === tv.$('#stageLobby'));
   tv.w.document.dispatchEvent(new tv.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   check('TV Back/Escape opens pairing overlay and focuses close', !tv.$('#pairPanel').hidden
     && tv.w.document.activeElement === tv.$('#closePair'));
@@ -291,6 +399,136 @@ async function run() {
   check('No API request URL contains host/controller secrets', [...tv.network.calls, ...remote.network.calls].every(call =>
     !call.url.href.includes(stage.host.token) && !call.url.href.includes(phone.client.token)
     && !call.url.search.includes(stage.host.code)));
+
+  const alicePage = browser('remote', origin + '/rooms');
+  const alice = alicePage.w.openkRemote;
+  await until(() => alicePage.$('#lobbyList').children.length, 'party lobby lists TV room');
+  check('Lobby discovers only shared room summaries, not pairing codes',
+    alicePage.$('#lobbyList').textContent.includes(stage.host.name)
+    && !alicePage.$('#lobbyList').textContent.includes(stage.host.code));
+  alicePage.$('#displayName').value = 'Alice';
+  alicePage.$('#newRoomName').value = 'Friday friends';
+  alicePage.$('#createRoomForm').dispatchEvent(new alicePage.w.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => alice.client?.state?.viewer.role === 'host' && alicePage.$('#roomSongList button'),
+    'phone creates named party room');
+  const partyA = { id: alice.client.id, code: alice.credentials.code, token: alice.client.token };
+  check('Phone owner can invite a TV without exposing its host capability',
+    !alicePage.$('#hostControls').hidden && !!alicePage.$('#inviteQR svg')
+    && new URL(alicePage.$('#screenInviteLink').href).pathname === '/tv'
+    && !alicePage.$('#screenInviteLink').href.includes(partyA.token));
+
+  const bobPage = browser('remote', alicePage.w.OpenKRoom.joinURL(partyA.id, partyA.code),
+    { 'openk.display-name': 'Bob' });
+  const bob = bobPage.w.openkRemote;
+  await until(() => bob.client?.state?.viewer.name === 'Bob', 'second person joins party');
+  check('Ordinary member does not see room-owner settings', bobPage.$('#hostControls').hidden);
+  alicePage.$('#songSearch').value = 'dx';
+  alice.renderLibrary();
+  alicePage.$('#roomSongList button').click();
+  await until(() => alice.client.state.current?.job_id === 'song-a', 'owner requests a shared song');
+  await bob.client.refresh();
+  bobPage.$('#singCurrent').click();
+  await until(() => bob.client.state.current.singers.length === 2, 'second singer joins current song');
+  await alice.client.refresh();
+  check('A shared song records its requester and multiple singers',
+    alice.client.state.current.requested_by.name === 'Alice'
+    && alicePage.$('#currentSingers').textContent.includes('Alice')
+    && alicePage.$('#currentSingers').textContent.includes('Bob')
+    && alicePage.$('#roomMembers').textContent.includes('Bob'));
+
+  const screenPage = browser('tv', alicePage.w.OpenKRoom.joinURL(partyA.id, partyA.code, 'screen'));
+  screenPage.network.holdNextLyrics = true;
+  const screen = screenPage.w.openkStage;
+  await until(() => screen.client?.state?.current && screenPage.network.releaseLyrics,
+    'invited TV pairs with its own screen capability');
+  check('Screen invitation is distinct from ownership and starts silent',
+    screen.host.role === 'screen' && screen.host.token !== partyA.token
+    && screenPage.$('#tvSettingsPanel').hidden && !screen.armed && screen.music.paused
+    && screenPage.w.location.hash === '');
+  await screen.activate();
+  check('TV renders the shared singing arrangement',
+    screen.armed && screenPage.$('#stageSingers').textContent.includes('Alice')
+    && screenPage.$('#stageSingers').textContent.includes('Bob'));
+
+  alicePage.$('#switchRoom').click();
+  await until(() => !alice.client && !alicePage.$('#joinScreen').hidden, 'owner opens lobby');
+  check('Switching the phone view does not interrupt the independent TV',
+    !screen.music.paused && !!alicePage.w.OpenKRoom.roomSessions.get(partyA.id, ['host']));
+  alicePage.$('#newRoomName').value = 'Second stage';
+  alicePage.$('#createRoomForm').dispatchEvent(new alicePage.w.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => alice.client?.state?.name === 'Second stage', 'second party room');
+  const partyB = { id: alice.client.id, code: alice.credentials.code };
+  alicePage.$('#songSearch').value = 'hktk';
+  alice.renderLibrary();
+  alicePage.$('#roomSongList button').click();
+  await until(() => alice.client.state.current?.job_id === 'song-b', 'second room queues another song');
+  await bob.client.refresh();
+  check('Different sessions keep queues and membership isolated',
+    bob.client.id === partyA.id && bob.client.state.current.job_id === 'song-a'
+    && alice.client.id === partyB.id && alice.client.state.current.job_id === 'song-b');
+
+  screen.music.currentTime = 17;
+  await screen.heartbeat();
+  screen.overlay(true);
+  screenPage.$('#tvJoinPanel').open = true;
+  screenPage.$('#tvJoinRoom').value = partyB.id;
+  screenPage.$('#tvJoinCode').value = partyB.code;
+  screenPage.$('#tvJoinForm').dispatchEvent(new screenPage.w.Event('submit', { bubbles: true, cancelable: true }));
+  await until(() => screen.client?.id === partyB.id && screen.client.state?.current?.job_id === 'song-b',
+    'TV switches room through pairing form');
+  screenPage.network.releaseLyrics();
+  await sleep(50);
+  await bob.client.refresh();
+  check('TV switch releases only its old lease and fences late lyrics/audio',
+    !bob.client.state.player.online && !bob.client.state.playback.playing
+    && bob.client.state.current.job_id === 'song-a'
+    && screen.music.src.includes('/song-b/') && screen.music.paused && !screen.armed
+    && screen.lines.length === 0);
+  check('The TV retains separate reconnect credentials for both rooms',
+    screenPage.w.OpenKRoom.roomSessions.get(partyA.id, ['screen'])
+    && screenPage.w.OpenKRoom.roomSessions.get(partyB.id, ['screen']));
+  const savedA = screenPage.w.OpenKRoom.roomSessions.get(partyA.id, ['screen']).token;
+  const savedB = screenPage.w.OpenKRoom.roomSessions.get(partyB.id, ['screen']).token;
+  await screen.start(false, { room: partyA.id, code: partyA.code });
+  await until(() => screen.client?.state, 'screen returns to first party');
+  check('Returning to a paired room reuses its screen membership', screen.host.token === savedA);
+  await screen.start(false, { room: partyB.id, code: partyB.code });
+  await until(() => screen.client?.state, 'screen returns to second party');
+  check('Repeated switching does not consume more screen slots', screen.host.token === savedB);
+  await screen.activate();
+  check('New room requires its own explicit audio activation', screen.armed && !screen.music.paused);
+
+  const bobToken = bob.client.token;
+  bobPage.$('#leaveRoom').click();
+  await until(() => !bob.client && !bobPage.$('#joinScreen').hidden, 'member leaves party');
+  const denied = await fetch(origin + '/api/rooms/' + partyA.id, {
+    headers: { Authorization: 'Bearer ' + bobToken },
+  });
+  check('Leaving removes membership instead of only hiding the phone UI', denied.status === 403
+    && !bobPage.w.OpenKRoom.roomSessions.get(partyA.id, ['controller']));
+
+  alicePage.$('#switchRoom').click();
+  const returnA = alicePage.$(`#recentList [data-room-id="${partyA.id}"] button`);
+  check('The lobby retains multiple own rooms for one-click switching', !!returnA
+    && !!alicePage.$(`#recentList [data-room-id="${partyB.id}"] button`));
+  returnA.click();
+  await until(() => alice.client?.id === partyA.id && alice.client.state, 'resume first room');
+  alicePage.$('#hostControls').open = true;
+  alicePage.$('#endRoom').click();
+  alicePage.$('#endRoom').click();
+  await until(() => !alice.client, 'owner closes first room');
+  check('Closing one party does not stop a different room',
+    screen.client.id === partyB.id && screen.armed && !screen.music.paused
+    && !alicePage.w.OpenKRoom.roomSessions.get(partyA.id));
+  alicePage.$(`#recentList [data-room-id="${partyB.id}"] button`).click();
+  await until(() => alice.client?.id === partyB.id && alice.client.state, 'resume second room');
+  alicePage.$('#hostControls').open = true;
+  alicePage.$('#endRoom').click();
+  alicePage.$('#endRoom').click();
+  await until(() => !alice.client && !screen.client && screen.music.paused, 'room closure stops its TV');
+  check('Closing a party silences its TV and removes its saved screen grant',
+    !screen.armed && !screenPage.w.OpenKRoom.roomSessions.get(partyB.id, ['screen']));
+
   check('No unhandled window errors', errors.length === 0);
 }
 

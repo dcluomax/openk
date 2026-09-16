@@ -6,6 +6,8 @@
   <meta name="theme-color" content="#101416" />
   <title>openk · 点歌台</title>
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/account.css" />
+  <link rel="stylesheet" href="/library.css" />
 </head>
 <body>
   <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -28,10 +30,15 @@
         <button id="searchClear" class="s-clear hidden" title="清空" aria-label="清空搜索">✕</button>
       </div>
       <div class="top-actions">
+        <a class="top-link" href="/rooms" target="_blank" rel="noopener" title="查看、创建与加入聚会房间" aria-label="打开聚会大厅">
+          <svg class="ui-icon" aria-hidden="true"><use href="#icon-queue"/></svg><span class="action-label">房间</span>
+        </a>
         <a class="top-link" href="/tv" target="_blank" rel="noopener" title="在新窗口打开演唱大屏" aria-label="打开演唱大屏">
           <svg class="ui-icon" aria-hidden="true"><use href="#icon-tv"/></svg><span class="action-label">大屏</span>
         </a>
-        <a class="top-link" href="/remote" target="_blank" rel="noopener" title="在新窗口打开遥控点歌" aria-label="打开手机点歌">
+        <a id="remoteLink" class="top-link" href="/remote" target="_blank" rel="noopener"
+           title="扫码打开手机遥控" aria-label="显示手机遥控二维码"
+           aria-haspopup="dialog" aria-controls="remotePanel" aria-expanded="false">
           <svg class="ui-icon" aria-hidden="true"><use href="#icon-phone"/></svg><span class="action-label">遥控</span>
         </a>
         <button id="queueBtn" class="top-btn queue-button" title="已点歌曲">
@@ -41,10 +48,19 @@
           <svg class="ui-icon" aria-hidden="true"><use href="#icon-settings"/></svg><span class="action-label">后台</span> <span id="adminBadge" class="pill busy hidden">0</span>
         </button>
       </div>
+      <div id="accountChip" class="account-chip" hidden></div>
     </header>
 
     <h1 class="visually-hidden">openk 点歌与演唱台</h1>
     <p id="catalogStatus" class="notice hidden" role="status"></p>
+    <section id="roomStatus" class="room-summary" aria-label="当前房间与播放设备" hidden>
+      <div class="room-summary-copy">
+        <a href="/rooms" title="查看或切换当前房间"><strong id="currentRoomName">当前房间</strong></a>
+        <span id="roomPlaybackStatus" role="status">正在连接房间…</span>
+      </div>
+      <button id="roomActivate" class="top-btn queue-button" type="button" disabled>在本机播放</button>
+      <div id="roomDevices" class="room-device-section" hidden></div>
+    </section>
     <section id="pendingRecordingsWrap" class="notice pending-recordings hidden" aria-label="尚未保存的录音">
       <strong>录音保存中心</strong>
       <p class="muted small">保存失败的音频仍保留在本页。请重试或下载备份后再关闭页面。</p>
@@ -70,8 +86,9 @@
         <div class="library-heading">
           <div class="library-title"><h2>我的曲库</h2><span id="browseCount" class="muted small"></span></div>
           <nav class="tabs" aria-label="曲库分类">
-            <button class="tab active" data-tab="all" aria-pressed="true">全部</button>
+            <button class="tab active" data-tab="all" aria-pressed="true">拼音</button>
             <button class="tab" data-tab="artist" aria-pressed="false">歌手</button>
+            <button class="tab" data-tab="popular" aria-pressed="false" hidden>常唱</button>
             <button class="tab" data-tab="new" aria-pressed="false">最新</button>
           </nav>
         </div>
@@ -79,10 +96,24 @@
           <div id="langBar" class="lang-bar" aria-label="语种筛选"></div>
           <button id="viewToggle" class="view-toggle" title="在文字列表和封面墙之间切换">封面视图</button>
         </div>
+        <div id="browseAux" class="catalog-controls" hidden>
+          <button id="artistBack" class="catalog-action" type="button" hidden>‹ 返回歌手列表</button>
+          <button id="refreshPopularity" class="catalog-action" type="button" hidden>刷新常唱</button>
+        </div>
+        <details id="browseAlphabet" class="catalog-alphabet">
+          <summary id="browseAlphabetLabel">歌名首字母 · 全部</summary>
+          <nav id="browseIndex" class="catalog-index" aria-label="拼音首字母筛选"></nav>
+        </details>
+        <p id="browseHint" class="catalog-note" role="status" hidden></p>
         <ul id="songList" class="song-list"></ul>
         <div id="grid" class="song-grid hidden" role="list"></div>
         <div id="artistList" class="artist-list hidden"></div>
         <p id="browseEmpty" class="empty hidden"></p>
+        <nav id="browsePager" class="catalog-pager" aria-label="曲库分页" hidden>
+          <button type="button" data-page-step="-1">上一页</button>
+          <span data-page-info role="status"></span>
+          <button type="button" data-page-step="1">下一页</button>
+        </nav>
       </div>
     </section>
 
@@ -99,14 +130,33 @@
         </div>
 
         <div class="lyrics-tools">
-          <button id="editLyrics" class="lyr-btn hidden" title="识别不准时可逐行手动修改歌词">✏️ 编辑歌词</button>
+          <button id="editLyrics" class="lyr-btn hidden" title="修改歌词文字、起止时间或整体前奏偏移">✏️ 编辑歌词与时间</button>
           <button id="searchLyrics" class="lyr-btn hidden" title="从歌词库搜索正确歌词并重新对齐（识别成拼音/英文时用）">🔍 搜歌词重对齐</button>
           <div id="editBar" class="edit-bar hidden">
-            <span class="muted small">逐行修改文字，保存后自动重建逐字时间轴</span>
+            <span class="muted small">文字与时间可一起修改，保存后同步到其他播放设备</span>
             <button id="saveLyrics" class="lyr-btn primary">保存</button>
             <button id="cancelLyrics" class="lyr-btn">取消</button>
           </div>
         </div>
+
+        <section id="lyricTimingTools" class="lyric-timing-tools hidden" aria-label="手动对齐歌词">
+          <p class="small lyric-timing-help">补前奏：播放到某一句开口，点该行「对齐整首」。时间可填秒数或分:秒，例如 12.5 或 00:12.500。</p>
+          <div class="lyric-offset-bar">
+            <label for="lyricOffset">整体偏移（秒）<input id="lyricOffset" type="number" step="0.1" value="0" inputmode="decimal" aria-describedby="lyricOffsetHint" /></label>
+            <button id="applyLyricOffset" class="lyr-btn" data-timing-change>应用偏移</button>
+            <button class="lyr-btn" data-lyric-shift="-0.1" data-timing-change aria-label="提前 0.1 秒" title="整首提前 0.1 秒">-0.1 秒</button>
+            <button class="lyr-btn" data-lyric-shift="0.1" data-timing-change aria-label="延后 0.1 秒" title="整首延后 0.1 秒">+0.1 秒</button>
+            <button id="resetLyricTiming" class="lyr-btn" data-timing-change title="还原本次编辑前的时间，保留文字改动">还原时间</button>
+          </div>
+          <p id="lyricOffsetHint" class="muted small">正数延后、负数提前。保存后才生效。</p>
+          <div class="lyric-edit-transport">
+            <button id="lyricEditPlay" class="lyr-btn" aria-label="播放或暂停">▶</button>
+            <span>当前 <output id="lyricEditPosition" class="time" aria-live="off">00:00.000</output></span>
+            <input id="lyricEditSeek" class="seek" type="range" min="0" max="1000" step="0.01" value="0" aria-label="歌词对齐试听进度" />
+          </div>
+          <p id="lyricEditPlaybackHint" class="muted small"></p>
+          <p id="lyricTimingNotice" class="lyric-timing-notice small" role="status"></p>
+        </section>
 
         <div id="lyricSearch" class="lyric-search hidden">
           <div class="ls-bar">
@@ -121,7 +171,7 @@
         <p id="alignmentStatus" class="notice hidden" role="status"></p>
         <div id="lyrics" class="lyrics"></div>
 
-        <div class="controls">
+        <div id="playerControls" class="controls">
           <button id="playBtn" class="round" title="播放/暂停" aria-label="播放或暂停">▶</button>
           <span id="curTime" class="time">0:00</span>
           <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度" />
@@ -152,7 +202,21 @@
               <option value="church">教堂</option>
             </select>
           </label>
+          <label class="mix">
+            🔈 Output / 本机输出 <span id="outVolVal" class="mix-val">100%</span>
+            <input id="outVol" type="range" min="0" max="100" value="100" />
+          </label>
+          <label class="mix">
+            🎙️ 麦克风设备
+            <select id="audioIn" aria-label="麦克风输入设备"></select>
+          </label>
+          <label class="mix">
+            🔊 扬声器设备
+            <select id="audioOut" aria-label="音频输出设备"></select>
+          </label>
         </div>
+        <p id="deviceHint" class="hint hidden" role="status"></p>
+        <p id="prefsStatus" class="hint hidden" role="status"></p>
 
         <div class="recorder">
           <label class="mon" title="把麦克风的声音一起放出来（和真正的 KTV 一样）">
@@ -178,6 +242,21 @@
         <audio id="vocalAudio" preload="auto"></audio>
       </div>
     </section>
+
+    <aside id="remotePanel" class="drawer remote-qr-dialog hidden" role="dialog"
+           aria-modal="true" aria-labelledby="remoteHeading" aria-describedby="remoteQRHint">
+      <div class="drawer-head">
+        <strong id="remoteHeading">手机遥控</strong>
+        <span class="drawer-spacer"></span>
+        <button id="remoteClose" class="lyr-btn" type="button">关闭</button>
+      </div>
+      <div id="remoteQR" class="remote-qr-code"></div>
+      <p id="remoteQRHint" class="muted">用手机相机扫码打开遥控页。</p>
+      <p id="remoteQRNotice" class="notice small hidden" role="status"></p>
+      <a id="remoteOpen" class="lyr-btn primary remote-qr-open" href="/remote"
+         target="_blank" rel="noopener">在本机打开遥控页</a>
+      <p id="remoteAddress" class="muted small remote-qr-address"></p>
+    </aside>
 
     <!-- 已点歌曲抽屉 -->
     <aside id="queuePanel" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="queueHeading">
@@ -302,6 +381,11 @@
   </div>
 
   <script src="/search.js"></script>
+  <script src="/library.js"></script>
+  <script src="/room-client.js"></script>
+  <script src="/account.js"></script>
+  <script src="/user-state.js"></script>
+  <script src="/vendor/qrcode.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

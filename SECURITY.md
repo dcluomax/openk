@@ -6,6 +6,20 @@ OpenK 面向可信局域网或已有身份认证反向代理后的部署，**不
 六位配对码、电视租约和控制凭据只保护共享房间，不能保护曲库、下载、录音或管理 API。
 不要把未认证的 HTTP 端口直接映射到公网。
 
+可选的账号房间集成使用独立私密代理跳点口令，并只接受该代理转发的账号资料。
+`X-OpenK-Account` 是编码后的资料，不是自带签名的登录令牌；代理必须认证用户、覆盖
+客户端传入的身份头，并通过受保护的上游连接发送 `X-OpenK-Identity-Key`。
+不要把这个口令返回给浏览器、复用 worker 口令或站点会话密钥，或把仅设置转发头当作
+全站认证。未配置集成时保持原来的可信网络配对模式；已配置但缺少有效身份时拒绝请求，
+不降级为游客。完整协议见[账号集成](docs/accounts.md)。
+
+The optional [guest trial](docs/guest-trials.md) is an explicit, separate
+anonymous-session capability, not an account-authentication fallback. Its
+gateway exceptions must be limited to the guest page/assets and `/api/trial/`;
+ordinary media, recordings, room and management endpoints remain protected.
+A guest can access only one server-selected song within a bounded window.
+The limit is per browser session, not a person-level entitlement or DRM.
+
 - 跨机器使用 HTTPS 或经过认证的加密隧道；浏览器侧 TLS 不会自动保护 worker 的独立连接。
 - 浏览器默认同源访问；修改 API 的请求会在副作用发生前拒绝不匹配或 `null` 来源。
   必须跨域时通过 `OPENK_ALLOWED_ORIGINS` 明确列出可信来源，不接受通配符。无 Origin 的

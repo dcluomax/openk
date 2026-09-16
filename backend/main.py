@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, pipeline, search
+from . import config, identity, pipeline, search, trials, user_state
 from .jobs import JobCancelledError, JobConflictError, extract_video_id, manager
 from .operations import OperationStore, public_operation
 from .security import BrowserOriginMiddleware
@@ -41,6 +41,8 @@ from .steps import local_media
 from .steps import playlist as playlist_step
 
 config.ensure_dirs()
+if config.GUEST_TRIAL_ENABLED and not identity.enabled():
+    raise ValueError("OPENK_GUEST_TRIAL_ENABLED requires a configured authenticated proxy identity key")
 
 
 class _QuietPollFilter(logging.Filter):
@@ -60,7 +62,9 @@ logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
 class ApiGZipMiddleware(GZipMiddleware):
     async def __call__(self, scope, receive, send):
         # 音轨的 Range 字节范围不能被传输压缩改变。
-        if scope["type"] == "http" and scope["path"].startswith("/api/"):
+        if (scope["type"] == "http" and scope["path"].startswith("/api/")
+                and not scope["path"].startswith("/api/trial/media/")
+                and scope["path"] != "/api/trial/lyrics"):
             await super().__call__(scope, receive, send)
         else:
             await self.app(scope, receive, send)
@@ -75,11 +79,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(BrowserOriginMiddleware, allowed_origins=config.ALLOWED_ORIGINS)
+app.add_middleware(trials.TrialBoundaryMiddleware)
 
 from .remote.api import router as _worker_router  # noqa: E402
 from .rooms import router as _rooms_router  # noqa: E402
 app.include_router(_worker_router, prefix="/api")
 app.include_router(_rooms_router)
+app.include_router(identity.router)
+app.include_router(user_state.router)
 
 _executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 _operations = OperationStore(config.DATA_DIR / "operations.json")
@@ -121,6 +128,7 @@ class LyricsUpdateRequest(BaseModel):
     lines: list[dict]                 # [{start, end, text, words?}]
     language: str | None = None
     source: str | None = None
+    base_lyrics_url: str | None = None
 
 
 class RetryJobRequest(BaseModel):
@@ -530,10 +538,17 @@ def get_job(job_id: str) -> dict:
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str) -> dict:
+def delete_job(job_id: str, failed_only: bool = False) -> dict:
     with _operation_lock:
-        _operations.cancel_for(job_id)
-        if not manager.delete(job_id):
+        if failed_only and _operations.active_for(job_id):
+            raise HTTPException(status_code=409, detail="歌词正在更新，请等待完成后再处理")
+        if not failed_only:
+            _operations.cancel_for(job_id)
+        try:
+            deleted = manager.delete(job_id, failed_only=failed_only)
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
             raise HTTPException(status_code=404, detail="任务不存在")
     return {"ok": True}
 
@@ -601,13 +616,19 @@ def update_lyrics(job_id: str, req: LyricsUpdateRequest) -> dict:
             raise HTTPException(status_code=404, detail="任务不存在")
         if job["state"] != "done" or _operations.active_for(job_id):
             raise HTTPException(status_code=409, detail="歌曲正在处理，请等待完成后编辑")
+        if (req.base_lyrics_url is not None
+                and req.base_lyrics_url != _public_job(job)["media"].get("lyrics")):
+            raise HTTPException(status_code=409, detail="歌词已被其他设备更新，请取消编辑，载入新版歌词后再调整。")
         source = (req.source or job.get("lyrics_source") or "手动编辑").strip()
         if "已编辑" not in source:
             source = f"{source} · 已编辑"
         with _lyrics_workspace(job) as directory:
-            result = transcribe.save_edited_lyrics(
-                req.lines, req.language or job.get("language"), source, Path(directory)
-            )
+            try:
+                result = transcribe.save_edited_lyrics(
+                    req.lines, req.language or job.get("language"), source, Path(directory)
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             result = _publish_lyrics(job, result, Path(directory))
     return {"ok": True, **result}
 
@@ -794,6 +815,8 @@ class NoCacheStaticFiles(StaticFiles):
     """
 
     async def get_response(self, path: str, scope):  # type: ignore[override]
+        if path == "trial" or path.startswith("trial/"):
+            raise HTTPException(status_code=404, detail="Use the configured guest entry.")
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response
@@ -833,6 +856,7 @@ class MediaStaticFiles(StaticFiles):
 
 
 app.mount("/media", MediaStaticFiles(directory=str(config.JOBS_DIR)), name="media")
+app.include_router(trials.create_router(MediaStaticFiles(directory=str(config.JOBS_DIR))))
 
 
 def _page(filename: str) -> FileResponse:
@@ -840,6 +864,47 @@ def _page(filename: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="页面未安装")
     return FileResponse(path, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/index.html", include_in_schema=False)
+def home_page() -> FileResponse:
+    return _page("index.html")
+
+
+@app.api_route("/try", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/try/", methods=["GET", "HEAD"], include_in_schema=False)
+def trial_page() -> FileResponse:
+    trials.require_enabled()
+    return _page("trial/index.html")
+
+
+@app.api_route("/trial-assets/{filename}", methods=["GET", "HEAD"], include_in_schema=False)
+def trial_asset(filename: str) -> FileResponse:
+    trials.require_enabled()
+    if filename not in {"trial.js", "trial.css"}:
+        raise HTTPException(404, "未找到试唱页面资源。")
+    return _page(f"trial/{filename}")
+
+
+@app.get("/library", include_in_schema=False)
+@app.get("/library/", include_in_schema=False)
+def library_page() -> FileResponse:
+    return _page("index.html")
+
+
+@app.get("/devices", include_in_schema=False)
+@app.get("/devices/", include_in_schema=False)
+def devices_page() -> FileResponse:
+    user_state.require_enabled()
+    return _page("devices.html")
+
+
+@app.get("/history", include_in_schema=False)
+@app.get("/history/", include_in_schema=False)
+def history_page() -> FileResponse:
+    user_state.require_enabled()
+    return _page("history.html")
 
 
 @app.get("/tv", include_in_schema=False)
@@ -850,6 +915,8 @@ def tv_page() -> FileResponse:
 
 @app.get("/remote", include_in_schema=False)
 @app.get("/remote/", include_in_schema=False)
+@app.get("/rooms", include_in_schema=False)
+@app.get("/rooms/", include_in_schema=False)
 def remote_page() -> FileResponse:
     return _page("remote.html")
 

@@ -1,6 +1,7 @@
 """目录缓存、流式录音与异步歌词接口回归，不调用外部模型或网络。"""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
@@ -19,7 +20,7 @@ os.environ["OPENK_JOBS_DIR"] = str(Path(_temporary.name) / "jobs")
 os.environ["OPENK_RESUME_ON_START"] = "false"
 
 from fastapi.testclient import TestClient
-from backend import main, search
+from backend import identity, main, search
 from backend.jobs import manager
 from backend.steps import local_media, lyrics_sources
 
@@ -58,6 +59,56 @@ class HttpTests(unittest.TestCase):
         result = self.client.get("/api/jobs", params={"q": "測試"}).json()
         self.assertTrue(any(job["id"] == self.job_id for job in result))
         self.assertEqual(self.client.get("/api/health").json(), {"status": "ok"})
+
+    def test_party_lobby_and_existing_room_pages_are_available(self):
+        for path in ("/rooms", "/rooms/", "/remote", "/remote/", "/tv", "/tv/"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("no-cache", response.headers["cache-control"])
+                self.assertIn("room-client.js", response.text)
+
+    def test_account_mode_home_keeps_the_full_room_capable_player(self):
+        with patch.object(identity, "KEY", b"test-only-identity-key-" + b"a" * 32):
+            for path in ("/", "/index.html"):
+                response = self.client.get(path, follow_redirects=False)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn('id="instAudio"', response.text)
+                self.assertIn('id="roomStatus"', response.text)
+                self.assertIn('src="/account.js"', response.text)
+                self.assertIn("no-cache", response.headers["cache-control"])
+            for path in ("/library", "/library/", "/admin"):
+                self.assertEqual(self.client.get(path).status_code, 200)
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+    def test_user_device_and_history_routes_are_wired_into_the_real_application(self):
+        key = b"integration-only-proxy-key-" + b"a" * 32
+        account = {
+            "id": "00000000-0000-4000-8000-000000000071",
+            "username": "integration-singer", "display_name": "Integration singer",
+            "is_staff": False,
+        }
+        headers = {
+            "X-OpenK-Identity-Key": key.decode(),
+            "X-OpenK-Account": base64.urlsafe_b64encode(json.dumps(account).encode()).decode(),
+        }
+        with patch.object(identity, "KEY", key):
+            for route, script in (("/devices", "/devices.js"), ("/history", "/history.js")):
+                for path in (route, route + "/"):
+                    response = self.client.get(path)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn('/user-state.js', response.text)
+                    self.assertIn(script, response.text)
+                    self.assertIn('<html lang="zh-CN">', response.text)
+                    self.assertIn("设备" if route == "/devices" else "播放历史", response.text)
+            for path in ("/api/user/state", "/api/user/history"):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                response = self.client.get(path, headers=headers)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("no-store", response.headers["cache-control"])
+        with patch.object(identity, "KEY", b""):
+            for path in ("/devices", "/history", "/api/user/state", "/api/user/history"):
+                self.assertEqual(self.client.get(path).status_code, 404)
 
     def test_api_compression_does_not_change_media_ranges(self):
         manager.update(self.job_id, message="large catalog field " * 300)
@@ -242,6 +293,65 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(main.get_operation(operation["id"])["state"], "error")
         self.assertFalse(manager.job_dir(self.job_id).exists())
 
+    def test_failed_only_delete_refreshes_catalog_and_preserves_import_source(self):
+        original = Path(_temporary.name) / f"original-{self.job_id}.flac"
+        original.write_bytes(b"original imported audio")
+        self.addCleanup(original.unlink, missing_ok=True)
+        manager.update(self.job_id, state="error", local_path=str(original), source_type="local")
+        before = self.client.get("/api/jobs")
+        response = self.client.delete(f"/api/jobs/{self.job_id}?failed_only=true")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"ok": True})
+        self.assertEqual(original.read_bytes(), b"original imported audio")
+        self.assertFalse(manager.job_dir(self.job_id).exists())
+        after = self.client.get("/api/jobs", headers={"If-None-Match": before.headers["etag"]})
+        self.assertEqual(after.status_code, 200)
+        self.assertNotIn(self.job_id, [job["id"] for job in after.json()])
+        self.assertEqual(self.client.delete(f"/api/jobs/{self.job_id}?failed_only=true").status_code, 404)
+
+    def test_failed_only_delete_rejects_running_and_completed_jobs(self):
+        for state in ("pending", "queued", "running", "done"):
+            with self.subTest(state=state):
+                manager.update(self.job_id, state=state)
+                before = manager.get(self.job_id)
+                data = (manager.job_dir(self.job_id) / "status.json").read_bytes()
+                with patch.object(main._operations, "cancel_for") as cancel:
+                    response = self.client.delete(f"/api/jobs/{self.job_id}?failed_only=true")
+                    self.assertEqual(response.status_code, 409, response.text)
+                    cancel.assert_not_called()
+                self.assertEqual(manager.get(self.job_id), before)
+                self.assertEqual((manager.job_dir(self.job_id) / "status.json").read_bytes(), data)
+
+    def test_failed_only_delete_does_not_cancel_a_lyric_operation(self):
+        with patch.object(main._executor, "submit"):
+            response = self.client.post(f"/api/jobs/{self.job_id}/lyrics/align", json={"lrclib_id": 1})
+        operation = response.json()["operation"]
+        before = main.get_operation(operation["id"])
+        response = self.client.delete(f"/api/jobs/{self.job_id}?failed_only=true")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(main.get_operation(operation["id"]), before)
+        self.assertEqual(manager.get(self.job_id)["state"], "done")
+
+    def test_failed_only_delete_rejects_a_successful_retry_from_another_device(self):
+        manager.update(self.job_id, state="error")
+        with patch.object(main._executor, "submit") as submit:
+            retried = self.client.post(f"/api/jobs/{self.job_id}/retry")
+            self.assertEqual(retried.status_code, 200, retried.text)
+            submit.assert_called_once()
+        before = manager.get(self.job_id)
+        response = self.client.delete(f"/api/jobs/{self.job_id}?failed_only=true")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(manager.get(self.job_id), before)
+        self.assertEqual(before["state"], "queued")
+
+    def test_failed_only_parameter_is_validated_and_general_delete_remains_available(self):
+        invalid = self.client.delete(f"/api/jobs/{self.job_id}?failed_only=invalid")
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(manager.get(self.job_id)["state"], "done")
+        response = self.client.delete(f"/api/jobs/{self.job_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(manager.get(self.job_id))
+
     def test_manual_lyrics_revision_keeps_song_identity(self):
         response = self.client.put(f"/api/jobs/{self.job_id}/lyrics",
                                    json={"lines": [{"text": "一起唱首歌", "start": 0, "end": 3}]})
@@ -250,6 +360,63 @@ class HttpTests(unittest.TestCase):
         result = self.client.get(job["media"]["lyrics"]).json()
         self.assertEqual(result["lines"][0]["text"], "一起唱首歌")
         self.assertEqual(job["lyrics_status"], "ok")
+
+    def test_manual_timing_keeps_word_gaps_and_rejects_a_stale_editor(self):
+        before = self.client.get(f"/api/jobs/{self.job_id}").json()
+        old_url = before["media"]["lyrics"]
+        words = [{"text": "hello", "start": 2.125, "end": 2.75},
+                 {"text": "world", "start": 5.5, "end": 6.25}]
+        payload = {"base_lyrics_url": old_url, "lines": [
+            {"text": "hello world", "start": 2, "end": 7, "words": words},
+        ]}
+        saved = self.client.put(f"/api/jobs/{self.job_id}/lyrics", json=payload)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        current = self.client.get(f"/api/jobs/{self.job_id}").json()
+        latest_url = current["media"]["lyrics"]
+        self.assertNotEqual(latest_url, old_url)
+        self.assertEqual(self.client.get(latest_url).json()["lines"][0]["words"], words)
+        self.assertEqual(self.client.get(old_url).json(), {"lines": []})
+        again = self.client.put(f"/api/jobs/{self.job_id}/lyrics", json=payload)
+        self.assertEqual(again.status_code, 409, again.text)
+        self.assertIn("其他设备更新", again.json()["detail"])
+        self.assertEqual(self.client.get(f"/api/jobs/{self.job_id}").json()["media"]["lyrics"], latest_url)
+        self.assertEqual(current["stems"], before["stems"])
+        self.assertEqual(current["duration"], before["duration"])
+
+    def test_manual_timing_rejects_invalid_intervals_without_publishing(self):
+        before = manager.get(self.job_id).copy()
+        cases = [
+            {"text": "words", "start": -1, "end": 2},
+            {"text": "words", "start": 4, "end": 2},
+            {"text": "words", "start": True, "end": 2},
+            {"text": "words", "start": float("nan"), "end": 2},
+            {"text": "words", "start": 0, "end": float("inf")},
+            {"text": "words", "start": 0},
+            {"text": " ", "start": 0, "end": 2},
+            {"text": "words", "start": 0, "end": 2, "words": "invalid"},
+            {"text": "words", "start": 0, "end": 2, "words": {}},
+            {"text": "words", "start": 0, "end": 2, "words": False},
+            {"text": "words", "start": 0, "end": 2,
+             "words": [{"text": "words", "start": 0, "end": -1}]},
+        ]
+        for line in cases:
+            with self.subTest(line=line):
+                response = self.client.put(f"/api/jobs/{self.job_id}/lyrics",
+                    content=json.dumps({"lines": [line]}),
+                    headers={"Content-Type": "application/json"})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIsInstance(response.json()["detail"], str)
+                self.assertEqual(manager.get(self.job_id), before)
+        self.assertFalse((manager.job_dir(self.job_id) / ".openk-results").exists())
+
+    def test_short_manual_line_never_generates_words_after_its_end(self):
+        response = self.client.put(f"/api/jobs/{self.job_id}/lyrics",
+            json={"lines": [{"text": "一起唱", "start": 1, "end": 1.1}]})
+        self.assertEqual(response.status_code, 200, response.text)
+        job = self.client.get(f"/api/jobs/{self.job_id}").json()
+        line = self.client.get(job["media"]["lyrics"]).json()["lines"][0]
+        self.assertEqual(line["end"], 1.1)
+        self.assertTrue(all(1 <= word["start"] <= word["end"] <= 1.1 for word in line["words"]))
 
 
 if __name__ == "__main__":

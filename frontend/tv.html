@@ -7,20 +7,24 @@
   <meta name="theme-color" content="#11121d">
   <title>OpenK · 大屏舞台</title>
   <link rel="stylesheet" href="/stage.css">
+  <link rel="stylesheet" href="/account.css">
   <script defer src="/vendor/qrcode.js"></script>
   <script defer src="/room-client.js"></script>
+  <script defer src="/account.js"></script>
+  <script defer src="/user-state.js"></script>
   <script defer src="/tv.js"></script>
 </head>
 <body class="tv-page">
   <main class="tv-safe">
     <header class="stage-header">
-      <a class="room-brand" href="/" aria-label="返回经典点歌台">open<span>k</span><small>THE LIVING ROOM STAGE</small></a>
-      <div class="stage-indicator"><span id="connection" role="status">连接中</span><span id="roomLabel">共享房间</span></div>
+      <a class="room-brand" href="/" aria-label="返回点歌台">open<span>k</span><small>客厅的专属舞台</small></a>
+      <div class="stage-indicator"><span id="roomLabel">共享房间</span><span id="connection" role="status">连接中</span></div>
+      <div id="tvAccountChip" class="account-chip" hidden></div>
     </header>
     <section class="now-heading">
       <img id="cover" class="stage-cover" alt="" hidden>
       <div><p class="eyebrow" id="songEyebrow">今晚，轮到你发光</p>
-        <h1 id="songTitle">把客厅交给音乐</h1><p id="songArtist">手机点歌 · 大屏开唱</p></div>
+        <h1 id="songTitle">把客厅交给音乐</h1><p id="songArtist">手机点歌 · 大屏开唱</p><p id="stageSingers" class="stage-singers"></p></div>
     </section>
     <section class="lyric-stage" aria-label="歌词">
       <p id="countdown" class="countdown"></p>
@@ -31,13 +35,18 @@
       <div class="stage-progress"><span id="elapsed">0:00</span><div class="progress-track"><div id="progress"></div></div><span id="duration">0:00</span></div>
       <div class="next-up"><span class="eyebrow">UP NEXT / 下一首</span><span id="nextSong">等待手机点歌</span><span id="audioStatus" role="status">请先启用电视声音</span></div>
       <nav id="stageControls" class="stage-controls" aria-label="播放控制">
+        <div class="stage-transport">
         <button id="activate" class="primary">启用电视声音</button>
         <button id="playPause" disabled>播放</button>
         <button id="guide" aria-pressed="false" disabled>原唱 · 关</button>
         <button id="restart" disabled>重唱</button>
         <button id="next" disabled>下一首</button>
-        <button id="pair">手机点歌</button>
+        </div>
+        <div class="stage-utilities">
+        <button id="pair">手机与房间</button>
+        <button id="stageLobby">大厅</button>
         <button id="fullscreen">全屏</button>
+        </div>
       </nav>
       <p class="remote-hint">方向键选择 · 确认键操作 · 返回键打开配对面板<span>麦克风请连接外部卡拉 OK 设备</span></p>
     </div>
@@ -45,15 +54,51 @@
   <section id="pairPanel" class="room-overlay" role="dialog" aria-modal="true" aria-labelledby="pairTitle" hidden>
     <div class="pair-card">
       <button id="closePair" class="close-button" aria-label="关闭配对面板">✕</button>
-      <p class="eyebrow">ONE ROOM. EVERY VOICE.</p>
-      <h2 id="pairTitle">你的手机，就是点歌台</h2>
-      <p>连接同一 Wi-Fi，扫码加入。声音只在电视播放。</p>
+      <header class="pair-heading">
+        <p class="eyebrow">ROOM &amp; DEVICES</p>
+        <h2 id="pairTitle">让手机加入这场演唱</h2>
+        <p class="muted">手机负责点歌，这台设备负责播放。</p>
+      </header>
+      <div class="pair-main">
       <div class="pair-content"><div id="qr" class="qr-code" aria-label="手机配对二维码"></div>
-        <div><p class="eyebrow">配对码</p><strong id="pairCode" class="pair-code">··· ···</strong>
+        <div class="pair-identity"><p class="eyebrow">手机配对码</p><strong id="pairCode" class="pair-code">··· ···</strong>
           <p id="pairRoom"></p><p id="joinAddress" class="join-address"></p></div></div>
-      <p class="muted">不能扫码？手机打开上方地址，填写房间号和配对码。</p>
+      <p class="muted small-copy">扫码加入，或在手机点歌页填写房间号和配对码。</p>
       <p id="pairNotice" class="notice" role="status"></p>
-      <div class="pair-actions"><button id="pairActivate" class="primary">启用声音，开始今晚</button><button id="newRoom">创建新房间</button></div>
+      <p id="tvMembers" class="muted"></p>
+      <div class="pair-actions"><button id="pairActivate" class="primary">启用声音，开始演唱</button><button id="tvLobby">去房间大厅</button><a id="tvSignIn" class="primary" href="/auth/login/" hidden>登录 OpenK</a></div>
+      </div>
+      <aside class="pair-settings" aria-label="房间与设备管理">
+      <section id="tvDevices" class="room-device-section" aria-label="房间设备及角色" hidden></section>
+      <details class="room-settings" id="tvSettingsPanel" hidden><summary>管理当前房间</summary>
+        <form id="tvRoomSettings" class="join-form">
+          <label for="tvRoomName">房间名称</label><input id="tvRoomName" required maxlength="60">
+          <label class="check-label"><input id="tvRoomListed" type="checkbox"><span>在聚会大厅展示</span></label>
+          <label class="check-label"><input id="tvRoomScreens" type="checkbox"><span>允许其他电视加入</span></label>
+          <button id="tvSaveSettings" type="submit">保存设置</button>
+        </form>
+        <button id="tvRefreshInvite" type="button" hidden>生成新的配对码</button>
+        <p id="tvInvitePrivacy" class="muted small-copy" hidden>服务器只保存配对码的摘要。换设备登录后看不到旧配对码时，生成一个新的；旧配对码会立即失效。</p>
+        <button id="tvEndRoom" class="danger-button" type="button">结束当前房间</button>
+        <p class="muted small-copy">结束会清空本房间歌单并让所有设备退出，不删除曲库。</p>
+      </details>
+      <details class="room-settings" id="tvJoinPanel"><summary>加入另一个房间</summary>
+        <form id="tvJoinForm" class="join-form">
+          <label for="tvJoinRoom">房间号</label><input id="tvJoinRoom" required maxlength="10" pattern="[a-fA-F0-9]{10}" autocomplete="off" autocapitalize="none">
+          <label for="tvJoinCode">配对码</label><input id="tvJoinCode" required maxlength="6" pattern="[0-9]{6}" inputmode="numeric" autocomplete="one-time-code">
+          <label for="tvScreenName">电视名称（可选）</label><input id="tvScreenName" maxlength="40" placeholder="例如：客厅电视">
+          <button id="joinTV" type="submit">作为电视加入</button>
+        </form>
+        <p id="tvJoinHint" class="muted small-copy">需房主允许；不会抢走其他电视的播放。</p>
+      </details>
+      <details class="room-settings" id="tvCreatePanel"><summary>创建新房间</summary>
+        <label class="field-label" for="tvNewName">新房间名称（可选）</label><input id="tvNewName" maxlength="60" placeholder="留空使用自动房间名">
+        <label class="check-label"><input id="tvNewListed" type="checkbox" checked><span>新房间在大厅展示，仍需配对码加入</span></label>
+        <label class="check-label"><input id="tvNewScreens" type="checkbox" checked><span>允许其他电视用配对码加入</span></label>
+        <p id="tvCreateHint" class="muted small-copy">创建不会结束旧房间，可从大厅切换回来。</p>
+        <button id="newRoom" class="primary">创建新房间</button>
+      </details>
+      </aside>
     </div>
   </section>
   <div id="tvNotice" class="toast" role="status" hidden></div>

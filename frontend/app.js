@@ -43,9 +43,9 @@ const api = {
   },
   listJobs(options = {}) { return fetchJSON('/api/jobs', { cache: 'no-cache', ...options }); },
   getJob(id, options = {}) { return fetchJSON('/api/jobs/' + encodeURIComponent(id), { cache: 'no-cache', ...options }); },
-  async deleteJob(id) {
-    const r = await fetchResponse('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
-    if (!r.ok) throw new Error(`删除失败（HTTP ${r.status}）`);
+  deleteJob(id, { failedOnly = false } = {}) {
+    return fetchJSON('/api/jobs/' + encodeURIComponent(id) + (failedOnly ? '?failed_only=true' : ''),
+      { method: 'DELETE' });
   },
   async retryJob(id, payload) {
     const r = await fetch('/api/jobs/' + id + '/retry', {
@@ -138,12 +138,15 @@ const state = {
   selectionRequest: null,
   lyricsGeneration: 0,
   lyricsRequest: null,
+  lyricsRequestUrl: null,
+  lyricsRetryAt: 0,
   recordingsGeneration: 0,
   recordingsRequest: null,
   pollGeneration: 0,
   pollRequest: null,
   listRequest: null,
   listForce: false,
+  deletingJobs: new Set(),
   endedTimer: null,
   lyricRaf: 0,
   lyricWords: [],
@@ -173,9 +176,13 @@ const state = {
   allJobs: [],       // 曲库缓存（用于前端搜索）
   search: '',
   editing: false,    // 歌词编辑态
+  lyricEdit: null,
   lyricsUrl: null,   // 当前歌词 json 地址（保存后重新拉取）
   currentTitle: '',  // 当前歌曲标题（用于搜歌词预填）
-  libMode: 'all',    // 点歌台视图：all 全部 / artist 按歌手 / new 最新
+  libMode: 'all',
+  browseLetter: '',
+  browsePage: 1,
+  artistReturn: null,
   artistPick: null,  // 「按歌手」里点进了哪位歌手（存归一后的简体键）
   artistLabel: null, // 该歌手在曲库里的实际写法，用于标题显示
   view: 'list',      // 曲库呈现：list 文字列表（默认，找歌快）/ grid 封面墙
@@ -377,9 +384,17 @@ async function onPickerImport() {
 
 const { pyCollator, initialsOf } = OpenKSearch;
 const librarySearch = OpenKSearch.create();
+const libraryPopularity = OpenKLibrary.createPopularity(() => {
+  if (!state.disposed) renderBrowse();
+});
+function libraryAccountId() { return room.account?.enabled ? room.account.user?.id || null : null; }
+function refreshPopularity(force = false) {
+  return state.libMode === 'popular' && !state.disposed
+    ? libraryPopularity.load(libraryAccountId(), force) : Promise.resolve();
+}
 
 /* ---------------- 曲库 ---------------- */
-const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败' };
+const STATE_TEXT = { queued: '排队中', running: '处理中', done: '已完成', error: '失败', cancelled: '已取消' };
 let _browseSig = '';
 
 /* 语种：曲库里的标题大多自带 (國語)/(粵語)/(日語) 这类标记，直接拿来用，
@@ -448,11 +463,14 @@ async function refreshList(force = false) {
         if (old) { j._si = old._si; j._siKey = old._siKey; }
       });
       state.allJobs = jobs;
+      const current = jobs.find(j => j.id === state.currentJobId && j.state === 'done');
+      if (current) refreshPlayerLyrics(current.id, current.media?.lyrics || null);
       $('#catalogStatus').textContent = '';
       $('#catalogStatus').classList.add('hidden');
       renderBrowse(state.listForce);
       renderProcessing();
       renderQueue();
+      refreshPopularity();
     } catch (e) {
       if (!state.disposed) {
         $('#catalogStatus').textContent = '曲库暂时无法更新，保留上次结果。' + (e.message || '');
@@ -488,6 +506,7 @@ function songCard(j) {
     <div class="sc-body">
       <p class="sc-title" title="${escapeHtml(si.title)}">${escapeHtml(si.title)}</p>
       <p class="sc-artist">${escapeHtml(si.artist || '未知歌手')}</p>
+      ${songPopularity(j)}
     </div>
     <div class="sc-actions">
       <button class="sc-pick" data-act="pick">＋ 点歌</button>
@@ -511,7 +530,8 @@ function songRow(j, idx) {
       <svg class="ui-icon"><use href="#icon-note"/></svg>
     </span>
     <span class="sr-name"><span class="sr-title">${escapeHtml(si.title)}</span>
-      ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}</span>
+      ${noLyrics(j) ? '<span class="sr-nolrc" title="此源没有歌词，只有伴奏">无词</span>' : ''}
+      ${songPopularity(j)}</span>
     <span class="sr-artist">${escapeHtml(si.artist || '未知歌手')}</span>
     <span class="sr-lang">${escapeHtml(si.lang)}</span>
     <span class="sr-dur">${j.duration ? fmt(j.duration) : ''}</span>
@@ -528,6 +548,12 @@ function songRow(j, idx) {
     li.querySelector('.sr-artwork').appendChild(image);
   }
   return li;
+}
+
+function songPopularity(job) {
+  const count = state.libMode === 'popular' && !librarySearch.query(state.search).text
+    ? libraryPopularity.state.songs.get(job.id)?.play_count : 0;
+  return count ? `<span class="catalog-plays">播放 ${count} 次</span>` : '';
 }
 
 /** 语种筛选条：一屏之内就能把 400 多首按语言切开，比进二级菜单快。 */
@@ -558,21 +584,36 @@ function renderBrowse(force = false) {
   const query = librarySearch.query(state.search);
   const kw = query.text;
   const all = doneJobs();
+  const accountId = libraryAccountId();
+  libraryPopularity.forAccount(accountId);
+  $('[data-tab="popular"]').hidden = !accountId;
   renderLangBar(all);
   let list = all;
   if (state.lang) list = list.filter((j) => songInfo(j).lang === state.lang);
   if (kw) list = librarySearch.search(list, query);
 
   const grid = $('#grid'), artistBox = $('#artistList'), rows = $('#songList');
-  const mode = kw ? 'all' : state.libMode;   // 搜索时不分组，直接给结果
+  const mode = kw || (state.libMode === 'popular' && !accountId) ? 'all' : state.libMode;
+  const artistRoot = mode === 'artist' && !state.artistPick;
+  const indexed = !kw && (mode === 'all' || mode === 'artist');
+  $('#browseAlphabet').hidden = !indexed;
+  $('#browseAlphabetLabel').textContent = `${artistRoot ? '歌手' : '歌名'}首字母 · ${state.browseLetter || '全部'}`;
+  $('#artistBack').hidden = mode !== 'artist' || !state.artistPick;
+  $('#viewToggle').hidden = artistRoot;
+  $('#refreshPopularity').hidden = mode !== 'popular';
+  $('#browseAux').hidden = $('#artistBack').hidden && $('#refreshPopularity').hidden;
+  $('#refreshPopularity').disabled = libraryPopularity.state.loading;
+  $('#browseHint').hidden = mode !== 'popular';
+  $('#browseHint').textContent = mode === 'popular' ? libraryPopularity.note() : '';
+  $('#browseHint').classList.toggle('error', mode === 'popular' && !!libraryPopularity.state.error);
+  document.querySelectorAll('.tab').forEach(button => {
+    const active = button.dataset.tab === mode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
 
   // 「歌手」页：先列歌手，点进去再看这位歌手的歌
-  if (mode === 'artist' && !state.artistPick) {
-    const sig = `A:${state.lang}:${list.map(jobRenderKey).join('|')}:${kw}`;
-    if (!force && sig === _browseSig) return;
-    _browseSig = sig;
-    grid.classList.add('hidden'); rows.classList.add('hidden');
-    artistBox.classList.remove('hidden');
+  if (artistRoot) {
     const groups = new Map();
     list.forEach((j) => {
       const a = songInfo(j).artist || '未知歌手';
@@ -591,11 +632,22 @@ function renderBrowse(force = false) {
       });
       label.set(key, [...tally.entries()].sort((x, y) => y[1] - x[1])[0][0]);
     });
-    const names = [...groups.keys()].sort((a, b) =>
+    let names = [...groups.keys()].sort((a, b) =>
       (pyCollator() || undefined) ? pyCollator().compare(label.get(a), label.get(b))
                                   : label.get(a).localeCompare(label.get(b)));
+    const initial = key => librarySearch.initial(groups.get(key)[0], 1);
+    OpenKLibrary.renderIndex($('#browseIndex'), names, state.browseLetter, initial);
+    if (state.browseLetter) names = names.filter(key => initial(key) === state.browseLetter);
+    const selection = OpenKLibrary.page(names, state.browsePage);
+    state.browsePage = selection.page;
+    OpenKLibrary.renderPager($('#browsePager'), selection, '位');
+    const sig = `A:${state.lang}:${state.browseLetter}:${selection.page}:${list.map(jobRenderKey).join('|')}`;
+    if (!force && sig === _browseSig) return;
+    _browseSig = sig;
+    grid.classList.add('hidden'); rows.classList.add('hidden');
+    artistBox.classList.remove('hidden');
     artistBox.innerHTML = '';
-    names.forEach((n) => {
+    selection.items.forEach((n) => {
       const li = document.createElement('button');
       li.type = 'button';
       li.className = 'artist-chip';
@@ -603,19 +655,30 @@ function renderBrowse(force = false) {
       li.innerHTML = `<span>${escapeHtml(label.get(n))}</span><em>${groups.get(n).length}</em>`;
       artistBox.appendChild(li);
     });
-    $('#browseCount').textContent = `${names.length} 位歌手 · ${list.length} 首`;
+    const songs = names.reduce((count, key) => count + groups.get(key).length, 0);
+    $('#browseCount').textContent = `${names.length} 位歌手 · ${songs} 首`;
     $('#browseEmpty').classList.toggle('hidden', names.length > 0);
-    $('#browseEmpty').textContent = '曲库还是空的，去「⚙️ 后台」添加歌曲。';
+    $('#browseEmpty').textContent = all.length
+      ? '这个分类下没有歌手，试试其他字母或语种，也可以直接搜索。'
+      : '曲库还是空的，去「⚙️ 后台」添加歌曲。';
     return;
   }
 
   if (mode === 'artist' && state.artistPick) {
     list = list.filter((j) => librarySearch.artistKey(songInfo(j).artist || '未知歌手') === state.artistPick);
   }
-  if (mode === 'new') list = list.slice(0, 60);
-  else if (mode === 'all' && !kw) list = librarySearch.search(list, query);
+  if (!kw && mode !== 'new') list = librarySearch.search(list, query);
+  if (indexed) {
+    OpenKLibrary.renderIndex($('#browseIndex'), list, state.browseLetter, job => librarySearch.initial(job));
+    if (state.browseLetter) list = list.filter(job => librarySearch.initial(job) === state.browseLetter);
+  }
+  if (mode === 'popular') list = libraryPopularity.rank(list);
+  const selection = OpenKLibrary.page(list, state.browsePage);
+  state.browsePage = selection.page;
+  OpenKLibrary.renderPager($('#browsePager'), selection);
 
-  const sig = `${mode}:${state.view}:${state.lang}:${state.artistPick || ''}:${state.search}:${list.map(jobRenderKey).join('|')}`;
+  const popularityKey = mode === 'popular' ? JSON.stringify([...libraryPopularity.state.songs]) : '';
+  const sig = `${mode}:${state.view}:${state.lang}:${state.artistPick || ''}:${state.search}:${state.browseLetter}:${selection.page}:${popularityKey}:${list.map(jobRenderKey).join('|')}`;
   if (!force && sig === _browseSig) return;
   _browseSig = sig;
 
@@ -628,7 +691,7 @@ function renderBrowse(force = false) {
   const box = useGrid ? grid : rows;
   box.innerHTML = '';
   const frag = document.createDocumentFragment();
-  list.forEach((j, i) => frag.appendChild(useGrid ? songCard(j) : songRow(j, i)));
+  selection.items.forEach((j, i) => frag.appendChild(useGrid ? songCard(j) : songRow(j, selection.start + i)));
   box.appendChild(frag);
 
   $('#browseCount').textContent = mode === 'artist' && state.artistPick
@@ -637,7 +700,12 @@ function renderBrowse(force = false) {
   $('#browseEmpty').classList.toggle('hidden', list.length > 0);
   $('#browseEmpty').textContent = kw
     ? `没搜到「${state.search.trim()}」。试试歌名、歌手、全拼或首字母，也可用空格组合搜索。`
-    : '曲库还是空的，去「⚙️ 后台」添加歌曲。';
+    : mode === 'popular'
+      ? libraryPopularity.state.loading ? '正在读取我的常唱…'
+        : libraryPopularity.state.error ? '统计暂不可用，请点击「刷新常唱」重试。'
+          : '还没有符合条件的常唱歌曲。正常播放后会自动累计，只点歌或拖动进度不会增加次数。'
+      : all.length ? '这个分类下没有歌曲，试试其他字母或语种，也可以直接搜索。'
+        : '曲库还是空的，去「⚙️ 后台」添加歌曲。';
 }
 
 function jobRenderKey(j) {
@@ -655,7 +723,11 @@ function syncQueuedMarkers() {
 /* ---------------- 已点歌曲（KTV 的核心交互） ---------------- */
 const QUEUE_KEY = 'openk.queue';
 
-function saveQueue() { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue)); } catch {} }
+// 账号模式下队列只存在服务端房间里；本机绝不另存一份，否则两个人会看到两张单子。
+function saveQueue() {
+  if (accountMode()) return;
+  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue)); } catch {}
+}
 function loadQueue() {
   try { state.queue = [...new Set(JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').filter((id) => typeof id === 'string'))]; }
   catch { state.queue = []; }
@@ -663,7 +735,933 @@ function loadQueue() {
 
 function jobById(id) { return state.allJobs.find((j) => j.id === id); }
 
+/* ---------------- 账号模式：一个人也待在自己的房间里 ---------------- */
+/* 私有账号服务挡在 OpenK 前面时，每个登录的人恒定拥有一个房间。房间是队列和
+   播放权的唯一权威，但唱歌用的还是本页原来那套混音器 / 歌词 / 录音引擎：
+   本机必须先拿到这个房间的独占播放租约，而且只有真实手势才会让它出声。 */
+const room = {
+  account: null, id: null, client: null, chip: null, ready: false, error: '', epoch: 0,
+  items: [], armed: false, activating: false, gesture: false,
+  playerToken: null, lastLease: 0, loadedItem: null, generation: -1, seekTarget: null,
+  seeking: false, seekSession: null,
+  focus: false, pendingEnded: null, ending: false, endingRequest: null, playFailed: null,
+  heartbeatBusy: false, heartbeatRequest: null, recovering: null, connection: '',
+  heartbeatTimer: null, watchdog: null, releasing: Promise.resolve(),
+};
+// 服务端租约 12 秒：2.5 秒续一次，8.5 秒没续上就认定失联并立刻停声。
+const LEASE_RENEW_MS = 2500;
+const LEASE_LOST_MS = 8500;
+
+function accountMode() { return !!room.account?.enabled; }
+function roomState() { return accountMode() ? room.client?.state || null : null; }
+function roomCurrent() { return roomState()?.current || null; }
+function roomItemId() { return roomCurrent()?.id || null; }
+
+/** 别的设备（电视，或同一个账号的另一台机器）正握着这个房间的播放租约。
+ *  这种时候本机只做遥控：点歌和播放控制都发给房间，不自己出声。 */
+function remotePlayerActive() {
+  const s = roomState();
+  return !!s?.player?.online && !room.playerToken;
+}
+
+/* ---------- 个人设置与设备拓扑 ---------- */
+/* 这台浏览器在账号里的名字。它不是凭据：没有登录时什么也代表不了，
+   而且服务端永远先按账号隔离，共用浏览器不会把设置带给下一个人。 */
+function thisDevice() {
+  return accountMode() ? window.OpenKUserState?.deviceId() || null : null;
+}
+function userState() {
+  const value = window.OpenKUserState?.value;
+  return value?.enabled ? value : null;
+}
+function preferredPlayerId() { return userState()?.preferredPlayer || null; }
+/** 账号把播放指到了别的设备：这台机器就不该自作主张开声。 */
+function preferredPlayerElsewhere() {
+  const preferred = preferredPlayerId();
+  return !!preferred && preferred !== thisDevice();
+}
+function preferredPlayerName() {
+  const value = userState();
+  return value?.devices.find((item) => item.id === value.preferredPlayer)?.label || '另一台设备';
+}
+function preferredPlayerNotice() {
+  return `首选播放器是“${preferredPlayerName()}”。请在该设备上打开 OpenK 开始播放，`
+       + '或点击“在本机播放”改用当前设备。';
+}
+
+function setRoomStatus(message) {
+  const status = $('#roomPlaybackStatus');
+  if (status) status.textContent = message;
+}
+
+function catalogNotice(message) {
+  const status = $('#catalogStatus');
+  if (!status) return;
+  status.textContent = message || '';
+  status.classList.toggle('hidden', !message);
+}
+
+function reportRoomError(e) {
+  if (!e || e.status === 499 || e.name === 'AbortError') return;
+  if (e.status === 401) { accountLost(e); return; }
+  const message = e.message || '房间操作失败，请重试';
+  toast(message);
+  setRoomStatus(message);
+}
+
+function renderRoomStatus() {
+  const host = $('#roomStatus');
+  if (!host) return;
+  if (!accountMode()) {
+    OpenKRoom.renderDevices($('#roomDevices'), null, null);
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  host.classList.remove('hidden');
+  const s = roomState();
+  OpenKRoom.renderDevices($('#roomDevices'), room.account.user ? s : null, room.client?.presenceId);
+  const button = $('#roomActivate');
+  const label = $('#currentRoomName');
+  if (label) {
+    const online = (s?.members || []).filter((m) => m.online).length;
+    label.textContent = !s ? '当前房间'
+      : (s.solo ? '我的房间 · 只有你' : (s.name || '当前房间') + ` · ${online} 人在线`);
+  }
+  const idle = (text) => {
+    if (button) { button.disabled = true; button.textContent = '在本机播放'; }
+    setRoomStatus(text);
+  };
+  if (!room.account.user) { idle('需要登录后才能点歌。'); return; }
+  if (!s) { idle(room.error || '正在连接房间…'); return; }
+  if (button) {
+    button.disabled = room.armed || room.activating || remotePlayerActive();
+    button.textContent = room.armed ? (playbackAudible() ? '本机正在播放' : '本机已连接')
+      : s.current ? '在本机播放' : '启用播放器';
+  }
+  if (room.connection === 'reconnecting') { setRoomStatus('房间连接不稳定，正在重连…'); return; }
+  if (room.armed) {
+    const status = localMediaStatus();
+    setRoomStatus(!s.current ? '播放器已就绪 · 点歌后自动开唱'
+      : status === 'playing' ? '本机正在播放这个房间的歌'
+      : status === 'buffering' ? '本机正在缓冲音频…'
+      : ['blocked', 'error'].includes(status) ? '声音尚未启用 · 点击播放重试'
+      : '本机已就绪 · 已暂停');
+  } else if (remotePlayerActive()) {
+    const who = (s.members || []).find((m) => m.id === s.player.member_id);
+    const device = s.devices?.find(item => item.player);
+    const status = playbackAudible() ? '正在播放' : '已连接';
+    setRoomStatus(`${device?.name || who?.name || '另一台设备'}${status} · 本机可以点歌和遥控`);
+  } else if (preferredPlayerElsewhere()) {
+    setRoomStatus(preferredPlayerNotice());
+  } else if (!s.current) {
+    setRoomStatus('点歌即可开唱；也可先启用播放器，等待手机点歌。');
+  } else {
+    setRoomStatus('本机还没有开声 · 点「在本机播放」开始');
+  }
+}
+
+/* ---------- 手势与独占播放租约 ---------- */
+
+/** 界面上的 ▶ / ⏸ 必须诚实。服务端的 playback.playing 只是「房间想播」，
+ *  没有任何设备握着租约时它并不代表有人听得见声音——那种时候必须显示 ▶，
+ *  让人一眼看出「还没开声」，按下去就能在本机开唱。 */
+function playbackAudible() {
+  if (!accountMode()) return !inst.paused;
+  if (room.armed) return !inst.paused && state.audioGraph?.actx.state === 'running';
+  if (!remotePlayerActive()) return false;
+  const s = roomState();
+  return !!s.playback.playing && ['playing', 'buffering'].includes(s.player.status);
+}
+
+function renderTransportLabels() {
+  const playing = playbackAudible();
+  const label = playing ? '暂停' : '播放';
+  for (const id of ['#playBtn', '#nbPlay', '#lyricEditPlay']) {
+    const button = $(id);
+    if (!button) continue;
+    button.textContent = playing ? '⏸' : '▶';
+    button.setAttribute('aria-label', label);
+  }
+  renderLyricEditProgress();
+}
+
+/** 必须在真实的指针/键盘事件里同步调用：先把原来的 AudioContext 解锁，再去等网络。
+ *  这里绝不碰麦克风——「开声音」不该顺手把录音权限也要走。 */
+function localGesture() {
+  if (!accountMode()) return;
+  room.gesture = true;
+  room.playFailed = null;
+  if (!remotePlayerActive()) unlockAudio();
+}
+
+function releaseLease(client, token) {
+  if (!client || !token) return Promise.resolve();
+  return client.release(token).catch((e) => {
+    // 租约 12 秒自己过期，所以这里只需要让人知道发生过什么。
+    if (![403, 404, 409, 499].includes(e.status)) console.warn('释放播放租约失败，等待自动过期', e);
+  });
+}
+
+/** 停掉本机的一切声音：音频、麦克风监听、录音（已录到的音频仍然保留）。 */
+function disarmLocalPlayer(message, { reset = false, release = true } = {}) {
+  const client = room.client, token = room.playerToken;
+  room.armed = false;
+  room.activating = false;
+  room.playerToken = null;
+  room.pendingEnded = null;
+  room.ending = false;
+  room.heartbeatBusy = false;
+  room.generation = -1;
+  room.seekTarget = null;
+  room.seeking = false;
+  room.seekSession = null;
+  room.lastLease = 0;
+  room.playFailed = null;
+  cancelEndedTimer();
+  // stopAudio 会顺带停止录音（音频进 pendingRecordings 不会丢）并断开麦克风。
+  stopAudio();
+  // 音轨已经被 stopAudio 卸掉了，所以必须让房间状态重新把这首歌装回来，
+  // 否则重新拿到播放权时会对着一个空的 <audio> 按播放。
+  room.loadedItem = null;
+  if (reset) {
+    room.focus = false;
+    room.gesture = false;
+    viewPlayerRequested = false;
+    invalidateSelection();
+    state.currentJobId = null;
+    $('#player').classList.add('hidden');
+  }
+  renderNowBar();
+  renderRoomStatus();
+  renderTransportLabels();
+  room.releasing = release ? releaseLease(client, token) : Promise.resolve();
+  if (message) { toast(message); setRoomStatus(message); }
+}
+
+/** 取得房间的独占播放租约。服务端只允许一个租约存在，所以这里抢不到就老实当遥控。 */
+async function armLocalPlayer() {
+  const client = room.client, epoch = room.epoch;
+  if (room.armed) return true;
+  if (room.activating) return false;
+  if (!client?.state) { toast('正在连接房间，请稍后重试'); return false; }
+  if (remotePlayerActive()) {
+    setRoomStatus('另一台设备正在播放这个房间，先在那台设备上停止。');
+    return false;
+  }
+  room.activating = true;
+  renderRoomStatus();
+  try {
+    if (!await unlockAudio()) {
+      setAudioStatus('点击播放以启用音频');
+      return false;
+    }
+    if (client !== room.client || epoch !== room.epoch) return false;
+    // 保守起见用「请求发出」的时刻记租约，网络慢时才不会高估剩余时间。
+    const sentAt = performance.now();
+    const claim = await client.claim();
+    if (client !== room.client || epoch !== room.epoch) {
+      releaseLease(client, claim.player_token);
+      return false;
+    }
+    room.playerToken = claim.player_token;
+    room.lastLease = sentAt;
+    room.armed = true;
+    room.generation = -1;
+    room.activating = false;
+    // claim 会把房间置为暂停，所以要显式把它放起来。
+    if (client.state.current) await client.command('play');
+    if (client !== room.client || epoch !== room.epoch
+        || !room.armed || room.playerToken !== claim.player_token) return false;
+    if (client.state.current) autoEnableMic();
+    applyRoomPlayback(true);
+    roomHeartbeat();
+    return true;
+  } catch (e) {
+    if (client !== room.client || epoch !== room.epoch) return false;
+    disarmLocalPlayer('');
+    await room.releasing;
+    if (client !== room.client || epoch !== room.epoch) return false;
+    if (e.status === 409) setRoomStatus('另一台设备正在播放这个房间，先在那台设备上停止。');
+    reportRoomError(e);
+    return false;
+  } finally {
+    if (client === room.client && epoch === room.epoch) room.activating = false;
+    renderRoomStatus();
+    renderTransportLabels();
+    renderNowBar();
+  }
+}
+
+/** 有真实手势、又没人占着播放权时，才在本机开声。 */
+async function ensureLocalPlayer() {
+  if (room.armed) return true;
+  if (!room.gesture || remotePlayerActive()) return false;
+  // 账号把播放指到了别的设备时，点歌不再顺手在这台机器上开声：
+  // 要么去那台设备上打开，要么在这里显式按「在本机播放」。
+  if (preferredPlayerElsewhere()) {
+    setRoomStatus(preferredPlayerNotice());
+    return false;
+  }
+  return armLocalPlayer();
+}
+
+async function activateLocalPlayer() {
+  room.gesture = true;
+  if (remotePlayerActive()) {
+    toast('另一台设备正在播放这个房间，先在那台设备上停止。');
+    return;
+  }
+  // 这一下是显式手势，所以允许覆盖拓扑，但必须说清楚发生了什么。
+  if (preferredPlayerElsewhere()) toast(`改用本机播放，不使用“${preferredPlayerName()}”。`);
+  if (await armLocalPlayer() && roomCurrent()) showStage();
+}
+
+/* ---------- 心跳、看门狗与自动切歌 ---------- */
+
+function localMediaStatus() {
+  const s = roomState();
+  if (!s?.current || !state.currentJobId) return 'ready';
+  if (inst.error) return 'error';
+  if (state.audioGraph && state.audioGraph.actx.state !== 'running') return 'blocked';
+  if (state.buffering) return 'buffering';
+  if (!inst.paused) return 'playing';
+  return state.playRequested ? 'buffering' : 'paused';
+}
+
+/** 把本机真实的播放状态与进度告诉房间，同时续租。 */
+async function roomHeartbeat() {
+  const client = room.client, token = room.playerToken, s = client?.state;
+  if (!room.armed || !token || room.heartbeatBusy || !s) return;
+  room.heartbeatBusy = true;
+  const pending = {};
+  room.heartbeatRequest = pending;
+  const sentAt = performance.now();
+  try {
+    await client.heartbeat(token, {
+      current_id: s.current?.id || null,
+      generation: s.playback.seek_version,
+      position: s.current && Number.isFinite(inst.currentTime) ? Math.max(0, inst.currentTime) : 0,
+      status: localMediaStatus(),
+      device_id: thisDevice(),
+    });
+    if (client !== room.client || token !== room.playerToken) return;
+    room.lastLease = sentAt;
+    if (room.pendingEnded) await sendRoomEnded();
+  } catch (e) {
+    if (client !== room.client || token !== room.playerToken) return;
+    if (OpenKRoom.contextChanged(e)) {
+      disarmLocalPlayer(e.message, { reset: true, release: false });
+      recoverRoom(e).catch(() => {});
+    } else if (e.status === 409) {
+      // 命令和心跳撞车不算丢租约：刷新之后再判断播放权是不是真的没了。
+      try { await client.refresh(); }
+      catch (error) { if (client === room.client && error.status !== 499) setRoomStatus(error.message); }
+      if (client !== room.client || token !== room.playerToken) return;
+      const fresh = client.state;
+      if (!fresh?.player.online || (fresh.player.member_id && fresh.viewer?.id
+          && fresh.player.member_id !== fresh.viewer.id)) {
+        disarmLocalPlayer('播放权已被收回，本机声音已停止。');
+      }
+    } else if ([401, 403, 404].includes(e.status)) {
+      disarmLocalPlayer(e.message, { release: false });
+      if (e.status === 401) accountLost(e);
+    } else setRoomStatus('与房间的连接不稳定，正在重试…');
+  } finally {
+    if (room.heartbeatRequest === pending) room.heartbeatBusy = false;
+  }
+}
+
+function leaseWatchdog() {
+  if (!room.armed) return;
+  if (performance.now() - room.lastLease > LEASE_LOST_MS) {
+    // 顺手把租约还回去：只是网络抖了一下的话，人重新点「在本机播放」就能立刻继续，
+    // 不必干等 12 秒；网络真断了这次释放也只会无声失败。
+    disarmLocalPlayer('与房间失去联系，声音已安全停止。恢复网络后请重新开声。');
+  }
+}
+
+/** 唱完一首由服务端推进队列，本机不另开一条本地队列去抢。 */
+async function sendRoomEnded() {
+  const client = room.client, token = room.playerToken, report = room.pendingEnded;
+  if (!report || room.ending || !token || !client?.state) return;
+  const s = client.state;
+  // 服务端已经翻到下一首，或者这首歌被重播 / 拖动过——这份「唱完了」已经过期，直接丢掉。
+  // 绝不改写 generation 去迁就新状态：那等于拿旧动作去推一个新局面。
+  if (s.current?.id !== report.item_id || s.playback.seek_version !== report.generation) {
+    room.pendingEnded = null;
+    return;
+  }
+  room.ending = true;
+  const pending = {};
+  room.endingRequest = pending;
+  try {
+    await client.ended(token, {
+      command_id: report.command_id, item_id: report.item_id, generation: report.generation,
+      device_id: thisDevice(),
+    });
+    if (room.pendingEnded === report) room.pendingEnded = null;
+  } catch (e) {
+    if (client !== room.client || token !== room.playerToken) return;
+    if (e.status === 409) disarmLocalPlayer(e.message);
+    else setRoomStatus('正在等待网络恢复后切歌…');
+  } finally {
+    if (room.endingRequest === pending) room.ending = false;
+  }
+}
+
+function reportRoomEnded() {
+  const s = roomState();
+  if (!room.armed || !s?.current) return;
+  if (room.pendingEnded?.item_id === s.current.id) return;
+  // 命令编号只铸一次，重发用的必须是同一条命令：网络抖一下重试时服务端才能去重，
+  // 而不会把队列一口气翻过两首歌。
+  room.pendingEnded = {
+    command_id: OpenKRoom.id(), item_id: s.current.id, generation: s.playback.seek_version,
+  };
+  sendRoomEnded();
+}
+
+/* ---------- 房间状态 → 本机引擎 ---------- */
+
+function applyGuideState(guide) {
+  const mode = guide ? 'orig' : 'inst';
+  if (state.singMode !== mode) setSingMode(mode, false);
+}
+
+/** 服务端要求的播放位置。媒体还没就绪时先记下来，等 loadedmetadata 再落位。 */
+function applyRoomSeek(position) {
+  if (!Number.isFinite(inst.duration)) { room.seekTarget = position; return; }
+  room.seekTarget = null;
+  seekTo(position);
+}
+
+/** 只在「歌变了 / seek_version 变了 / 播放开关变了」时动引擎，不能每轮轮询都重设进度。 */
+function applyRoomPlayback(reseek = false) {
+  const s = roomState();
+  if (!s || state.disposed || !room.armed) return;
+  if (state.audioGraph?.actx.state !== 'running') {
+    disarmLocalPlayer('声音被系统暂停，请点击「在本机播放」恢复。');
+    return;
+  }
+  if (!s.current || room.loadedItem !== s.current.id || !state.currentJobId) return;
+  if (!room.seeking && (reseek || room.generation !== s.playback.seek_version)) {
+    room.generation = s.playback.seek_version;
+    applyRoomSeek(s.playback.position);
+  }
+  if (s.playback.playing) {
+    const key = s.current.id + ':' + s.playback.seek_version;
+    if (inst.paused && !inst.ended && !state.playRequested && !room.pendingEnded
+        && room.playFailed !== key) {
+      // 起播失败（多半是浏览器要一次新手势）只提示一次，不能每轮轮询都弹一遍。
+      startPlayback().then((ok) => { if (!ok && room.armed) room.playFailed = key; });
+    }
+  } else if (!inst.paused || state.playRequested) pausePlayback();
+  renderNowBar();
+}
+
+/** 载入房间当前这首歌。歌曲信息以房间条目为准（服务端只会给出真实存在的音轨），
+ *  再用曲库里的同一首歌补上来源链接等额外字段。走的还是原来的 showPlayer 那条路，
+ *  所以歌词、歌词编辑、重对齐、历史录音全部照旧可用。 */
+async function loadRoomSong(item, focus) {
+  const requestGeneration = ++state.selectionRequestGeneration;
+  state.selectionRequest?.abort();
+  state.selectionRequest = null;
+  cancelEndedTimer();
+  const known = jobById(item.job_id);
+  const job = {
+    ...(known || {}),
+    id: item.job_id,
+    state: 'done',
+    track: item.title || known?.track,
+    title: item.title || known?.title,
+    artist: item.artist || known?.artist || '',
+    duration: item.duration || known?.duration || 0,
+    thumbnail: item.thumbnail || known?.thumbnail || null,
+    media: item.media || known?.media || {},
+  };
+  if (!job.media.instrumental) {
+    const message = '伴奏文件暂时不可用，请在后台检查歌曲';
+    toast(message);
+    setRoomStatus(message);
+    return;
+  }
+  const generation = ++state.selectionGeneration;
+  state.lyricsGeneration++;
+  state.lyricsRequest?.abort();
+  state.recordingsGeneration++;
+  state.recordingsRequest?.abort();
+  if (focus) showStage();
+  await showPlayer(job, generation, false);
+}
+
+function applyRoomCurrent(s) {
+  const current = s.current || null;
+  if ((current?.id || null) === room.loadedItem) {
+    if (current) refreshPlayerLyrics(current.job_id, current.media?.lyrics || null);
+    if (room.focus && current) { room.focus = false; showStage(); }
+    return;
+  }
+  const focus = room.focus;
+  room.focus = false;
+  room.loadedItem = current?.id || null;
+  room.generation = -1;
+  room.seekTarget = null;
+  room.pendingEnded = null;
+  cancelEndedTimer();
+  if (!current) { endPlayback(); return; }
+  loadRoomSong(current, focus);
+}
+
+function applyRoomState(s) {
+  if (!accountMode() || state.disposed || !s) return;
+  consumeViewIntent(s);
+  room.items = Array.isArray(s.queue) ? s.queue : room.items;
+  // 曲库上的「已点」角标按歌显示；真正的增删置顶都用房间条目 ID，重复点同一首才不会串。
+  const mirrored = room.items.map((item) => item.job_id);
+  const changed = mirrored.join('|') !== state.queue.join('|');
+  state.queue = mirrored;
+  renderQueue();
+  if (changed) renderBrowse();
+  applyRoomCurrent(s);
+  // 导唱开关是房间设置：手机上按一下，正在唱的这台机器也要跟着切。
+  applyGuideState(s.playback.guide);
+  applyRoomPlayback();
+  renderRoomStatus();
+  renderTransportLabels();
+  renderNowBar();
+}
+
+/* ---------- 房间连接 ---------- */
+
+/** 手机在没有播放设备时把人送到 /?view=player：进来就看见当前这首歌的完整播放器。
+ *  这只是「打开播放器」，不是播放许可——开声仍然要一次真实手势。用过一次就作废，
+ *  免得之后换了房间还被这条旧地址拽走。 */
+let viewPlayerRequested = false;
+try { viewPlayerRequested = new URLSearchParams(location.search).get('view') === 'player'; } catch {}
+
+function consumeViewIntent(s) {
+  if (!viewPlayerRequested || !s?.current) return;
+  viewPlayerRequested = false;
+  room.focus = true;
+}
+
+function bindRoom(current) {
+  room.id = current.room_id;
+  room.items = [];
+  const client = new OpenKRoom.RoomClient(current.room_id, null, {
+    presence: () => OpenKRoom.devicePresence(['player', 'controller'], state.micStream ? ['microphone'] : []),
+  });
+  room.client = client;
+  client.onstate = (value) => { if (room.client === client) applyRoomState(value); };
+  client.onconnection = (status, error) => {
+    if (room.client === client) roomConnectionChanged(status, error);
+  };
+  // 房间里已经有歌时，只有地址明确要求 /?view=player 才直接进歌词页；
+  // 平常刷新首页仍然停在点歌台，用房间条上的「在本机播放」当那次手势入口。
+  room.focus = false;
+  client.accept(current.state);
+  client.start();
+}
+
+function roomConnectionChanged(status, error) {
+  room.connection = status;
+  if (status === 'connected') {
+    room.error = '';
+    catalogNotice('');
+    renderRoomStatus();
+    return;
+  }
+  if (error?.status === 401) { accountLost(error); return; }
+  if (status === 'changed' || status === 'expired') {
+    disarmLocalPlayer(error?.message || '房间已切换，本机声音已停止。',
+      { reset: true, release: false });
+    recoverRoom(error).catch(() => {});
+    return;
+  }
+  setRoomStatus(error?.message || '房间连接不稳定，正在重连…');
+}
+
+/** 房间换了 / 账号换了：先停声，再按新的身份重新绑定。旧动作绝不重放。 */
+function recoverRoom(cause) {
+  if (room.recovering) return room.recovering;
+  const pending = (async () => {
+    disarmLocalPlayer(cause?.message, { reset: true, release: false });
+    try { await initAccount(true); }
+    catch (e) { accountFailed(e); throw e; }
+  })();
+  room.recovering = pending;
+  pending.catch(() => {}).then(() => { if (room.recovering === pending) room.recovering = null; });
+  return pending;
+}
+
+async function roomConnected() {
+  if (room.client) return room.client;
+  const current = await OpenKAccount.currentRoom();
+  if (!room.client) bindRoom(current);
+  return room.client;
+}
+
+async function roomCommand(action, payload) {
+  const accountId = room.account?.user?.id;
+  try {
+    const client = await roomConnected();
+    return await client.command(action, payload);
+  } catch (e) {
+    if (OpenKRoom.contextChanged(e) || [403, 404].includes(e.status)) {
+      await recoverRoom(e);
+      const changed = accountId !== room.account?.user?.id;
+      throw new OpenKRoom.RoomError(changed ? '登录账号已改变，请确认当前账号后重新操作'
+        : '房间已重新连接，请在当前房间重试操作', 409, changed ? 'account_changed' : 'room_changed');
+    }
+    throw e;
+  }
+}
+
+function roomTransport(action, payload = {}) {
+  return roomCommand(action, payload).catch(reportRoomError);
+}
+
+/* ---------- 点歌 / 切歌 / 传输控制 ---------- */
+
+async function addToRoom(id, playNow) {
+  const title = songInfo(jobById(id) || {}).title || '';
+  try {
+    const empty = !roomItemId();
+    if (empty || playNow) room.focus = true;
+    const s = await roomCommand('add', { job_id: id });
+    const item = [...(s?.queue || [])].reverse().find((entry) => entry.job_id === id);
+    if (playNow && !empty && item) {
+      await roomCommand('top', { item_id: item.id });
+      const current = roomItemId();
+      if (current && current !== item.id) await roomCommand('next', { item_id: current });
+    }
+    room.focus = false;
+    const playing = await ensureLocalPlayer();
+    if (empty || playNow) toast(`已点：${title}`);
+    else toast(`已点到房间：${title}（第 ${room.items.length} 位）`);
+    if (!playing && remotePlayerActive()) setRoomStatus('已排进队列，正在播放的设备会接着唱。');
+  } catch (e) {
+    room.focus = false;
+    reportRoomError(e);
+  }
+}
+
+async function singRoomItemNow(itemId) {
+  try {
+    room.focus = true;
+    await roomCommand('top', { item_id: itemId });
+    const current = roomItemId();
+    if (current && current !== itemId) await roomCommand('next', { item_id: current });
+    room.focus = false;
+    await ensureLocalPlayer();
+  } catch (e) {
+    room.focus = false;
+    reportRoomError(e);
+  }
+}
+
+function toggleRoomPlay() {
+  const s = roomState();
+  if (!s) { accountWaiting(); return; }
+  if (!s.current) { toast('先点一首歌再播放'); return; }
+  if (!room.armed && !remotePlayerActive()) { activateLocalPlayer(); return; }
+  roomTransport(s.playback.playing ? 'pause' : 'play');
+}
+
+function skipRoomSong() {
+  const item = roomItemId();
+  if (!item) { toast('房间里还没有歌曲'); return; }
+  roomTransport('next', { item_id: item });
+}
+
+function restartRoomSong() {
+  const item = roomItemId();
+  if (!item) { toast('房间里还没有歌曲'); return; }
+  // 从头再唱一次：停着的时候按重播，理应直接唱起来。
+  const paused = !roomState()?.playback.playing;
+  roomTransport('restart', { item_id: item });
+  if (paused) roomTransport('play');
+}
+
+/** 拖进度条 / 点歌词行。本机先跟手，房间随后确认同一个位置。 */
+function userSeek(t) {
+  if (!Number.isFinite(t)) return;
+  if (!accountMode()) { seekTo(t); return; }
+  const item = roomItemId();
+  if (room.armed) seekTo(t);
+  if (!item) return;
+  return roomTransport('seek', { item_id: item, position: Math.max(0, t) });
+}
+
+function setSingModeIntent(mode) {
+  if (!accountMode()) { setSingMode(mode); return; }
+  prefs.singMode = mode;
+  savePrefs('singMode');
+  roomTransport('guide', { enabled: mode === 'orig' });
+}
+
+/* ---------- 账号生命周期 ---------- */
+
+function prefsStatus(message) {
+  const node = $('#prefsStatus');
+  if (!node) return;
+  node.textContent = message || '';
+  node.classList.toggle('hidden', !message);
+}
+function deviceHint(message) {
+  const node = $('#deviceHint');
+  if (!node) return;
+  node.textContent = message || '';
+  node.classList.toggle('hidden', !message);
+}
+
+/** 把服务端「账号默认 + 这台设备覆盖」的有效设置装进运行时。 */
+function applyUserSettings(values) {
+  if (!values) return;
+  prefs.singMode = values.sing_mode;
+  prefs.reverb = values.reverb;
+  prefs.view = values.view;
+  prefs.instVol = values.accompaniment_volume;
+  prefs.vocalVol = values.guide_volume;
+  prefs.micMonitor = values.mic_monitor;
+  prefs.micVol = values.mic_volume;
+  prefs.howlGuard = values.howl_guard;
+  prefs.outVol = values.output_volume;
+  prefs.audioIn = values.audio_input;
+  prefs.audioOut = values.audio_output;
+  syncPrefControls();
+}
+
+/** 控件与音频图跟着偏好走。这里绝不申请麦克风，也绝不自己开始播放：
+ *  存下来的偏好只是偏好，真正出声仍然要手势和浏览器授权。 */
+function syncPrefControls() {
+  const set = (selector, value) => { const node = $(selector); if (node) node.value = value; };
+  const text = (selector, value) => { const node = $(selector); if (node) node.textContent = value; };
+  set('#reverb', prefs.reverb);
+  set('#instVol', prefs.instVol);
+  set('#vocalVol', prefs.vocalVol);
+  set('#micVol', prefs.micVol);
+  set('#outVol', prefs.outVol);
+  text('#micVolVal', prefs.micVol + '%');
+  text('#outVolVal', prefs.outVol + '%');
+  const monitor = $('#monitor');
+  if (monitor) monitor.checked = prefs.micMonitor;
+  const guard = $('#howlGuard');
+  if (guard) guard.checked = prefs.howlGuard;
+  if (state.audioGraph) {
+    setReverb(prefs.reverb);
+    if (state.audioGraph.mic) state.audioGraph.mic.micGain.gain.value = prefs.micVol / 100;
+  }
+  applyVolumes();
+  applyMonitorState();
+  applyOutputDevice();
+  refreshMediaDevices();
+  if (prefs.view && prefs.view !== state.view) {
+    state.view = prefs.view;
+    text('#viewToggle', state.view === 'list' ? '封面视图' : '列表视图');
+    renderBrowse(true);
+  }
+  // 房间里原唱/伴唱是大家共用的开关，个人偏好不能悄悄把它掀过去。
+  if (prefs.singMode && !accountMode() && prefs.singMode !== state.singMode) {
+    setSingMode(prefs.singMode, false);
+  }
+}
+
+/** 输出设备只能由这台浏览器自己决定，不支持就明说，不假装换成功。 */
+function applyOutputDevice() {
+  const sink = typeof prefs.audioOut === 'string' ? prefs.audioOut : '';
+  if (!sinkSelectable()) {
+    if (sink) deviceHint('当前浏览器不支持选择音频输出设备，将使用系统默认设备。');
+    return Promise.resolve(false);
+  }
+  return Promise.all([inst, vocal].map((element) => element.setSinkId(sink)))
+    .then(() => { deviceHint(''); return true; })
+    .catch(() => {
+      deviceHint('已保存的扬声器在当前设备上不可用，将使用系统默认设备。');
+      return false;
+    });
+}
+function sinkSelectable() {
+  return typeof HTMLMediaElement !== 'undefined'
+    && typeof HTMLMediaElement.prototype.setSinkId === 'function';
+}
+
+/** 列出这台浏览器能用的输入/输出设备。名字要等授权过一次才有，如实说明。 */
+async function refreshMediaDevices() {
+  const input = $('#audioIn'), output = $('#audioOut');
+  if (!input || !output) return;
+  const fill = (select, list, current, fallback) => {
+    const options = [{ deviceId: '', label: '系统默认' }, ...list];
+    if (current && !options.some((item) => item.deviceId === current)) {
+      options.push({ deviceId: current, label: '已保存的设备（当前浏览器未找到）' });
+    }
+    select.replaceChildren(...options.map((item, index) => {
+      const option = document.createElement('option');
+      option.value = item.deviceId;
+      option.textContent = item.label || `${fallback} ${index}`;
+      return option;
+    }));
+    select.value = current && options.some((item) => item.deviceId === current) ? current : '';
+  };
+  const media = navigator.mediaDevices;
+  const sink = sinkSelectable();
+  let devices = [];
+  if (media?.enumerateDevices) {
+    try { devices = await media.enumerateDevices(); } catch { devices = []; }
+  }
+  fill(input, devices.filter((item) => item.kind === 'audioinput'), prefs.audioIn, '麦克风');
+  fill(output, sink ? devices.filter((item) => item.kind === 'audiooutput') : [], prefs.audioOut, '扬声器');
+  input.disabled = !media?.enumerateDevices;
+  output.disabled = !sink;
+  if (!media?.enumerateDevices) deviceHint('当前浏览器无法列出音频设备，将使用系统默认设备。');
+  else if (!sink) deviceHint('当前浏览器不支持选择音频输出设备，将使用系统默认设备。');
+  else if (devices.length && devices.every((item) => !item.label)) {
+    deviceHint('允许访问麦克风后，才能显示设备名称。');
+  }
+}
+
+/** 登录后读「人 + 这台设备」的设置。读不到就退回内置安全默认值并说明，
+ *  绝不把上一位用户留在这台浏览器里的本地偏好顶上去当成新用户的设置。 */
+async function loadUserSettings() {
+  const api = window.OpenKUserState;
+  if (!api) return;
+  const epoch = room.epoch;
+  Object.assign(prefs, PREF_DEFAULTS);
+  api.reset();
+  syncPrefControls();
+  prefsStatus('正在加载已保存的设置…');
+  try {
+    const value = await api.load();
+    if (epoch !== room.epoch) return;
+    if (value?.enabled) applyUserSettings(value.settings);
+    prefsStatus('');
+  } catch (e) {
+    if (e.status === 499 || epoch !== room.epoch) return;
+    prefsStatus('无法加载已保存的设置，当前使用安全默认值。'
+      + (e.message || ''));
+  }
+}
+
+function accountLost(e) {
+  room.ready = false;
+  room.error = '登录已过期，请重新登录后再点歌。';
+  room.epoch++;
+  OpenKAccount.reset();
+  window.OpenKUserState?.reset();
+  prefsStatus('');
+  disarmLocalPlayer('登录已过期，本机声音已停止。', { reset: true, release: false });
+  room.client?.stop();
+  room.client = null;
+  room.id = null;
+  room.items = [];
+  state.queue = [];
+  room.account = { enabled: true, user: null, loginUrl: e?.loginUrl || '/auth/login/' };
+  room.chip?.update(null);
+  renderQueue();
+  renderBrowse();
+  renderRoomStatus();
+  catalogNotice('登录已过期，请重新登录后再点歌。');
+}
+
+async function initAccount(force = false) {
+  if (!window.OpenKAccount) throw new Error('缺少 account.js，前端资源不完整');
+  libraryPopularity.reset();
+  const epoch = ++room.epoch;
+  room.ready = false;
+  room.error = '';
+  room.client?.stop();
+  room.client = null;
+  OpenKRoom.renderDevices($('#roomDevices'), null, null);
+  room.id = null;
+  room.items = [];
+  const host = $('#accountChip');
+  const account = await (force ? OpenKAccount.reload() : OpenKAccount.load());
+  if (epoch !== room.epoch) throw new OpenKRoom.RoomError('账号状态已更新，请重试', 499);
+  room.account = account;
+  if (!account.enabled) {
+    if (host) host.hidden = true;
+    renderRoomStatus();
+    loadQueue();
+    room.ready = true;
+    renderQueue(); renderBrowse();
+    return;
+  }
+  document.body.classList.add('account-mode');
+  room.chip = OpenKAccount.mount(host, { onLogout: () => signOutLibrary() });
+  room.chip.update(account.user);
+  state.queue = [];
+  renderRoomStatus();
+  if (account.user) await loadUserSettings();
+  if (epoch !== room.epoch) throw new OpenKRoom.RoomError('账号状态已更新，请重试', 499);
+  const current = await OpenKAccount.currentRoom();
+  if (epoch !== room.epoch) throw new OpenKRoom.RoomError('账号状态已更新，请重试', 499);
+  // 换房间要重新做一次手势才会出声，绝不因为跟随而自动播放。
+  room.gesture = false;
+  bindRoom(current);
+  room.ready = true;
+  catalogNotice('');
+  renderRoomStatus();
+  renderQueue();
+  renderBrowse();
+  refreshPopularity(true);
+}
+
+function accountFailed(e) {
+  if (e.status === 499) return;
+  room.ready = false;
+  room.error = '无法读取登录状态，请刷新页面后重试。';
+  if (e.status === 401) {
+    room.account = { enabled: true, user: null, loginUrl: '/auth/login/' };
+    libraryPopularity.reset();
+    renderBrowse();
+    document.body.classList.add('account-mode');
+    room.chip = OpenKAccount.mount($('#accountChip'), {});
+    room.chip.update(null);
+    renderRoomStatus();
+    catalogNotice('需要登录后才能点歌。');
+    return;
+  }
+  // 绝不悄悄退回独立播放器：那会绕过房间，也会让别人看不到你点的歌。
+  renderRoomStatus();
+  catalogNotice('无法读取登录状态：' + (e.message || e));
+  toast('无法读取登录状态：' + (e.message || e));
+}
+
+function accountWaiting() {
+  if (accountMode() && !room.account.user) location.assign(room.account.loginUrl || '/auth/login/');
+  else toast(room.error || '正在读取登录状态和当前房间，请稍后重试。');
+}
+
+async function signOutLibrary() {
+  try {
+    room.chip?.busy(true);
+    // 先停本机的声音和麦克风，并且真的把播放权还回去，再把身份交还给账号服务：
+    // 否则房间要空等 12 秒才肯让下一台设备开声。
+    disarmLocalPlayer('正在退出登录…');
+    await room.releasing;
+    window.OpenKUserState?.reset();
+    const url = await OpenKAccount.logout();
+    room.client?.stop();
+    room.client = null;
+    OpenKRoom.renderDevices($('#roomDevices'), null, null);
+    location.assign(url);
+  } catch (e) {
+    room.chip?.busy(false);
+    toast(e.message || '退出登录失败');
+    setRoomStatus('退出登录失败，房间仍然可用。');
+    // 退出失败不能把界面留在一个死掉的连接上。
+    if (!room.client?.running) initAccount(true).catch(accountFailed);
+  }
+}
+
 function addToQueue(id, playNow = false) {
+  if (!room.ready) { accountWaiting(); return; }
+  if (accountMode()) {
+    if (!room.account.user) { location.assign(room.account.loginUrl || '/auth/login/'); return; }
+    addToRoom(id, playNow);
+    return;
+  }
   if (playNow) {
     state.queue = state.queue.filter((q) => q !== id);
     state.queue.unshift(id);
@@ -692,15 +1690,53 @@ function topQueue(id) {
 /** 取出队首开唱。当前这首会从队列里移除——KTV 机器就是这个行为。
  *
  *  keepView：自动接下一首时用。别人正在翻歌选下一首，结果上一首唱完了
- *  界面自己跳走，很烦人；所以只有用户主动点歌 / 切歌时才切到歌词页。 */
+ *  界面自己跳走，很烦人；所以只有用户主动点歌 / 切歌时才切到歌词页。
+ *
+ *  账号模式下队列在服务端，所以这里只是把「下一首」这个意图交给房间，
+ *  绝不在房间之外再开一条本地队列。 */
 function playFromQueue(keepView = false) {
+  if (!room.ready) { accountWaiting(); return; }
+  if (accountMode()) { skipRoomSong(); return; }
   const id = state.queue.shift();
   saveQueue(); renderQueue(); renderBrowse();
   if (!id) { endPlayback(); return; }   // 队列空了才真正停下来
   selectJob(id, keepView);
 }
 
+/** 账号模式的已点列表直接画服务端条目：同一首歌点两次是两条独立记录，
+ *  置顶/删除/立即唱都认条目 ID，不会误伤另一份拷贝。 */
+function renderRoomQueue() {
+  const ul = $('#queueList');
+  const items = room.items;
+  const signature = items.map((item) =>
+    JSON.stringify([item.id, item.job_id, item.title, item.artist])).join('|');
+  if (ul.dataset.signature !== signature) {
+    ul.dataset.signature = signature;
+    ul.innerHTML = '';
+    items.forEach((item, i) => {
+      const li = document.createElement('li');
+      li.className = 'q-item';
+      li.dataset.id = item.job_id;
+      li.dataset.item = item.id;
+      li.innerHTML = `
+      <span class="q-no">${i + 1}</span>
+      <div class="q-body">
+        <button class="q-title item-open" data-act="play" aria-label="立即演唱：${escapeHtml(item.title || '')}">${escapeHtml(item.title || '未命名')}</button>
+        <p class="q-artist">${escapeHtml(item.artist || '未知歌手')}</p>
+      </div>
+      <button class="lyr-btn" data-act="top" title="置顶，下一首就唱它">⇧ 置顶</button>
+      <button class="lyr-btn" data-act="del" title="从已点里删掉">✕</button>`;
+      ul.appendChild(li);
+    });
+  }
+  $('#queueCount').textContent = String(items.length);
+  $('#nbQueueCount').textContent = String(items.length);
+  $('#queueEmpty').classList.toggle('hidden', items.length > 0);
+  $('#queueHint').textContent = items.length ? '唱完自动接下一首' : '';
+}
+
 function renderQueue() {
+  if (accountMode()) { renderRoomQueue(); return; }
   const ul = $('#queueList');
   const signature = state.queue.map((id) => {
     const j = jobById(id);
@@ -732,6 +1768,10 @@ function renderQueue() {
 }
 
 /* ---------------- 后台：处理中的任务 ---------------- */
+function isFailedJob(job) {
+  return job?.state === 'error' || job?.state === 'cancelled';
+}
+
 function renderProcessing() {
   const pending = state.allJobs.filter((j) => j.state !== 'done');
   const ul = $('#procList');
@@ -744,6 +1784,8 @@ function renderProcessing() {
     const li = document.createElement('li');
     li.className = `proc-item ${j.state}`;
     li.dataset.id = j.id;
+    const deleting = state.deletingJobs.has(j.id);
+    const disabled = deleting ? 'disabled' : '';
     const pct = Math.round(Math.max(0, Math.min(100, Number(j.progress) || 0)));
     li.innerHTML = `
       <div class="p-body">
@@ -751,8 +1793,12 @@ function renderProcessing() {
         <p class="p-msg muted small">${STATE_TEXT[j.state] || j.state} · ${escapeHtml(j.message || '')}</p>
       </div>
       ${j.state === 'error'
-        ? '<button class="lyr-btn" data-act="retry">重试</button>'
-        : `<span class="p-pct">${pct}%</span>`}`;
+        ? `<button class="lyr-btn" data-act="retry" ${disabled}>重试</button>`
+        : isFailedJob(j) ? '' : `<span class="p-pct">${pct}%</span>`}
+      ${isFailedJob(j)
+        ? `<button class="lyr-btn proc-delete" data-act="delete" ${disabled}
+            aria-label="删除任务：${escapeHtml(j.title || j.id)}">${deleting ? '删除中…' : '删除'}</button>`
+        : ''}`;
     ul.appendChild(li);
   });
   $('#procEmpty').classList.toggle('hidden', pending.length > 0);
@@ -765,7 +1811,46 @@ function renderProcessing() {
   if (focused) {
     const row = [...ul.children].find((el) => el.dataset.id === focused.id);
     const button = row && [...row.querySelectorAll('button')].find((el) => el.dataset.act === focused.action);
-    (button || $('#adminClose')).focus();
+    (button && !button.disabled ? button : row?.querySelector('button:not(:disabled)') || $('#adminClose')).focus();
+  }
+}
+
+async function deleteFailedJob(id) {
+  if (state.deletingJobs.has(id)) return;
+  const job = jobById(id);
+  if (!isFailedJob(job)) {
+    toast('任务状态已改变，请刷新后再处理');
+    await refreshList(true);
+    return;
+  }
+  if (!confirm(`删除「${job.title || job.id}」及其任务工作文件？\n不会删除导入目录中的原文件。此操作无法撤销。`)) return;
+  state.deletingJobs.add(id);
+  renderProcessing();
+  try {
+    let missing = false;
+    try {
+      await api.deleteJob(id, { failedOnly: true });
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      missing = true;
+    }
+    if (state.disposed) return;
+    if (state.inspectedJobId === id) stopPolling();
+    if ($('#progressPanel').dataset.jobId === id) $('#progressPanel').classList.add('hidden');
+    // Drain a pre-delete catalog request before fetching the authoritative new list.
+    await state.listRequest;
+    if (state.disposed) return;
+    state.allJobs = state.allJobs.filter((item) => item.id !== id);
+    renderProcessing();
+    await refreshList(true);
+    toast(missing ? '任务已不存在，列表已更新' : '任务已删除');
+  } catch (err) {
+    if (!state.disposed) alert(err.message || '删除失败，请重试');
+    await state.listRequest;
+    await refreshList(true);
+  } finally {
+    state.deletingJobs.delete(id);
+    if (!state.disposed) renderProcessing();
   }
 }
 
@@ -777,6 +1862,7 @@ function showBrowse() {
   $('#browse').classList.remove('hidden');
   stopLyricAnimation();
   renderBrowse();
+  renderNowBar();
 }
 
 function showStage() {
@@ -785,6 +1871,7 @@ function showStage() {
   state.activeLine = -1;
   updateLyrics(inst.currentTime);
   startLyricAnimation();
+  renderNowBar();
 }
 
 /** 彻底停止播放（只有清空队列 / 没有下一首时才走这里）。 */
@@ -800,7 +1887,12 @@ function endPlayback() {
 function renderNowBar() {
   const bar = $('#nowbar');
   const j = state.currentJobId ? jobById(state.currentJobId) : null;
-  if (!j) { bar.classList.add('hidden'); document.body.classList.remove('has-nowbar'); return; }
+  if (!j || (state.editing && !$('#stage').classList.contains('hidden'))) {
+    bar.classList.add('hidden');
+    document.body.classList.remove('has-nowbar');
+    renderTransportLabels();
+    return;
+  }
   const si = songInfo(j);
   bar.classList.remove('hidden');
   document.body.classList.add('has-nowbar');
@@ -810,7 +1902,7 @@ function renderNowBar() {
   $('#nbTitle').textContent = si.title;
   $('#nbArtist').textContent = si.artist || '未知歌手';
   $('#nbQueueCount').textContent = String(state.queue.length);
-  $('#nbPlay').textContent = inst.paused ? '▶' : '⏸';
+  renderTransportLabels();
   measureNowBar();
 }
 
@@ -819,45 +1911,84 @@ function measureNowBar() {
   if (height > 0) document.documentElement.style.setProperty('--nowbar-height', `${height}px`);
 }
 
-/** 原唱 / 伴唱切换。KTV 里默认永远是伴唱——原唱是拿来学的，不是拿来唱的。 */
-function setSingMode(mode) {
+/** 原唱 / 伴唱切换。KTV 里默认永远是伴唱——原唱是拿来学的，不是拿来唱的。
+ *  persist=false 用于照抄房间下发的状态：别把别人按的开关记成本机偏好。 */
+function setSingMode(mode, persist = true) {
   state.singMode = mode;
-  prefs.singMode = mode;
-  savePrefs();
+  if (persist) prefs.singMode = mode;
   $('#modeInst').classList.toggle('active', mode === 'inst');
   $('#modeOrig').classList.toggle('active', mode === 'orig');
   $('#modeInst').setAttribute('aria-pressed', String(mode === 'inst'));
   $('#modeOrig').setAttribute('aria-pressed', String(mode === 'orig'));
   // 原唱模式下把导唱人声推满，伴唱模式下压到 0
   $('#vocalVol').value = mode === 'orig' ? 100 : 0;
+  prefs.vocalVol = Number($('#vocalVol').value);
+  // 房间下发的模式不算个人设置，所以只有本机主动切换时才记下来。
+  if (persist) savePrefs('singMode', 'vocalVol');
   applyVolumes();
 }
 
+const DRAWERS = {
+  queue: { panel: '#queuePanel', close: '#queueClose' },
+  admin: { panel: '#adminPanel', close: '#adminClose' },
+  remote: { panel: '#remotePanel', close: '#remoteClose' },
+};
+const DRAWER_BACKGROUND = ['.topbar', '#roomStatus', '#browse', '#stage', '#nowbar', '#pendingRecordingsWrap', '.foot'];
 let drawerTrigger = null;
 function openDrawer(which) {
+  const drawer = DRAWERS[which];
+  if (!drawer) throw new Error('Unknown drawer: ' + which);
   if ($('#scrim').classList.contains('hidden')) drawerTrigger = document.activeElement;
-  const q = which === 'queue';
-  $('#queuePanel').classList.toggle('hidden', !q);
-  $('#adminPanel').classList.toggle('hidden', q);
+  Object.entries(DRAWERS).forEach(([name, value]) => $(value.panel).classList.toggle('hidden', name !== which));
+  $('#remoteLink').setAttribute('aria-expanded', String(which === 'remote'));
   $('#scrim').classList.remove('hidden');
-  ['.topbar', '#browse', '#stage', '#nowbar', '#pendingRecordingsWrap', '.foot'].forEach((s) => {
+  DRAWER_BACKGROUND.forEach((s) => {
     const el = $(s);
     if (el) el.inert = true;
   });
   document.body.classList.add('drawer-open');
-  (q ? $('#queueClose') : $('#adminClose')).focus();
+  $(drawer.close).focus();
 }
 function closeDrawers() {
-  $('#queuePanel').classList.add('hidden');
-  $('#adminPanel').classList.add('hidden');
+  Object.values(DRAWERS).forEach(value => $(value.panel).classList.add('hidden'));
+  $('#remoteLink').setAttribute('aria-expanded', 'false');
   $('#scrim').classList.add('hidden');
-  ['.topbar', '#browse', '#stage', '#nowbar', '#pendingRecordingsWrap', '.foot'].forEach((s) => {
+  DRAWER_BACKGROUND.forEach((s) => {
     const el = $(s);
     if (el) el.inert = false;
   });
   document.body.classList.remove('drawer-open');
   if (drawerTrigger?.isConnected) drawerTrigger.focus();
   drawerTrigger = null;
+}
+
+function openRemoteQR() {
+  // Share only the navigation URL, never account cookies or room capabilities.
+  const url = new URL('/remote', location.href).href;
+  $('#remoteOpen').href = url;
+  $('#remoteAddress').textContent = url;
+  $('#remoteQRHint').textContent = !room.ready
+    ? '用手机相机扫码打开遥控页；如需登录，请使用与本机相同的账号。'
+    : accountMode() ? '用手机相机扫码，登录与本机相同的账号后，即可控制当前房间。'
+      : '用手机相机扫码打开遥控页，再选择或加入要控制的房间。';
+  const notice = $('#remoteQRNotice');
+  notice.textContent = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+    ? '当前是本机地址。请先用手机可访问的域名或局域网地址打开 OpenK，再扫码。' : '';
+  notice.classList.toggle('hidden', !notice.textContent);
+  const box = $('#remoteQR');
+  box.replaceChildren();
+  if (typeof window.qrcode === 'function') {
+    const qr = window.qrcode(0, 'M');
+    qr.addData(url);
+    qr.make();
+    box.innerHTML = qr.createSvgTag({ cellSize: 5, margin: 20, scalable: true });
+    const svg = box.querySelector('svg');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', '扫描二维码打开手机遥控页');
+  } else {
+    box.textContent = '二维码生成器未能加载，请使用下方链接打开遥控页。';
+  }
+  openDrawer('remote');
 }
 
 let _toastTimer;
@@ -895,6 +2026,7 @@ function invalidateSelection() {
   state.lyricsRequest?.abort();
   state.recordingsGeneration++;
   state.recordingsRequest?.abort();
+  resetLyricsEditor();
   cancelEndedTimer();
 }
 
@@ -908,11 +2040,13 @@ async function selectJob(id, keepView = false) {
   cancelEndedTimer();
   const request = new AbortController();
   state.selectionRequest = request;
-  unlockAudio();
+  if (room.ready) unlockAudio();
   try {
     const job = await api.getJob(id, { signal: request.signal });
     if (requestGeneration !== state.selectionRequestGeneration || request.signal.aborted || state.disposed) return;
     if (job.state === 'done') {
+      if (!room.ready) { accountWaiting(); return; }
+      if (accountMode()) { await addToRoom(id, true); return; }
       if (!job.media?.instrumental) throw new Error('伴奏文件暂时不可用，请在后台检查歌曲');
       const generation = ++state.selectionGeneration;
       state.lyricsGeneration++;
@@ -959,10 +2093,11 @@ function startPolling(id) {
       if (index >= 0) state.allJobs[index] = job;
       else state.allJobs.unshift(job);
       renderProcessing();
-      if (job.state === 'done' || job.state === 'error') {
+      if (job.state === 'done' || isFailedJob(job)) {
         stopPolling();
         await refreshList();
-        toast(job.state === 'done' ? '歌曲已制作完成，可在曲库点唱' : '制作失败，请在后台查看原因');
+        toast(job.state === 'done' ? '歌曲已制作完成，可在曲库点唱'
+          : job.state === 'cancelled' ? '任务已取消，可在后台删除' : '制作失败，请在后台查看原因');
         return;
       }
     } catch (e) {
@@ -1001,6 +2136,7 @@ function showProgress(job) {
 }
 
 function updateProgressUI(job) {
+  $('#progressPanel').dataset.jobId = job.id || '';
   $('#progTitle').textContent = job.title || '处理中…';
   $('#progMessage').textContent = job.message || '';
   const pct = Math.max(0, Math.min(100, Number(job.progress || 0)));
@@ -1033,7 +2169,7 @@ function updateProgressUI(job) {
 const inst = $('#instAudio');
 const vocal = $('#vocalAudio');
 
-async function showPlayer(job, generation = state.selectionGeneration) {
+async function showPlayer(job, generation = state.selectionGeneration, autoplay = true) {
   if (generation !== state.selectionGeneration) return;
   $('#progressPanel').classList.add('hidden');
   $('#player').classList.remove('hidden');
@@ -1061,10 +2197,18 @@ async function showPlayer(job, generation = state.selectionGeneration) {
   $('#modeOrig').disabled = !hasVocal();
   setAudioStatus('正在载入音频…');
 
-  // 开唱先把麦克风接上（点歌那一下就是用户手势，此时申请授权才会被允许）
-  autoEnableMic();
-  setSingMode(state.singMode);
-  startPlayback();
+  // 开唱先把麦克风接上（点歌那一下就是用户手势，此时申请授权才会被允许）。
+  // 房间里没拿到播放权的那台设备不出声，也就不该顺手要走麦克风。
+  if (autoplay || room.armed) autoEnableMic();
+  if (accountMode()) {
+    const guide = roomState()?.playback.guide;
+    setSingMode(guide ? 'orig' : 'inst', false);
+  } else setSingMode(state.singMode);
+  if (autoplay) startPlayback();
+  else if (accountMode()) {
+    setAudioStatus(room.armed ? '' : '点「在本机播放」开始');
+    applyRoomPlayback(true);
+  }
   renderNowBar();
 
   // 录音状态重置 + 载入该歌的历史录音
@@ -1084,8 +2228,7 @@ async function showPlayer(job, generation = state.selectionGeneration) {
   state.lyrics = null; state.lineEls = []; state.activeLine = -1;
   state.lyricsUrl = job.media?.lyrics || null;
   state.currentTitle = job.title || '';
-  state.editing = false;
-  $('#editBar').classList.add('hidden');
+  resetLyricsEditor();
   $('#editLyrics').classList.add('hidden');
   $('#searchLyrics').classList.add('hidden');
   $('#lyricSearch').classList.add('hidden');
@@ -1095,26 +2238,38 @@ async function showPlayer(job, generation = state.selectionGeneration) {
   if (isCurrentPlayer(job.id, generation)) renderAlignmentStatus(job.id);
 }
 
+function refreshPlayerLyrics(jobId, url) {
+  if (state.disposed || state.currentJobId !== jobId || state.editing
+      || (state.lyrics && state.lyricsUrl === url && !state.lyricsRetryAt)
+      || (state.lyricsRequest && state.lyricsRequestUrl === url)
+      || Date.now() < state.lyricsRetryAt) return;
+  loadPlayerLyrics(jobId, url, state.selectionGeneration, true);
+}
+
 async function loadPlayerLyrics(jobId, url, generation = state.selectionGeneration, bust = false) {
   if (!isCurrentPlayer(jobId, generation)) return;
   const revision = ++state.lyricsGeneration;
   state.lyricsRequest?.abort();
   const request = new AbortController();
   state.lyricsRequest = request;
+  state.lyricsRequestUrl = url;
+  state.lyricsRetryAt = 0;
   const box = $('#lyrics');
   if (!state.lyrics) box.innerHTML = '<p class="muted empty">正在载入歌词…</p>';
   try {
     if (bust) {
-      // 发布歌词会产生新的不可变路径，不能只给旧 URL 加时间戳。
+      // Room/catalog snapshots can lag a local edit; resolve the latest immutable path.
       const job = await api.getJob(jobId, { signal: request.signal });
       if (!isCurrentPlayer(jobId, generation) || revision !== state.lyricsGeneration || request.signal.aborted) return;
       url = job.media?.lyrics || null;
-      state.lyricsUrl = url;
+      state.lyricsRequestUrl = url;
       const index = state.allJobs.findIndex((j) => j.id === jobId);
       if (index >= 0) state.allJobs[index] = job;
     }
     if (!url) {
       state.lyrics = { lines: [] };
+      state.lyricsUrl = null;
+      $('#lyricSource').classList.add('hidden');
       renderLyrics();
       return;
     }
@@ -1123,6 +2278,7 @@ async function loadPlayerLyrics(jobId, url, generation = state.selectionGenerati
     if (!isCurrentPlayer(jobId, generation) || revision !== state.lyricsGeneration || request.signal.aborted) return;
     if (!lyrics || !Array.isArray(lyrics.lines)) throw new Error('歌词格式不正确');
     state.lyrics = lyrics;
+    state.lyricsUrl = url;
     // 显示歌词来源徽章
     const badge = $('#lyricSource');
     const src = state.lyrics.source;
@@ -1130,16 +2286,20 @@ async function loadPlayerLyrics(jobId, url, generation = state.selectionGenerati
     else { badge.classList.add('hidden'); }
     renderLyrics();
   } catch (e) {
-    if (isCurrentPlayer(jobId, generation) && revision === state.lyricsGeneration && e.name !== 'AbortError') {
+    if (isCurrentPlayer(jobId, generation) && revision === state.lyricsGeneration && !request.signal.aborted) {
+      state.lyricsRetryAt = Date.now() + 3000;
       if (state.lyrics?.lines?.length) {
         renderLyrics();
-        toast('新版歌词暂时无法载入，保留上次版本；重新点歌可重试');
+        toast('新版歌词暂时无法载入，保留上次版本；稍后自动重试');
       } else {
-        box.innerHTML = '<p class="muted empty">未能载入歌词。音乐可继续播放，请稍后重试。</p>';
+        box.innerHTML = '<p class="muted empty">未能载入歌词。音乐可继续播放，稍后会自动重试。</p>';
       }
     }
   } finally {
-    if (state.lyricsRequest === request) state.lyricsRequest = null;
+    if (state.lyricsRequest === request) {
+      state.lyricsRequest = null;
+      state.lyricsRequestUrl = null;
+    }
   }
 }
 
@@ -1176,9 +2336,9 @@ function renderLyrics() {
     } else {
       div.textContent = ln.text;
     }
-    div.addEventListener('click', () => seekTo(ln.start + 0.001));
+    div.addEventListener('click', () => { localGesture(); userSeek(ln.start + 0.001); });
     div.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); e.stopPropagation(); seekTo(ln.start + 0.001); }
+      if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); e.stopPropagation(); localGesture(); userSeek(ln.start + 0.001); }
     });
     box.appendChild(div);
     state.lineEls.push(div);
@@ -1191,61 +2351,310 @@ function renderLyrics() {
 }
 
 /* ---------- 歌词编辑（识别不准时手动纠正） ---------- */
+function formatLyricTime(value) {
+  if (!Number.isFinite(value)) return '';
+  const milliseconds = Math.round(value * 1000);
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) return '';
+  return String(Math.floor(milliseconds / 60000)).padStart(2, '0') + ':'
+    + String(Math.floor(milliseconds / 1000) % 60).padStart(2, '0') + '.'
+    + String(milliseconds % 1000).padStart(3, '0');
+}
+
+function parseLyricTime(value) {
+  const match = /^(?:(\d+):)?(\d+)(?:\.(\d{1,3}))?$/.exec(value.trim());
+  if (!match || (match[1] !== undefined && Number(match[2]) >= 60)) return NaN;
+  const seconds = Number(match[1] || 0) * 60 + Number(match[2]) + Number('0.' + (match[3] || '0'));
+  return Number.isSafeInteger(Math.round(seconds * 1000)) ? seconds : NaN;
+}
+
+function lyricTimingNotice(message, error = false) {
+  const notice = $('#lyricTimingNotice');
+  notice.textContent = message;
+  notice.classList.toggle('error', error);
+}
+
+function invalidLyricTime(message, field) {
+  field?.setAttribute('aria-invalid', 'true');
+  const error = new Error(message);
+  error.field = field;
+  throw error;
+}
+
+function lyricEditDuration() {
+  const duration = Number.isFinite(inst.duration) ? inst.duration : Number(jobById(state.currentJobId)?.duration);
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
+}
+
+function validateLyricEdits(lines) {
+  const duration = lyricEditDuration();
+  let previous = -1;
+  for (const line of lines) {
+    const row = state.lyricEdit.rows[line.index];
+    if (!Number.isFinite(line.start) || line.start < 0) {
+      invalidLyricTime(`第 ${line.index + 1} 行开始时间无效，请填写秒数或分:秒，最多三位小数。`, row.start);
+    }
+    if (!Number.isFinite(line.end) || line.end < line.start) {
+      invalidLyricTime(`第 ${line.index + 1} 行结束时间不能早于开始时间。`, row.end);
+    }
+    if (line.start < previous) {
+      invalidLyricTime(`第 ${line.index + 1} 行不能早于上一行；补前奏请用「对齐整首」。`, row.start);
+    }
+    if (duration !== null && line.end > duration + 0.001) {
+      invalidLyricTime(`第 ${line.index + 1} 行超出歌曲时长 ${formatLyricTime(duration)}，请检查结束时间或偏移量。`, row.end);
+    }
+    previous = line.start;
+  }
+  return lines;
+}
+
+function readLyricEdits() {
+  const lines = state.lyricEdit.rows.map((row, index) => {
+    row.text.removeAttribute('aria-invalid');
+    row.start.removeAttribute('aria-invalid');
+    row.end.removeAttribute('aria-invalid');
+    return { index, start: parseLyricTime(row.start.value), end: parseLyricTime(row.end.value),
+      text: row.text.value.trim() };
+  }).filter(line => line.text);
+  if (!lines.length) invalidLyricTime('歌词不能为空，请至少保留一行。', state.lyricEdit.rows[0]?.text);
+  return validateLyricEdits(lines);
+}
+
+function showLyricTimingError(error) {
+  lyricTimingNotice(error.message || '无法调整时间，请检查输入。', true);
+  error.field?.focus();
+}
+
+function writeLyricTimes(lines) {
+  validateLyricEdits(lines);
+  for (const line of lines) {
+    const row = state.lyricEdit.rows[line.index];
+    row.start.value = formatLyricTime(line.start);
+    row.end.value = formatLyricTime(line.end);
+    row.start.removeAttribute('aria-invalid');
+    row.end.removeAttribute('aria-invalid');
+  }
+  renderLyricEditProgress();
+}
+
+function shiftLyricTimes(delta, lines = readLyricEdits()) {
+  if (!Number.isFinite(delta)) invalidLyricTime('请输入偏移秒数：正数延后，负数提前。', $('#lyricOffset'));
+  writeLyricTimes(lines.map(line => ({ ...line,
+    start: Math.round((line.start + delta) * 1000) / 1000,
+    end: Math.round((line.end + delta) * 1000) / 1000 })));
+  lyricTimingNotice(`整首歌词已${delta < 0 ? '提前' : '延后'} ${Number(Math.abs(delta).toFixed(3))} 秒，尚未保存。`);
+}
+
+function lyricEditPlayhead() {
+  if (accountMode() && !room.armed) return null;
+  return Number.isFinite(inst.currentTime) && lyricEditDuration() !== null ? inst.currentTime : null;
+}
+
+function alignLyricAtPlayhead(index, wholeSong) {
+  const position = lyricEditPlayhead();
+  if (position === null) throw new Error('请在实际播放设备上标记当前时间；本页仍可直接填写起止时间。');
+  const lines = readLyricEdits();
+  const selected = lines.find(line => line.index === index);
+  if (!selected) invalidLyricTime('请先填写这一行的歌词。', state.lyricEdit.rows[index].text);
+  const delta = Math.round((position - selected.start) * 1000) / 1000;
+  if (wholeSong) shiftLyricTimes(delta, lines);
+  else {
+    writeLyricTimes(lines.map(line => line.index === index
+      ? { ...line, start: Math.round(position * 1000) / 1000,
+        end: Math.round((line.end + delta) * 1000) / 1000 } : line));
+    lyricTimingNotice(`第 ${index + 1} 行已对齐到 ${formatLyricTime(position)}，其余行不变；尚未保存。`);
+  }
+}
+
+function renderLyricEditProgress() {
+  const draft = state.lyricEdit;
+  if (!draft) return;
+  const position = lyricEditPlayhead();
+  $('#lyricEditPosition').textContent = position === null ? '本机未播放' : formatLyricTime(position);
+  $('#lyricEditSeek').disabled = position === null;
+  $('#lyricEditPlaybackHint').textContent = position === null
+    ? '本机不是播放器；这里可改时间，当前时间请在播放设备上标记。'
+    : '可暂停后拖动进度精确定位。点「试听本句」从这一句前一秒播放；对齐不需要重新识别。';
+  if (position !== null && !room.seeking) {
+    $('#lyricEditSeek').value = position / lyricEditDuration() * 1000;
+    $('#lyricEditSeek').setAttribute('aria-valuetext', formatLyricTime(position));
+  }
+  for (const row of draft.rows) {
+    const start = parseLyricTime(row.start.value), end = parseLyricTime(row.end.value);
+    row.node.classList.toggle('is-current', position !== null && position >= start && position < end);
+    for (const button of row.node.querySelectorAll('[data-playhead]')) {
+      button.disabled = draft.saving || position === null;
+    }
+  }
+}
+
+function resetLyricsEditor() {
+  state.editing = false;
+  state.lyricEdit = null;
+  $('#editBar').classList.add('hidden');
+  $('#lyricTimingTools').classList.add('hidden');
+  $('#lyrics').classList.remove('is-editing');
+  $('#player').classList.remove('is-editing');
+  $('#playerControls').classList.remove('hidden');
+  $('#saveLyrics').disabled = $('#cancelLyrics').disabled = false;
+  $('#saveLyrics').textContent = '保存';
+  renderNowBar();
+}
+
+function setLyricEditBusy(busy) {
+  state.lyricEdit.saving = busy;
+  for (const control of document.querySelectorAll('#lyrics input, #lyrics [data-timing-change], #lyricTimingTools [data-timing-change], #lyricOffset, #cancelLyrics')) {
+    control.disabled = busy;
+  }
+  $('#saveLyrics').disabled = busy;
+  $('#saveLyrics').textContent = busy ? '保存中…' : '保存';
+  renderLyricEditProgress();
+}
+
 function enterLyricsEdit() {
   const lines = state.lyrics?.lines || [];
-  if (!lines.length) return;
+  if (!lines.length || state.editing) return;
   state.editing = true;
+  const draft = { rows: [], saving: false, lines };
+  state.lyricEdit = draft;
+  state.lyricsGeneration++;
+  state.lyricsRequest?.abort();
+  state.lyricsRequest = null;
+  state.lyricsRequestUrl = null;
   stopLyricAnimation();
   const box = $('#lyrics');
   box.innerHTML = '';
   state.lineEls = [];
   lines.forEach((ln, i) => {
+    const row = document.createElement('div');
+    row.className = 'lyric-edit-row';
+    const label = document.createElement('label');
+    label.className = 'lyric-edit-label';
+    label.htmlFor = 'lyric-text-' + i;
+    label.textContent = `第 ${i + 1} 行`;
     const inp = document.createElement('input');
     inp.type = 'text';
+    inp.id = label.htmlFor;
     inp.className = 'lyric-edit';
     inp.value = ln.text || '';
     inp.dataset.i = i;
-    box.appendChild(inp);
+    const fields = document.createElement('div');
+    fields.className = 'lyric-time-fields';
+    const times = {};
+    for (const [key, text] of [['start', '开始'], ['end', '结束']]) {
+      const timeLabel = document.createElement('label');
+      timeLabel.textContent = text;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'lyric-time-input';
+      input.dataset.time = key;
+      input.value = formatLyricTime(ln[key]);
+      input.placeholder = '00:12.500';
+      input.setAttribute('aria-label', `第 ${i + 1} 行${text}时间`);
+      input.addEventListener('change', () => {
+        try { readLyricEdits(); lyricTimingNotice('时间已修改，尚未保存。'); }
+        catch (error) { showLyricTimingError(error); }
+        renderLyricEditProgress();
+      });
+      timeLabel.append(input);
+      fields.append(timeLabel);
+      times[key] = input;
+    }
+    const actions = document.createElement('div');
+    actions.className = 'lyric-edit-actions';
+    for (const [action, text] of [['line', '本行对齐'], ['all', '对齐整首'], ['preview', '试听本句']]) {
+      const button = document.createElement('button');
+      button.className = 'lyr-btn';
+      button.textContent = text;
+      button.dataset.action = action;
+      button.setAttribute('aria-label', `第 ${i + 1} 行：${text}`);
+      if (action !== 'preview') {
+        button.dataset.playhead = '';
+        button.dataset.timingChange = '';
+        button.title = action === 'line' ? '把本行起点设为当前播放时间，保持本行时长'
+          : '以这句的开口时间为准，平移所有歌词（补前奏）';
+      }
+      button.addEventListener('click', () => {
+        if (state.lyricEdit !== draft) return;
+        try {
+          if (action !== 'preview') alignLyricAtPlayhead(i, action === 'all');
+          else {
+            const start = parseLyricTime(times.start.value);
+            if (!Number.isFinite(start)) invalidLyricTime('请先填写这一行的开始时间。', times.start);
+            localGesture();
+            userSeek(Math.max(0, start - 1));
+            if (!playbackAudible() && !state.playRequested) togglePlay();
+            lyricTimingNotice(`从 ${formatLyricTime(Math.max(0, start - 1))} 开始试听，草稿未保存。`);
+          }
+        } catch (error) { showLyricTimingError(error); }
+      });
+      actions.append(button);
+    }
+    row.append(label, inp, fields, actions);
+    box.append(row);
+    draft.rows.push({ node: row, text: inp, ...times });
   });
+  box.classList.add('is-editing');
+  $('#player').classList.add('is-editing');
+  $('#playerControls').classList.add('hidden');
+  $('#lyricTimingTools').classList.remove('hidden');
+  $('#lyricOffset').value = '0';
+  $('#lyricOffset').removeAttribute('aria-invalid');
+  for (const control of $('#lyricTimingTools').querySelectorAll('[data-timing-change], #lyricOffset')) control.disabled = false;
+  lyricTimingNotice('调整尚未保存，可试听或取消。');
   $('#editBar').classList.remove('hidden');
   $('#editLyrics').classList.add('hidden');
   $('#searchLyrics').classList.add('hidden');
   $('#lyricSearch').classList.add('hidden');
+  renderTransportLabels();
+  renderNowBar();
+  draft.rows[Math.max(0, state.activeLine)]?.text.focus();
 }
 
 function exitLyricsEdit() {
-  state.editing = false;
-  $('#editBar').classList.add('hidden');
+  resetLyricsEditor();
   renderLyrics();
+  const current = accountMode() ? roomCurrent() : jobById(state.currentJobId);
+  if (current) refreshPlayerLyrics(state.currentJobId, current.media?.lyrics || null);
 }
 
 async function saveLyricsEdit() {
-  if (!state.editing || !state.lyrics) return;
+  const draft = state.lyricEdit;
+  if (!state.editing || !draft || draft.saving) return;
   const jobId = state.currentJobId;
   const generation = state.selectionGeneration;
   const lyricsUrl = state.lyricsUrl;
   const lyrics = state.lyrics;
-  const inputs = $('#lyrics').querySelectorAll('.lyric-edit');
-  const lines = (state.lyrics.lines || []).map((ln, i) => ({
-    start: ln.start, end: ln.end,
-    text: (inputs[i] ? inputs[i].value : ln.text || '').trim(),
-    words: ln.words || [],
-  })).filter((ln) => ln.text);
-  const btn = $('#saveLyrics');
-  btn.disabled = true; btn.textContent = '保存中…';
+  let lines;
+  try {
+    lines = readLyricEdits().map(({ index, start, end, text }) => {
+      const original = draft.lines[index];
+      const span = original.end - original.start;
+      const moved = start !== original.start || end !== original.end;
+      // Move/stretch word timing with its line without losing the original gaps.
+      const time = value => Math.round(Math.max(start, Math.min(end,
+        start + (value - original.start) * (end - start) / span)) * 1000) / 1000;
+      const words = moved && !(span > 0) ? [] : (original.words || []).map(word => ({
+        ...word, text: word.text ?? word.word ?? '',
+        start: moved ? time(word.start) : word.start, end: moved ? time(word.end) : word.end,
+      }));
+      return { start, end, text, words };
+    });
+  } catch (error) { showLyricTimingError(error); return; }
+  setLyricEditBusy(true);
   try {
     await api.updateLyrics(jobId, {
-      lines, language: lyrics.language, source: lyrics.source,
+      lines, language: lyrics.language, source: lyrics.source, base_lyrics_url: lyricsUrl,
     });
-    if (!isCurrentPlayer(jobId, generation)) return;
-    state.editing = false;
-    $('#editBar').classList.add('hidden');
+    if (!isCurrentPlayer(jobId, generation) || state.lyricEdit !== draft) return;
+    resetLyricsEditor();
     await loadPlayerLyrics(jobId, lyricsUrl, generation, true);
     refreshList(true);
   } catch (e) {
-    if (isCurrentPlayer(jobId, generation)) toast(e.message || '保存失败');
+    if (isCurrentPlayer(jobId, generation) && state.lyricEdit === draft) showLyricTimingError(e);
   } finally {
-    if (isCurrentPlayer(jobId, generation)) { btn.disabled = false; btn.textContent = '保存'; }
+    if (isCurrentPlayer(jobId, generation) && state.lyricEdit === draft) {
+      setLyricEditBusy(false);
+    }
   }
 }
 
@@ -1657,7 +3066,10 @@ function makeNotchBank(actx, cfg = HOWL) {
   };
 }
 
-/* ---------- 用户偏好（存浏览器本地，换台设备互不影响） ---------- */
+/* ---------- 用户偏好 ----------
+   独立部署时仍然存在这台浏览器本地（换台设备互不影响）；
+   接上账号服务后偏好同时跟着「人」和「这台设备」走，由服务端保存，
+   本地不再留档，免得共用浏览器把上一个人的设置留给下一个人。 */
 const PREF_KEY = 'openk.prefs';
 const PREF_DEFAULTS = {
   micMonitor: true,   // 默认把麦克风外放——真正的 KTV 就是插上麦就有声
@@ -1665,7 +3077,20 @@ const PREF_DEFAULTS = {
   howlGuard: true,    // 外放就必然有啸叫风险，防护默认开着
   reverb: 'ktv',
   singMode: 'inst',   // KTV 默认伴唱
+  view: 'list',
+  instVol: 100,       // 伴奏音量
+  vocalVol: 0,        // 导唱人声音量
+  outVol: 100,        // 本机输出音量：跟着这台设备走
+  audioIn: '',        // 麦克风输入设备；浏览器给的 id 只在本来源有效，不可搬到别的设备
+  audioOut: '',       // 输出设备（需要浏览器支持 setSinkId）
   v: 2,               // 偏好版本，用来做一次性迁移
+};
+// 服务端字段名 ←→ 本地字段名。服务端那套名字同时被 /devices 页面使用。
+const PREF_FIELDS = {
+  singMode: 'sing_mode', reverb: 'reverb', view: 'view',
+  micMonitor: 'mic_monitor', micVol: 'mic_volume', howlGuard: 'howl_guard',
+  instVol: 'accompaniment_volume', vocalVol: 'guide_volume',
+  outVol: 'output_volume', audioIn: 'audio_input', audioOut: 'audio_output',
 };
 const prefs = (() => {
   let p;
@@ -1679,7 +3104,20 @@ const prefs = (() => {
   }
   return p;
 })();
-function savePrefs() { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} }
+/** 传入改动过的本地字段名；账号模式下只把这几项交给服务端。 */
+function savePrefs(...keys) {
+  if (accountMode()) { pushPrefs(keys); return; }
+  try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {}
+}
+function pushPrefs(keys) {
+  const api = window.OpenKUserState;
+  if (!api?.enabled) return;
+  const patch = {};
+  for (const key of keys.length ? keys : Object.keys(PREF_FIELDS)) {
+    if (PREF_FIELDS[key] && prefs[key] !== undefined) patch[PREF_FIELDS[key]] = prefs[key];
+  }
+  if (Object.keys(patch).length) api.save(patch);
+}
 
 function makeIR(actx, seconds, decay) {
   const rate = actx.sampleRate;
@@ -1724,6 +3162,11 @@ function ensureAudioGraph() {
     actx, instGain, vocalGain, dry, wet, conv, send,
     speakerBus, recordBus, recDest, mic: null, monitorGain: null, irCache: new Map(),
   };
+  actx.addEventListener?.('statechange', () => {
+    if (accountMode() && room.armed && actx.state !== 'running') {
+      disarmLocalPlayer('声音被系统暂停，请点击「在本机播放」恢复。');
+    }
+  });
   setReverb($('#reverb').value);
   applyVolumes();
   return state.audioGraph;
@@ -1748,6 +3191,9 @@ function setReverb(name) {
 function applyVolumes() {
   const iv = ($('#instVol').value || 0) / 100;
   const vv = ($('#vocalVol').value || 0) / 100;
+  // 本机输出音量属于这台设备：只压扬声器总线，录音仍然保持原电平。
+  const raw = Number(prefs.outVol);
+  const ov = (Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 100) / 100;
   const g = state.audioGraph;
   if (g) {
     // 图存在时媒体元素必须保持满音量：element.volume=0 会让
@@ -1755,8 +3201,9 @@ function applyVolumes() {
     // 实际音量改由增益节点控制。
     inst.volume = 1; vocal.volume = 1;
     g.instGain.gain.value = iv; g.vocalGain.gain.value = vv;
+    g.speakerBus.gain.value = ov;
   } else {
-    inst.volume = iv; vocal.volume = vv;
+    inst.volume = iv * ov; vocal.volume = vv * ov;
   }
 }
 
@@ -1769,8 +3216,12 @@ function setAudioStatus(message = '') {
 function unlockAudio() {
   try {
     const g = ensureAudioGraph();
-    return bounded(Promise.resolve(g.actx.state === 'suspended' ? g.actx.resume() : undefined), 8000, '音频启动超时')
-      .then(() => true, () => { setAudioStatus('点击播放以启用音频'); return false; });
+    return bounded(Promise.resolve(g.actx.state !== 'running' ? g.actx.resume() : undefined), 8000, '音频启动超时')
+      .then(() => {
+        if (g.actx.state === 'running') return true;
+        setAudioStatus('点击播放以启用音频');
+        return false;
+      }, () => { setAudioStatus('点击播放以启用音频'); return false; });
   } catch (e) {
     setAudioStatus(e.message || '无法启动音频');
     return Promise.resolve(false);
@@ -1787,8 +3238,24 @@ function pausePlayback() {
 }
 
 function togglePlay() {
+  if (accountMode()) { toggleRoomPlay(); return; }
   if (inst.paused && !state.playRequested) startPlayback();
   else pausePlayback();
+}
+
+/** 录唱要从头唱。账号模式下房间也得回到 0，其他设备看到的进度才不会骗人。 */
+function restartForRecording() {
+  seekTo(0);
+  if (accountMode() && room.armed && roomItemId()) {
+    roomTransport('restart', { item_id: roomItemId() });
+  }
+}
+
+/** 录音 / 连唱时的「就从这里放」。账号模式下同时把房间切到播放态，
+ *  但不等网络往返——录音起头那一两秒不能是空的。 */
+async function beginPlayback() {
+  if (accountMode() && room.armed && roomItemId()) roomTransport('play');
+  return startPlayback();
 }
 
 /** 点歌即开唱：KTV 点歌台不会让人再按一次播放键。
@@ -1861,7 +3328,7 @@ function stopAudio(keepMic = false) {
   vocal.playbackRate = 1;
   inst.removeAttribute('src'); vocal.removeAttribute('src');
   inst.load(); vocal.load();
-  $('#playBtn').textContent = '▶';
+  renderTransportLabels();
   state.buffering = false;
 }
 
@@ -1916,8 +3383,19 @@ function requestMicStream(pending, generation) {
     const remaining = Math.max(1, pending.deadline - performance.now());
     const timer = setTimeout(() => finishError(new Error('麦克风授权等待超时，请再次点击重试')), remaining);
     pending.cancel = () => finishError(new DOMException('麦克风请求已取消', 'AbortError'));
-    Promise.resolve().then(() => navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    // 选了具体输入设备就按它取流；这台机器上找不到就退回默认设备并明说，
+    // 绝不假装换成功了。设备 id 只在本浏览器本来源有效，不会被搬到别的设备。
+    const chosen = typeof prefs.audioIn === 'string' ? prefs.audioIn : '';
+    const capture = (deviceId) => navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+      },
+    });
+    Promise.resolve().then(() => capture(chosen).catch((error) => {
+      if (!chosen || !['OverconstrainedError', 'NotFoundError'].includes(error.name)) throw error;
+      micHint('选定的麦克风在这台设备上不可用，已改用系统默认麦克风。');
+      return capture('');
     })).then((stream) => {
       if (settled || generation !== state.micGeneration || state.disposed) {
         stream.getTracks().forEach((t) => t.stop());
@@ -2195,7 +3673,7 @@ async function startRecording() {
       } else await uploadRecording(session);
       maybeReleaseMic();
     };
-    seekTo(0);
+    restartForRecording();
     state.recordingSession = session;
     state.recorder = mr;
     state.recStart = session.startedAt;
@@ -2204,7 +3682,7 @@ async function startRecording() {
     $('#recBtn').disabled = false;
     $('#recBtn').textContent = '⏹ 停止并保存';
     $('#recBtn').classList.add('recording');
-    if (!await startPlayback() || !isCurrentPlayer(jobId, generation)) {
+    if (!await beginPlayback() || !isCurrentPlayer(jobId, generation)) {
       session.cancelled = true;
       if (state.recordingSession === session) stopRecording();
       return;
@@ -2254,7 +3732,7 @@ function stopRecording() {
   }
   resetRecordButton();
   $('#recStatus').textContent = session.cancelled ? '录制未开始，请重试播放' : '正在整理录音…';
-  $('#playBtn').textContent = '▶';
+  renderTransportLabels();
   maybeReleaseMic();
 }
 
@@ -2406,21 +3884,27 @@ function renderRecordings(recs, jobId = state.currentJobId) {
 
 /* ---------- 播放器事件绑定 ---------- */
 function bindPlayer() {
-  $('#playBtn').addEventListener('click', togglePlay);
+  for (const id of ['#playBtn', '#lyricEditPlay']) {
+    $(id).addEventListener('click', () => { localGesture(); togglePlay(); });
+  }
 
   inst.addEventListener('play', () => {
-    $('#playBtn').textContent = '⏸';
-    $('#playBtn').setAttribute('aria-label', '暂停');
-    $('#nbPlay').setAttribute('aria-label', '暂停');
+    renderTransportLabels();
     startLyricAnimation();
   });
   inst.addEventListener('pause', () => {
-    $('#playBtn').textContent = '▶';
-    $('#playBtn').setAttribute('aria-label', '播放');
-    $('#nbPlay').setAttribute('aria-label', '播放');
+    renderTransportLabels();
     stopLyricAnimation();
   });
-  inst.addEventListener('loadedmetadata', () => { $('#durTime').textContent = fmt(inst.duration); });
+  inst.addEventListener('loadedmetadata', () => {
+    $('#durTime').textContent = fmt(inst.duration);
+    // 房间下发的进度可能在媒体就绪前就到了，这里补上那一次定位。
+    if (accountMode() && room.seekTarget !== null && Number.isFinite(inst.duration)) {
+      const target = room.seekTarget;
+      room.seekTarget = null;
+      seekTo(target);
+    }
+  });
   for (const event of ['waiting', 'stalled']) {
     inst.addEventListener(event, () => {
       if (!state.currentJobId) return;
@@ -2453,15 +3937,18 @@ function bindPlayer() {
   inst.addEventListener('ended', () => {
     if (state.recording) stopRecording();
     state.playRequested = false;
-    $('#playBtn').textContent = '▶';
+    renderTransportLabels();
     if (hasVocal()) vocal.pause();
   });
 
   inst.addEventListener('timeupdate', () => {
     const t = inst.currentTime;
-    $('#curTime').textContent = fmt(t);
-    if (inst.duration) $('#seek').value = Math.round((t / inst.duration) * 1000);
-    $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
+    renderLyricEditProgress();
+    if (!room.seeking) {
+      $('#curTime').textContent = fmt(t);
+      if (inst.duration) $('#seek').value = Math.round((t / inst.duration) * 1000);
+      $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
+    }
     // 纠正双轨漂移
     if (hasVocal() && !vocal.paused && !inst.paused && !state.buffering
         && !inst.seeking && !vocal.seeking && inst.readyState >= 2 && vocal.readyState >= 2
@@ -2474,37 +3961,141 @@ function bindPlayer() {
     if (!state.lyricRaf && !document.hidden && !$('#stage').classList.contains('hidden')) updateLyrics(t);
   });
 
-  $('#seek').addEventListener('input', (e) => {
-    if (!inst.duration) return;
-    const t = (e.target.value / 1000) * inst.duration;
-    seekTo(t);
-    $('#curTime').textContent = fmt(t);
-    $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
-    updateLyrics(t);
-  });
+  for (const id of ['#seek', '#lyricEditSeek']) {
+    $(id).addEventListener('input', (e) => {
+      if (!inst.duration) return;
+      const t = (e.target.value / 1000) * inst.duration;
+      localGesture();
+      if (accountMode()) {
+        if (!room.seeking) room.seekSession = { room: room.id, item: roomItemId() };
+        room.seeking = true;
+        if (room.armed) seekTo(t);
+      } else userSeek(t);
+      $('#curTime').textContent = fmt(t);
+      $('#seek').setAttribute('aria-valuetext', `${fmt(t)} / ${fmt(inst.duration)}`);
+      if (state.editing) {
+        $('#lyricEditPosition').textContent = formatLyricTime(t);
+        $('#lyricEditSeek').setAttribute('aria-valuetext', formatLyricTime(t));
+      }
+      updateLyrics(t);
+    });
+    $(id).addEventListener('change', (e) => {
+      if (!accountMode()) return;
+      const session = room.seekSession;
+      room.seeking = false;
+      room.seekSession = null;
+      if (!session || session.room !== room.id || session.item !== roomItemId()) {
+        toast('歌曲或房间已切换，这次拖动已取消。');
+        applyRoomPlayback(true);
+        return;
+      }
+      if (Number.isFinite(inst.duration)) userSeek((e.target.value / 1000) * inst.duration);
+    });
+  }
 
-  $('#instVol').addEventListener('input', applyVolumes);
-  $('#vocalVol').addEventListener('input', applyVolumes);
+  $('#instVol').addEventListener('input', () => {
+    prefs.instVol = Number($('#instVol').value);
+    applyVolumes();
+    savePrefs('instVol');
+  });
+  $('#vocalVol').addEventListener('input', () => {
+    prefs.vocalVol = Number($('#vocalVol').value);
+    applyVolumes();
+    savePrefs('vocalVol');
+  });
+  $('#instVol').value = prefs.instVol;
+  $('#vocalVol').value = prefs.vocalVol;
+  const outVol = $('#outVol');
+  if (outVol) {
+    outVol.value = prefs.outVol;
+    $('#outVolVal').textContent = prefs.outVol + '%';
+    outVol.addEventListener('input', () => {
+      prefs.outVol = Number(outVol.value);
+      $('#outVolVal').textContent = prefs.outVol + '%';
+      applyVolumes();
+      savePrefs('outVol');
+    });
+  }
+  const audioIn = $('#audioIn'), audioOut = $('#audioOut');
+  if (audioIn) {
+    audioIn.addEventListener('change', () => {
+      prefs.audioIn = audioIn.value;
+      savePrefs('audioIn');
+      // 换麦克风要重新取流，所以先断开；下一次监听/录音的手势会按新选择连上。
+      if (state.audioGraph?.mic) {
+        cleanupMic();
+        micHint('麦克风已更换，请重新开启监听以连接新设备。');
+      }
+    });
+  }
+  if (audioOut) {
+    audioOut.addEventListener('change', async () => {
+      prefs.audioOut = audioOut.value;
+      savePrefs('audioOut');
+      if (!await applyOutputDevice()) audioOut.value = prefs.audioOut;
+    });
+  }
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => { refreshMediaDevices(); });
+  refreshMediaDevices();
+  applyOutputDevice();
+  applyVolumes();
   $('#reverb').value = prefs.reverb;
   $('#reverb').addEventListener('change', () => {
     prefs.reverb = $('#reverb').value;
-    savePrefs();
+    savePrefs('reverb');
     setReverb(prefs.reverb);
   });
   $('#editLyrics').addEventListener('click', enterLyricsEdit);
   $('#saveLyrics').addEventListener('click', saveLyricsEdit);
+  $('#applyLyricOffset').addEventListener('click', () => {
+    if (!state.lyricEdit || state.lyricEdit.saving) return;
+    try {
+      const value = $('#lyricOffset').value.trim();
+      shiftLyricTimes(value ? Number(value) : NaN);
+      $('#lyricOffset').value = '0';
+      $('#lyricOffset').removeAttribute('aria-invalid');
+    } catch (error) { showLyricTimingError(error); }
+  });
+  for (const button of document.querySelectorAll('[data-lyric-shift]')) {
+    button.addEventListener('click', () => {
+      if (!state.lyricEdit || state.lyricEdit.saving) return;
+      try { shiftLyricTimes(Number(button.dataset.lyricShift)); }
+      catch (error) { showLyricTimingError(error); }
+    });
+  }
+  $('#resetLyricTiming').addEventListener('click', () => {
+    const draft = state.lyricEdit;
+    if (!draft || draft.saving) return;
+    draft.rows.forEach((row, i) => {
+      row.start.value = formatLyricTime(draft.lines[i].start);
+      row.end.value = formatLyricTime(draft.lines[i].end);
+      row.start.removeAttribute('aria-invalid');
+      row.end.removeAttribute('aria-invalid');
+    });
+    $('#lyricOffset').value = '0';
+    $('#lyricOffset').removeAttribute('aria-invalid');
+    lyricTimingNotice('已还原打开编辑器时的时间，文字修改仍保留；尚未保存。');
+    renderLyricEditProgress();
+  });
   $('#cancelLyrics').addEventListener('click', exitLyricsEdit);
   $('#searchLyrics').addEventListener('click', () => toggleLyricSearch());
   $('#lsGo').addEventListener('click', doLyricSearch);
   $('#lsClose').addEventListener('click', () => toggleLyricSearch(false));
   $('#lsQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLyricSearch(); });
-  $('#recBtn').addEventListener('click', () => (state.recording ? stopRecording() : startRecording()));
+  $('#recBtn').addEventListener('click', () => {
+    localGesture();
+    if (!state.recording) return startRecording();
+    stopRecording();
+    // 主动停录音就是「这一段唱完了」，房间里其他人的进度条也该跟着停。
+    // 换歌时 stopAudio 内部那次停止不走这里，免得把下一首刚开的播放又摁停。
+    if (accountMode() && room.armed) roomTransport('pause');
+  });
   $('#micVol').value = prefs.micVol;
   const showMicVol = () => { $('#micVolVal').textContent = prefs.micVol + '%'; };
   showMicVol();
   $('#micVol').addEventListener('input', (e) => {
     prefs.micVol = Number(e.target.value);
-    savePrefs();
+    savePrefs('micVol');
     showMicVol();
     const g = state.audioGraph;
     if (g && g.mic) g.mic.micGain.gain.value = prefs.micVol / 100;
@@ -2514,7 +4105,7 @@ function bindPlayer() {
   $('#monitor').addEventListener('change', async () => {
     const on = $('#monitor').checked;
     prefs.micMonitor = on;
-    savePrefs();
+    savePrefs('micMonitor');
     if (on) state.monitorHidden = false;
     const generation = state.micGeneration;
     if (on) {
@@ -2543,7 +4134,7 @@ function bindPlayer() {
     hg.checked = prefs.howlGuard;
     hg.addEventListener('change', () => {
       prefs.howlGuard = hg.checked;
-      savePrefs();
+      savePrefs('howlGuard');
       if (!hg.checked) resetHowlGuard();
       howlHint(hg.checked ? '' : '⚠️ 防啸叫已关闭，麦克风离音箱近了会尖叫');
     });
@@ -2556,8 +4147,7 @@ function interactiveTarget(target) {
 }
 
 function handleKeys(e) {
-  const drawer = !$('#queuePanel').classList.contains('hidden') ? $('#queuePanel')
-    : !$('#adminPanel').classList.contains('hidden') ? $('#adminPanel') : null;
+  const drawer = document.querySelector('.drawer:not(.hidden)');
   if (drawer) {
     if (e.key === 'Escape') { e.preventDefault(); closeDrawers(); return; }
     if (e.key === 'Tab') {
@@ -2571,19 +4161,21 @@ function handleKeys(e) {
     return;
   }
   if (e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || interactiveTarget(e.target)) return;
-  if (e.code === 'Space' && state.currentJobId) { e.preventDefault(); togglePlay(); }
+  if (e.code === 'Space' && state.currentJobId) { e.preventDefault(); localGesture(); togglePlay(); }
   if (e.key === '/') { e.preventDefault(); $('#search').focus(); }
 }
 
 /* ---------------- 初始化 ---------------- */
 function init() {
-  loadQueue();
+  // Playback and restoring a local queue require an explicit account-mode response.
+  initAccount().catch(accountFailed);
 
   /* 顶部：搜索 / 已点 / 后台 */
   let composing = false;
   const onSearch = (event) => {
     if (composing || event?.isComposing) return;
     state.search = $('#search').value;
+    state.browsePage = 1;
     $('#searchClear').classList.toggle('hidden', !state.search);
     renderBrowse();
   };
@@ -2595,10 +4187,21 @@ function init() {
   $('#backBtn').addEventListener('click', showBrowse);
   $('#queueBtn').addEventListener('click', () => openDrawer('queue'));
   $('#adminBtn').addEventListener('click', () => openDrawer('admin'));
+  $('#remoteLink').addEventListener('click', (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    e.preventDefault();
+    openRemoteQR();
+  });
   $('#queueClose').addEventListener('click', closeDrawers);
   $('#adminClose').addEventListener('click', closeDrawers);
+  $('#remoteClose').addEventListener('click', closeDrawers);
   $('#scrim').addEventListener('click', closeDrawers);
   $('#queueClear').addEventListener('click', () => {
+    if (accountMode()) {
+      if (!room.items.length || !confirm('清空房间里的已点歌曲？')) return;
+      roomTransport('clear', { expected_revision: roomState()?.revision });
+      return;
+    }
     if (!state.queue.length || !confirm('清空已点歌曲？')) return;
     state.queue = []; saveQueue(); renderQueue(); renderBrowse();
   });
@@ -2608,33 +4211,76 @@ function init() {
     btn.addEventListener('click', () => {
       state.libMode = btn.dataset.tab;
       state.artistPick = null;
+      state.artistReturn = null;
+      state.browseLetter = '';
+      state.browsePage = 1;
       document.querySelectorAll('.tab').forEach((b) => {
         b.classList.toggle('active', b === btn);
         b.setAttribute('aria-pressed', String(b === btn));
       });
       renderBrowse(true);
+      refreshPopularity(true);
     });
   });
+  $('#browseAlphabet').open = window.innerWidth >= 900;
+  $('#browseIndex').addEventListener('click', event => {
+    const button = event.target.closest('[data-letter]');
+    if (!button || button.disabled) return;
+    state.browseLetter = button.dataset.letter;
+    state.browsePage = 1;
+    if (window.innerWidth < 700) $('#browseAlphabet').open = false;
+    renderBrowse(true);
+  });
+  $('#browsePager').addEventListener('click', event => {
+    const button = event.target.closest('[data-page-step]');
+    if (!button || button.disabled) return;
+    state.browsePage += Number(button.dataset.pageStep);
+    renderBrowse(true);
+    $('.library-heading').scrollIntoView?.({ block: 'start' });
+  });
+  $('#artistBack').addEventListener('click', () => {
+    state.artistPick = null;
+    state.artistLabel = null;
+    state.browseLetter = state.artistReturn?.letter || '';
+    state.browsePage = state.artistReturn?.page || 1;
+    state.artistReturn = null;
+    renderBrowse(true);
+  });
+  $('#refreshPopularity').addEventListener('click', () => refreshPopularity(true));
 
   /* 曲库网格：整卡点一下就是点歌，右下角 ▶ 是「插队马上唱」 */
   $('#grid').addEventListener('click', (e) => {
     const card = e.target.closest('.song-card');
     if (!card) return;
+    localGesture();
     addToQueue(card.dataset.id, e.target.dataset.act === 'play');
   });
   $('#artistList').addEventListener('click', (e) => {
     const chip = e.target.closest('.artist-chip');
     if (!chip) return;
+    state.artistReturn = { letter: state.browseLetter, page: state.browsePage };
     state.artistPick = chip.dataset.artist;
     state.artistLabel = chip.querySelector('span').textContent;
+    state.browseLetter = '';
+    state.browsePage = 1;
     renderBrowse(true);
   });
 
-  /* 已点列表：置顶 / 删除 / 直接唱 */
+  /* 已点列表：置顶 / 删除 / 直接唱。账号模式下这些动作认房间条目 ID，
+     所以同一首歌点了两次也能分别处理。 */
   $('#queueList').addEventListener('click', (e) => {
     const li = e.target.closest('.q-item');
     if (!li) return;
     const act = e.target.dataset.act;
+    localGesture();
+    if (accountMode()) {
+      const item = li.dataset.item;
+      if (!item) return;
+      if (act === 'top') roomTransport('top', { item_id: item });
+      else if (act === 'del') roomTransport('remove', { item_id: item });
+      else { closeDrawers(); singRoomItemNow(item); }
+      return;
+    }
     if (act === 'top') topQueue(li.dataset.id);
     else if (act === 'del') removeFromQueue(li.dataset.id);
     else { closeDrawers(); addToQueue(li.dataset.id, true); }
@@ -2659,7 +4305,10 @@ function init() {
   $('#procList').addEventListener('click', async (e) => {
     const li = e.target.closest('.proc-item');
     if (!li) return;
-    if (e.target.dataset.act === 'retry') {
+    if (e.target.dataset.act === 'delete') {
+      await deleteFailedJob(li.dataset.id);
+    } else if (e.target.dataset.act === 'retry') {
+      if (state.deletingJobs.has(li.dataset.id)) return;
       try { await api.retryJob(li.dataset.id); await refreshList(true); }
       catch (err) { alert(err.message || '重试失败'); }
     } else {
@@ -2672,17 +4321,20 @@ function init() {
   $('#viewToggle').addEventListener('click', () => {
     state.view = state.view === 'list' ? 'grid' : 'list';
     $('#viewToggle').textContent = state.view === 'list' ? '封面视图' : '列表视图';
-    prefs.view = state.view; savePrefs();
+    prefs.view = state.view; savePrefs('view');
     renderBrowse(true);
   });
   $('#songList').addEventListener('click', (e) => {
     const row = e.target.closest('.song-row');
-    if (row) addToQueue(row.dataset.id);
+    if (!row) return;
+    localGesture();
+    addToQueue(row.dataset.id);
   });
   $('#langBar').addEventListener('click', (e) => {
     const b = e.target.closest('.lang-btn');
     if (!b) return;
     state.lang = b.dataset.lang;
+    state.browsePage = 1;
     $('#langBar').dataset.sig = '';      // 强制重画选中态
     renderBrowse(true);
   });
@@ -2690,15 +4342,30 @@ function init() {
   /* 常驻控制条 */
   $('#nbOpen').addEventListener('click', () => { if (state.currentJobId) showStage(); });
   $('#nbCover').addEventListener('click', () => { if (state.currentJobId) showStage(); });
-  $('#nbPlay').addEventListener('click', () => { togglePlay(); renderNowBar(); });
-  $('#nbReplay').addEventListener('click', () => { seekTo(0); if (inst.paused) togglePlay(); renderNowBar(); });
+  $('#nbPlay').addEventListener('click', () => { localGesture(); togglePlay(); renderNowBar(); });
+  $('#nbReplay').addEventListener('click', () => {
+    localGesture();
+    if (accountMode()) { restartRoomSong(); return; }
+    seekTo(0);
+    if (inst.paused) togglePlay();
+    renderNowBar();
+  });
   $('#nbSkip').addEventListener('click', () => {
+    localGesture();
+    if (accountMode()) { skipRoomSong(); return; }
     if (state.queue.length) playFromQueue();
     else { toast('已点列表空了，没有下一首'); endPlayback(); }
   });
   $('#nbQueue').addEventListener('click', () => openDrawer('queue'));
-  $('#modeInst').addEventListener('click', () => setSingMode('inst'));
-  $('#modeOrig').addEventListener('click', () => setSingMode('orig'));
+  $('#modeInst').addEventListener('click', () => { localGesture(); setSingModeIntent('inst'); });
+  $('#modeOrig').addEventListener('click', () => { localGesture(); setSingModeIntent('orig'); });
+  $('#roomActivate')?.addEventListener('click', () => { localGesture(); activateLocalPlayer(); });
+  // 保存失败必须看得见，不能让人以为已经存上了。
+  window.OpenKUserState?.onchange(() => {
+    const problems = window.OpenKUserState.problems;
+    prefsStatus(problems.length ? '未保存：' + problems[0] : '');
+    renderRoomStatus();
+  });
   state.singMode = prefs.singMode;
   state.view = prefs.view || 'list';
   $('#viewToggle').textContent = state.view === 'list' ? '封面视图' : '列表视图';
@@ -2712,15 +4379,20 @@ function init() {
   window.addEventListener('resize', measureNowBar);
   inst.addEventListener('play', renderNowBar);
   inst.addEventListener('pause', renderNowBar);
-  // 一首唱完自动接下一首，这是 KTV 机器最基本的行为
+  // 一首唱完自动接下一首，这是 KTV 机器最基本的行为。
+  // 账号模式下推进队列的是服务端：本机只汇报「这首唱完了」，不跟房间抢顺序。
   inst.addEventListener('ended', () => {
     cancelEndedTimer();
+    if (accountMode()) { if (room.armed) reportRoomEnded(); return; }
     const generation = state.selectionGeneration, id = state.currentJobId;
     state.endedTimer = setTimeout(() => {
       state.endedTimer = null;
       if (id && isCurrentPlayer(id, generation)) playFromQueue(true);
     }, 800);
   });
+  // 独占租约 12 秒：2.5 秒续一次，8.5 秒续不上就立刻停声，免得两台机器同时响。
+  room.heartbeatTimer = setInterval(() => { roomHeartbeat(); }, LEASE_RENEW_MS);
+  room.watchdog = setInterval(leaseWatchdog, 500);
   document.addEventListener('keydown', handleKeys);
 
   refreshList(true);
@@ -2761,6 +4433,7 @@ function init() {
       state.pollRequest?.abort();
       state.alignmentRequests.forEach((r) => r.abort());
     } else {
+      refreshPopularity(true);
       if (!state.inspectedJobId) refreshList();
       else startPolling(state.inspectedJobId);
       scheduleListRefresh();
@@ -2779,6 +4452,15 @@ function init() {
     }
   });
   window.addEventListener('pagehide', (e) => {
+    libraryPopularity.reset();
+    if (accountMode()) {
+      const client = room.client, token = room.playerToken;
+      if (client && token) {
+        client.releaseOnUnload(token).catch(error => console.warn('Page exit could not release the player lease:', error));
+      }
+      disarmLocalPlayer('', { reset: true, release: false });
+      client?.stop();
+    }
     if (state.recording) stopRecording();
     pausePlayback();
     cleanupMic();
@@ -2786,6 +4468,8 @@ function init() {
     state.monitorHidden = prefs.micMonitor;
     if (!e.persisted) {
       state.disposed = true;
+      clearInterval(room.heartbeatTimer);
+      clearInterval(room.watchdog);
       stopPolling();
       clearTimeout(state.listTimer);
       state.alignmentTimers.forEach(clearTimeout);
@@ -2794,7 +4478,11 @@ function init() {
     }
   });
   window.addEventListener('pageshow', (e) => {
-    if (e.persisted) { applyMonitorState(); scheduleListRefresh(); }
+    if (e.persisted) {
+      if (accountMode()) recoverRoom().catch(reportRoomError);
+      applyMonitorState();
+      scheduleListRefresh();
+    }
   });
 }
 

@@ -2,6 +2,80 @@
 
 ## 未发布
 
+- Add confirmed deletion for failed/cancelled processing tasks, refreshing the
+  list and badge without interrupting playback. Atomically reject stale deletion
+  after a retry or completion; keep imported originals outside the job directory.
+  Leave the existing general-purpose deletion API unchanged unless `failed_only`
+  is explicitly requested.
+
+- Add A-Z song/artist navigation and 24-item pagination to keep large libraries
+  bounded, including the phone picker. Retain global pinyin search and queue
+  behavior; add private frequent-played ranking from the signed-in account's
+  retained, evidence-based playback history instead of invented popularity.
+
+- Treat manual song skip as a request to play the next queue entry, including
+  when the previous song was paused. An empty queue stops; stale/retried skips
+  do not advance twice or override a later pause.
+
+- Add manual lyric timing controls with precise line start/end fields, whole-song
+  offsets, per-line or whole-song alignment to the current local playhead, preview,
+  and timing reset. Move/stretch existing word timestamps with their lines and
+  preserve draft text until save/cancel. Validate intervals, keep short rebuilt
+  words within their line, and reject stale revision-aware saves without publishing.
+
+- Start the first room queue entry automatically on an already-armed receiver,
+  allow explicit player preparation before any song is queued, and retain
+  manual pause when appending songs. Show per-device player/controller/microphone
+  roles and receiving status without conflating browsers signed into one account.
+  Presence is bounded and volatile; device labels never grant room privileges or
+  enable remote microphone transport.
+
+- Open a locally generated phone-remote QR dialog from the classic player's
+  remote shortcut, retaining a direct-link fallback, keyboard focus handling
+  and uninterrupted playback. The QR contains only the current site's remote
+  URL; account authentication and room membership remain unchanged.
+
+- Refresh the active player's lyrics when realignment or editing publishes a new
+  version, including other account devices and the TV stage. Keep playback position,
+  audio and microphone sessions intact; fence stale responses, retain unsaved edits,
+  and retry transient lyric-load failures without reloading the song.
+
+- 试唱、设备设置、播放历史及账号入口统一使用简体中文，包括页面说明、动态提示、
+  无障碍标签、设备选择与错误信息；接口字段、用户自定义名称和现有设置保持不变。
+
+- Follow both the person and the device for player settings. A signed-in account
+  keeps portable defaults on the server while each browser keeps its own
+  hardware overrides (microphone, feedback guard, output volume, input/output
+  device), stored per account UUID in `data/user-state.sqlite3` with revisions
+  so two devices cannot overwrite each other. New `/devices` names browsers,
+  assigns roles, draws a local topology map and chooses the preferred player,
+  which now decides where playback may start instead of silently claiming this
+  device; new `/history` lists songs a validated player lease actually advanced
+  through, per account, with explicit deletion only. See `docs/devices.md`.
+
+- Restore the full home player in account mode instead of redirecting users to a
+  controller with no audio receiver. Local playback, shared queue controls,
+  lyrics, mixing and recording use the current room and exclusive player lease.
+  Keep the original standalone behavior and make receiver-free remote/TV play
+  actions explicit rather than presenting a silent room flag as playback.
+  Commit range drags once, release playback on normal page exit or activation
+  failure, restore first-song microphone monitoring, and require reactivation
+  after the operating system suspends audio output.
+- Redesign phone, lobby, library and TV layouts with compact account menus,
+  expandable secondary controls, a desktop player sidebar and a two-column TV setup.
+  Keep phone song-picking targets above the queue dock and TV activation visible on
+  short displays; add real-browser responsive and account-menu keyboard regressions.
+- 新增可选账号房间模式：验证私密代理跳点后的用户身份，每个账号只有一个当前房间，
+  自动创建／恢复私人单人房；组队原子切换，退出回单人房，房主交接，结束房间时为成员
+  分别准备单人房。用户昵称与演唱身份跨设备一致，不接纳浏览器自报身份或旧配对凭据。
+- 账号部署首页进入当前房间，曲库维护保留在 `/library`；新增当前账号、当前房间及房主
+  配对码更新接口。独立播放器和按设备配对保留在未启用账号集成的部署中。
+- 新增 `/rooms` 聚会大厅：具名房间、可选展示、多人配对、成员在线状态、点歌归属与合唱名单。
+  每个房间保留独立歌单，本机可保存多个房间并切换；退出配对与结束房间分开处理。
+- 手机房主可允许电视以受限屏幕角色加入，不传递房主凭据；每房间仍仅有一个播放租约。
+  电视切换先释放自己的租约并停止旧音轨，过期请求与歌词不能覆盖新房间。
+- 老房间快照保持兼容且默认不在大厅展示；成功配对不再消耗失败配对的限流额度。
+- 非交互提示不再遮挡点歌按钮，增加聚会入口后的经典导航在平板宽度自动换行。
 - 更新桌面、手机、电视和录唱截图，新增日常使用说明书与公开截图生成说明；
   文档区分 `main` 开发界面与正式稳定版，统一实际按钮名称和证书路径示例。
 - Chrome 回归使用独立短路径临时目录，避免深层 Linux CI 工作区导致套接字路径过长。

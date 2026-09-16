@@ -117,6 +117,14 @@
     }
     return {
       normalize, query, index,
+      initial(job, field = 0) {
+        const value = index(job).f[field];
+        const text = value[1][0] || value[0];
+        const first = Array.from(text)[0] || '';
+        const letter = /^[a-z]$/i.test(first) ? first.toUpperCase()
+          : HAN.test(first) ? initialsOf(first)[0] : '#';
+        return /^[A-Z]$/.test(letter || '') ? letter : '#';
+      },
       // Artist identity deliberately keeps punctuation and accents.
       artistKey: value => Array.from(String(value || '').normalize('NFKC').toLowerCase(),
         char => map[char] || char).join('').trim().replace(/\s+/g, ' '),

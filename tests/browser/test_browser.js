@@ -107,16 +107,39 @@ class CDP {
   }
   async click(selector) {
     await this.send('Page.bringToFront');
-    const point = await this.evaluate(`(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el || el.disabled || el.hidden) throw new Error('控件不可用: ${selector}');
-      el.scrollIntoView({block:'center'});
-      const r = el.getBoundingClientRect();
-      if (!r.width || !r.height) throw new Error('控件不可见: ${selector}');
-      return {x:r.x+r.width/2,y:r.y+r.height/2};
-    })()`);
-    await this.send('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
-    await this.send('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+    // 页面会异步重绘（大厅轮询、details 展开），命中点和真实点击可能错位：
+    // 先等布局稳定，再确认元素真的收到了 click，最多重试三次。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const token = 'c' + Math.random().toString(36).slice(2);
+      const point = await waitFor(async () => {
+        const result = await this.evaluate(`(() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (!el || el.disabled || el.hidden) return {error: '控件不可用'};
+          el.scrollIntoView({block:'center', behavior:'instant'});
+          const r = el.getBoundingClientRect();
+          if (!r.width || !r.height) return {error: '控件不可见'};
+          const point = {x:r.x+r.width/2,y:r.y+r.height/2};
+          const hit = document.elementFromPoint(point.x, point.y);
+          if (!hit || !el.contains(hit)) {
+            const box = h => h ? [h.tagName, h.id, h.className].filter(Boolean).join('.') : 'outside viewport';
+            return {error: '点击被遮挡: ' + box(hit) + ' | ' + JSON.stringify(r) + ' scrollY ' + scrollY};
+          }
+          window.__clicks = window.__clicks || {};
+          el.addEventListener('click', () => { window.__clicks['${token}'] = true; },
+            {capture: true, once: true});
+          return {point};
+        })()`);
+        if (result.error) throw new Error(result.error);
+        return result.point;
+      }, `可点击 ${selector}`, 4000);
+      await this.send('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+      await this.send('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+      // 跳转会清空标记，这时按已送达处理，后续断言仍然会发现真正的问题。
+      const landed = await this.evaluate(`!window.__clicks || !!window.__clicks['${token}']`).catch(() => true);
+      if (landed) return;
+      await sleep(120);
+    }
+    throw new Error(`点击未送达: ${selector}`);
   }
   close() {
     for (const request of this.pending.values()) {
@@ -176,6 +199,7 @@ async function main() {
   const browsers = [];
   const syncSamples = [];
   let server;
+  let accountServer, accountData, identityKeyFile;
   let browserDirectory;
   let serverLog = '', chromeLog = '';
   const artifacts = process.env.OPENK_TEST_ARTIFACTS;
@@ -185,7 +209,12 @@ async function main() {
       for (const tab of pages) tab.close();
       for (const browser of browsers) await stop(browser);
       await stop(server);
+      await stop(accountServer);
       await fs.rm(directory, {recursive:true, force:true, maxRetries:4, retryDelay:200});
+      // 账号模式的服务数据和假密钥放在测试目录里，跑完立刻删掉。
+      for (const leftover of [accountData, identityKeyFile]) {
+        if (leftover) await fs.rm(leftover, {recursive:true, force:true, maxRetries:4, retryDelay:200});
+      }
       if (browserDirectory) {
         await fs.rm(browserDirectory, {recursive:true, force:true, maxRetries:4, retryDelay:200});
       }
@@ -249,7 +278,7 @@ async function main() {
     const debugPort = await launchBrowser('tv-browser');
     // 两个独立设备，不把“手机点按钮”错误模拟成“电视切到后台标签页”。
     const phonePort = await launchBrowser('phone-browser');
-    async function page(route, width, height, browserPort = debugPort) {
+    async function page(route, width, height, browserPort = debugPort, options = {}) {
       const response = await fetch(`http://127.0.0.1:${browserPort}/json/new?about:blank`, {method:'PUT'});
       const target = await response.json();
       const tab = await CDP.connect(target.webSocketDebuggerUrl);
@@ -260,7 +289,12 @@ async function main() {
           throw new DOMException('Physical capture is disabled in browser tests', 'NotAllowedError');
         };
       `});
-      await tab.send('Page.navigate', {url:base + route});
+      if (options.headers) {
+        // 真实部署里这些请求头由 NGINX 注入；测试用隔离服务和假密钥模拟同一条信任链。
+        await tab.send('Network.enable');
+        await tab.send('Network.setExtraHTTPHeaders', {headers:options.headers});
+      }
+      await tab.send('Page.navigate', {url:(options.origin || base) + route});
       return tab;
     }
     async function screenshot(tab, filename, selectors = []) {
@@ -275,6 +309,8 @@ async function main() {
       })`), `截图图片载入：${filename}`);
       assert.ok(await tab.evaluate(`document.querySelector('#pairPanel')?.hidden !== false`),
         '公开截图不能显示配对二维码或配对码');
+      assert.ok(await tab.evaluate(`!document.querySelector('#hostControls')?.open`),
+        '公开截图不能显示房主的配对信息');
       await sleep(150);
       const clip = selectors.length ? await tab.evaluate(`(() => {
         const rects = ${JSON.stringify(selectors)}.map(selector => {
@@ -304,6 +340,7 @@ async function main() {
     pass('电视创建房间并生成本地配对二维码');
     const remote = await page('/remote', 390, 844, phonePort);
     await waitFor(() => remote.evaluate(`!!document.querySelector('#joinSubmit')`), '手机加入页');
+    await remote.click('#joinCodeShortcut');
     await remote.evaluate(`document.querySelector('#joinRoom').value=${JSON.stringify(pairing.room)};
       document.querySelector('#joinCode').value=${JSON.stringify(pairing.code)};`);
     await remote.click('#joinSubmit');
@@ -322,6 +359,10 @@ async function main() {
         button.click();
       })()`);
     }
+    async function roomControl(tab, selector) {
+      if (!await tab.evaluate('document.querySelector("#playbackPanel").open')) await tab.click('#playbackToggle');
+      await tab.click(selector);
+    }
     await add('一起唱首歌');
     await waitFor(() => tv.evaluate(`document.querySelector('#songTitle').textContent.includes('一起唱首歌')`), '手机点歌出现在电视');
     await tv.click('#pairActivate');
@@ -329,7 +370,7 @@ async function main() {
     if (await tv.evaluate(`document.querySelector('#instrumental').paused`)) await remote.click('#remotePlay');
     await waitFor(() => tv.evaluate(`!document.querySelector('#instrumental').paused && document.querySelector('#instrumental').currentTime > 0.05`), '真实音轨播放');
     pass('手机点歌 → 电视经用户手势启动真实音频');
-    await remote.click('#remoteGuide');
+    await roomControl(remote, '#remoteGuide');
     await waitFor(() => tv.evaluate(`document.querySelector('#guide').getAttribute('aria-pressed') === 'true' &&
       !document.querySelector('#vocals').paused`), '启用原唱音轨');
     await tv.send('Page.bringToFront');
@@ -374,7 +415,7 @@ async function main() {
     await sleep(250);
     assert.ok(Math.abs(await tv.evaluate(`document.querySelector('#instrumental').currentTime`) - before) < 0.05);
     pass('远程暂停同步到真实媒体时钟');
-    await remote.click('#remoteGuide');
+    await roomControl(remote, '#remoteGuide');
     await waitFor(() => tv.evaluate(`document.querySelector('#guide').getAttribute('aria-pressed') === 'false'`), '原唱切换');
     pass('手机原唱切换同步电视');
     await add('星光练习曲');
@@ -405,7 +446,7 @@ async function main() {
       offline:false, latency:0, downloadThroughput:-1, uploadThroughput:-1,
     });
     await waitFor(() => remote.evaluate(`document.querySelector('#remoteTitle').textContent.includes('星光练习曲')`), '断线恢复');
-    await remote.click('#remoteRestart');
+    await roomControl(remote, '#remoteRestart');
     await waitFor(() => tv.evaluate(`document.querySelector('#instrumental').currentTime < 1`), '重连后控制命令到达电视');
     pass('手机断线重连不重置电视队列');
     await tv.send('Page.bringToFront');
@@ -421,8 +462,107 @@ async function main() {
     await sleep(12500);
     await tv.click('#pairActivate');
     await waitFor(() => tv.evaluate(`document.querySelector('#songTitle').textContent.includes('星光练习曲') &&
+      window.openkStage.armed && !window.openkStage.activating &&
+      window.openkStage.client.state.playback.playing &&
+      !document.querySelector('#instrumental').muted &&
       !document.querySelector('#instrumental').paused`), '电视重新启用原房间播放');
     pass('电视刷新保留房间，旧租约到期后重新授权播放');
+
+    await remote.evaluate('window.openkRemote.client.refresh().then(() => null)');
+    if (await remote.evaluate('window.openkRemote.client.state.playback.playing')) await remote.click('#remotePlay');
+    await waitFor(() => tv.evaluate('document.querySelector("#instrumental").paused'), '聚会回归前暂停原房间');
+    const guestPort = await launchBrowser('party-guest-browser');
+    const guest = await page('/rooms', 390, 844, guestPort);
+    await waitFor(() => guest.evaluate(`!!document.querySelector('#lobbyList [data-room-id="${pairing.room}"]')`),
+      '大厅列出可发现的聚会房间');
+    await guest.click(`#lobbyList [data-room-id="${pairing.room}"] button`);
+    assert.equal(await guest.evaluate('document.querySelector("#joinRoom").value'), pairing.room);
+    await guest.evaluate(`document.querySelector('#displayName').value='Harmony';
+      document.querySelector('#joinCode').value=${JSON.stringify(pairing.code)};`);
+    await guest.click('#joinSubmit');
+    await waitFor(() => guest.evaluate(`window.openkRemote?.client?.state?.viewer.name === 'Harmony' &&
+      !!window.openkRemote.client.state.current`), '独立手机加入聚会');
+    assert.ok(await guest.evaluate('document.querySelector("#hostControls").hidden'));
+    await roomControl(guest, '#singCurrent');
+    await waitFor(() => tv.evaluate('document.querySelector("#stageSingers").textContent.includes("Harmony")'),
+      '电视显示多人演唱名单');
+    pass('大厅发现房间，独立手机加入并登记合唱，普通成员没有房主管理权限');
+
+    await guest.click('#switchRoom');
+    await guest.click('#createRoomPanel summary');
+    await guest.evaluate('document.querySelector("#newRoomName").value="Second party"');
+    await guest.click('#createRoom');
+    await waitFor(() => guest.evaluate(`window.openkRemote?.client?.state?.name === 'Second party' &&
+      window.openkRemote.client.state.viewer.role === 'host'`), '手机创建独立聚会房间');
+    const newParty = await guest.evaluate(`({
+      id: window.openkRemote.client.id,
+      code: document.querySelector('#inviteCode').textContent,
+      hasQR: !!document.querySelector('#inviteQR svg')
+    })`);
+    assert.ok(newParty.hasQR);
+    await guest.evaluate(`document.querySelector('#hostControls').open=false;
+      document.querySelector('#songSearch').value='一起唱首歌';
+      document.querySelector('#songSearch').dispatchEvent(new Event('input',{bubbles:true}));`);
+    await waitFor(() => guest.evaluate(`document.querySelector('#roomSongList .song-info strong')?.textContent === '一起唱首歌'`),
+      '第二房间独立选歌');
+    await guest.click('#roomSongList .add-song');
+    await waitFor(() => guest.evaluate('window.openkRemote.client.state.current?.title === "一起唱首歌"'),
+      '第二房间队列');
+    assert.ok(await tv.evaluate(`window.openkStage.client.id === ${JSON.stringify(pairing.room)} &&
+      window.openkStage.client.state.current.title === '星光练习曲'`), '另一房间的当前歌曲不能被改动');
+
+    const partyTVPort = await launchBrowser('party-tv-browser');
+    const partyTV = await page('/tv#room=' + newParty.id, 1280, 720, partyTVPort);
+    await waitFor(() => partyTV.evaluate(`document.querySelector('#tvJoinRoom')?.value === ${JSON.stringify(newParty.id)} &&
+      document.querySelector('#tvJoinPanel').open`), '电视从大厅进入指定房间配对');
+    assert.ok(await partyTV.evaluate('!window.openkStage.client'), '指定房间未配对时不能悄悄创建另一个房间');
+    await partyTV.evaluate(`document.querySelector('#tvJoinCode').value=${JSON.stringify(newParty.code)};
+      document.querySelector('#tvScreenName').value='Party TV';`);
+    await partyTV.click('#joinTV');
+    await waitFor(() => partyTV.evaluate(`window.openkStage.client?.id === ${JSON.stringify(newParty.id)} &&
+      window.openkStage.client.state?.viewer.role === 'screen'`), '电视以受限播放角色加入');
+    assert.ok(await partyTV.evaluate('document.querySelector("#tvSettingsPanel").hidden && !window.openkStage.armed'));
+    await partyTV.click('#pairActivate');
+    await waitFor(() => partyTV.evaluate('!document.querySelector("#instrumental").paused && document.querySelector("#instrumental").currentTime > 0.05'),
+      '被邀请的电视经手势播放真实音轨');
+    assert.ok(await tv.evaluate('document.querySelector("#instrumental").paused'), '独立房间不能被别的电视激活');
+    pass('手机建房后电视独立配对播放，不传递房主凭据，两个房间各自控制音轨');
+
+    await guest.click('#switchRoom');
+    await waitFor(() => guest.evaluate(`!!document.querySelector('#recentList [data-room-id="${newParty.id}"]')`),
+      '大厅保留每个房间的本机凭据');
+    assert.ok(await partyTV.evaluate('!document.querySelector("#instrumental").paused'),
+      '手机切换大厅不能暂停另一设备的电视');
+    await screenshot(guest, 'party-lobby.png');
+    await guest.click(`#recentList [data-room-id="${newParty.id}"] button`);
+    await waitFor(() => guest.evaluate(`window.openkRemote?.client?.id === ${JSON.stringify(newParty.id)} &&
+      !!window.openkRemote.client.state`), '从大厅恢复原房间');
+    await guest.click('#hostControls summary');
+    await guest.click('#endRoom');
+    await guest.click('#endRoom');
+    await waitFor(() => partyTV.evaluate('!window.openkStage.client && document.querySelector("#instrumental").paused'),
+      '房主结束房间后电视停止');
+    pass('多房间切换保留配对，结束只撤销本房间并停止其电视');
+    if (!await guest.evaluate('document.querySelector("#createRoomPanel").open')) await guest.click('#newPartyShortcut');
+    async function touchTargets(selectors) {
+      const targets = await guest.evaluate(`${JSON.stringify(selectors)}.map(selector => {
+        const rect=document.querySelector(selector).getBoundingClientRect();
+        return {selector,width:rect.width,height:rect.height};
+      })`);
+      for (const target of targets) assert.ok(target.width >= 44 && target.height >= 44,
+        `大厅控件需满足触摸尺寸：${JSON.stringify(target)}`);
+    }
+    for (const width of [320, 390, 768]) {
+      await guest.send('Emulation.setDeviceMetricsOverride', {width, height:900, deviceScaleFactor:1, mobile:false});
+      assert.ok(await guest.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'),
+        `聚会大厅 ${width}px 页面不能横向溢出`);
+      await touchTargets(['#displayName', '#newRoomName', '#createRoom', '#joinCodeShortcut', '#refreshRooms']);
+      await guest.click('#joinCodeShortcut');
+      await touchTargets(['#joinRoom', '#joinCode', '#joinSubmit']);
+      await guest.click('#newPartyShortcut');
+    }
+    pass('聚会大厅 320–768px 布局及触摸控件可用');
+
     const classic = await page('/', 1024, 768, phonePort);
     await waitFor(() => classic.evaluate(`document.body.textContent.includes('一起唱首歌')`), '经典曲库');
     for (const [width, height, name] of [
@@ -482,6 +622,149 @@ async function main() {
     const recording = await fetch(base + oldRecordings[0].url);
     assert.ok((await recording.arrayBuffer()).byteLength > 100);
     pass('真实模拟麦克风/MediaRecorder 录唱，切歌后音频保存到原歌曲');
+
+    /* ---- 账号模式：真实浏览器里同一个账号只有一个当前房间 ---- */
+    // 生产上这条信任链由 NGINX + 账号服务提供；这里用隔离服务和假密钥复现同样的协议。
+    const identityKey = 'openk-browser-test-fake-proxy-key-0123456789_abcdef';
+    assert.ok(/^[A-Za-z0-9_-]{48,128}$/.test(identityKey), '合成代理密钥要符合服务端约定');
+    identityKeyFile = path.join(__dirname, '.identity-key-' + Math.random().toString(36).slice(2, 10));
+    accountData = path.join(__dirname, '.account-data-' + Math.random().toString(36).slice(2, 10));
+    await fs.writeFile(identityKeyFile, identityKey, {mode:0o600});
+    const accountFixture = spawnSync(python, ['-m', 'tools.demo', accountData], {cwd:ROOT, encoding:'utf8'});
+    assert.equal(accountFixture.status, 0, accountFixture.stderr);
+    const accountPort = await freePort();
+    const accountBase = `http://127.0.0.1:${accountPort}`;
+    accountServer = spawn(python, ['-m', 'backend.main'], {
+      cwd:ROOT,
+      env:{...env, PYTHONDONTWRITEBYTECODE:'1', OPENK_HOST:'127.0.0.1', OPENK_PORT:String(accountPort),
+        OPENK_DATA_DIR:accountData, OPENK_JOBS_DIR:path.join(accountData, 'jobs'),
+        OPENK_RESUME_ON_START:'false', OPENK_IDENTITY_KEY_FILE:identityKeyFile},
+      stdio:['ignore', 'pipe', 'pipe'], detached:true,
+    });
+    accountServer.on('error', error => { serverLog += error.stack; });
+    accountServer.stdout.on('data', chunk => { serverLog += chunk; });
+    accountServer.stderr.on('data', chunk => { serverLog += chunk; });
+    await waitFor(async () => (await fetch(accountBase + '/api/health')).ok, '账号模式隔离服务启动');
+    const singer = {id:'3f2504e0-4f89-11d3-9a0c-0305e82c3301', username:'ling', display_name:'小玲', is_staff:false};
+    const identity = {
+      'X-OpenK-Identity-Key': identityKey,
+      'X-OpenK-Account': Buffer.from(JSON.stringify(singer), 'utf8').toString('base64url'),
+    };
+    const landing = await fetch(accountBase + '/', {headers:identity});
+    assert.equal(new URL(landing.url).pathname, '/', '账号模式首页保留完整的房间播放器');
+    assert.ok((await landing.text()).includes('id="instAudio"'), '首页不再是没有音频的遥控器');
+    assert.ok((await fetch(accountBase + '/library', {headers:identity})).ok, '经典曲库仍在 /library');
+    const accountPhone = await page('/remote', 390, 844, phonePort, {origin:accountBase, headers:identity});
+    await waitFor(() => accountPhone.evaluate(`!!window.openkRemote?.client?.state?.solo &&
+      document.querySelector('#accountChip .account-name')?.textContent === '小玲'`), '登录后自动进入自己的房间');
+    const soloRoom = await accountPhone.evaluate('window.openkRemote.client.id');
+    assert.ok(await accountPhone.evaluate(`window.openkRemote.client.token === null &&
+      localStorage.getItem('openk.remote.room') === null`), '账号模式不保存房间凭据');
+    const accountTV = await page('/tv', 1280, 720, debugPort, {origin:accountBase, headers:identity});
+    await waitFor(() => accountTV.evaluate(`window.openkStage?.client?.id === ${JSON.stringify(soloRoom)} &&
+      window.openkStage.client.state?.members.length === 1`), '电视沿用同一账号的房间和同一个成员');
+    await accountPhone.evaluate(`window.openkRemote.client.command('add', {job_id:
+      window.openkRemote.jobs.find(job => job.title === '星光练习曲').id}).then(() => null)`);
+    await waitFor(() => accountTV.evaluate(`window.openkStage.client.state?.current?.title === '星光练习曲'`),
+      '独唱房间用同一套队列');
+    await accountTV.click('#closePair');
+    await accountTV.click('#playPause');
+    await waitFor(() => accountTV.evaluate(`!document.querySelector('#instrumental').paused &&
+      document.querySelector('#instrumental').currentTime > 0.05`), '一个人也能在自己的房间里真实起播');
+    pass('账号登录后手机和电视自动共用同一个私人房间并真实播放');
+
+    await accountPhone.evaluate(`document.querySelector('#newRoomName').value = '客厅聚会';
+      window.openkRemote.create().then(() => null)`);
+    await waitFor(() => accountPhone.evaluate(`window.openkRemote.client?.state?.name === '客厅聚会' &&
+      window.openkRemote.client.id !== ${JSON.stringify(soloRoom)}`), '手机整体搬进新的聚会房间');
+    const partyRoom = await accountPhone.evaluate('window.openkRemote.client.id');
+    await waitFor(() => accountTV.evaluate(`window.openkStage.client?.id === ${JSON.stringify(partyRoom)}`),
+      '电视跟着账号换房间');
+    assert.ok(await accountTV.evaluate(`document.querySelector('#instrumental').paused &&
+      window.openkStage.armed === false && !document.querySelector('#pairPanel').hidden`),
+      '换房间必须先停声并重新请求用户手势');
+    assert.ok(await accountTV.evaluate(`window.openkStage.client.state.members.length === 1`),
+      '同一个账号的两台设备仍然只占一个成员');
+    assert.ok(/^\d{6}$/.test(await accountPhone.evaluate(`document.querySelector('#inviteCode').textContent`)),
+      '房主拿到可用的邀请码');
+    const firstCode = await accountPhone.evaluate(`document.querySelector('#inviteCode').textContent`);
+    // 电视没有保存过明文配对码（服务器只存摘要），所以它只提供“生成配对码”。
+    assert.ok(await accountTV.evaluate(`!document.querySelector('#pairCode').textContent
+        .includes(${JSON.stringify(firstCode.slice(0, 3))}) &&
+      document.querySelector('#tvRefreshInvite').textContent === '生成配对码'`), '另一台设备不会凭空得到配对码');
+    // 另一台已登录设备换码：手机上的旧码必须消失，并且不能自己再换一次。
+    const rotated = await (await fetch(`${accountBase}/api/rooms/${partyRoom}/invitation`,
+      {method:'POST', headers:identity})).json();
+    assert.ok(/^\d{6}$/.test(rotated.pairing_code) && rotated.state.invite_version > 1, '另一台设备换码成功');
+    await waitFor(() => accountPhone.evaluate(`window.openkRemote.client.state.invite_version ===
+        ${rotated.state.invite_version} && document.querySelector('#roomInvite').hidden === true &&
+      document.querySelector('#inviteQR').children.length === 0 &&
+      document.querySelector('#refreshInvite').textContent === '生成配对码' &&
+      !document.querySelector('#inviteCode').textContent.includes(${JSON.stringify(firstCode.slice(0, 3))})`),
+      '别的设备换码后旧码在这里消失');
+    assert.equal(await accountPhone.evaluate(`window.openkRemote.client.state.invite_version`),
+      rotated.state.invite_version, '过期的配对码不会触发自动换码');
+    await accountPhone.click('#refreshInvite');
+    await waitFor(() => accountPhone.evaluate(`/^\\d{6}$/.test(document.querySelector('#inviteCode').textContent) &&
+      document.querySelector('#roomInvite').hidden === false &&
+      JSON.parse(localStorage.getItem('openk.account.invites.v1'))[${JSON.stringify(singer.id)}]
+        [${JSON.stringify(partyRoom)}].version === window.openkRemote.client.state.invite_version`),
+      '房主可以按版本重新生成并保存邀请码');
+    pass('换房间后电视立即停声、跟随账号，并按账号和版本管理邀请码');
+
+    const guestSinger = {...singer, id:'9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
+      username:'hao', display_name:'阿豪'};
+    const guestIdentity = {...identity,
+      'X-OpenK-Account': Buffer.from(JSON.stringify(guestSinger), 'utf8').toString('base64url')};
+    const invitationCode = await accountPhone.evaluate(`document.querySelector('#inviteCode').textContent`);
+    const invitedPhone = await page(`/remote#room=${partyRoom}&code=${invitationCode}`, 390, 844, phonePort,
+      {origin:accountBase, headers:guestIdentity});
+    await waitFor(() => invitedPhone.evaluate(`!window.openkRemote?.starting &&
+      window.openkRemote.client?.id === ${JSON.stringify(partyRoom)} &&
+      document.querySelector('#accountChip .account-name').textContent === '阿豪'`), '新账号通过邀请链接加入聚会');
+    assert.ok(await invitedPhone.evaluate(`location.hash === '' &&
+      window.openkRemote.client.token === null && document.querySelector('#joinScreen').hidden`),
+      '进入自己的房间不会清掉待处理的邀请');
+    const accountLobby = await page('/rooms', 390, 844, phonePort, {origin:accountBase, headers:identity});
+    await waitFor(() => accountLobby.evaluate(`!window.openkRemote?.starting && window.openkRemote.lobbyOpen &&
+      location.pathname === '/rooms' && !document.querySelector('#joinScreen').hidden &&
+      window.openkRemote.client?.id === ${JSON.stringify(partyRoom)}`), '直接打开大厅仍停留在大厅');
+    await accountLobby.evaluate('window.__beforeLobbyReload = true');
+    await accountLobby.send('Page.reload');
+    await waitFor(() => accountLobby.evaluate(`window.__beforeLobbyReload === undefined &&
+      !window.openkRemote?.starting && window.openkRemote?.lobbyOpen &&
+      location.pathname === '/rooms' && window.openkRemote.client?.id === ${JSON.stringify(partyRoom)}`),
+      '刷新大厅后保留房间和大厅页面');
+    pass('账号邀请链接、大厅直达和大厅刷新都保留原始入口意图');
+
+    await accountPhone.click('#switchRoom');
+    await waitFor(() => accountPhone.evaluate(`location.pathname === '/rooms' &&
+      !document.querySelector('#currentRoomBanner').hidden &&
+      window.openkRemote.client?.running === true`), '逛大厅不会把人丢出房间');
+    await accountPhone.click('#returnRoom');
+    await waitFor(() => accountPhone.evaluate(`location.pathname === '/remote' &&
+      window.openkRemote.client.id === ${JSON.stringify(partyRoom)}`), '从大厅直接回到当前房间');
+    await accountPhone.click('#leaveRoom');
+    await waitFor(() => accountPhone.evaluate(`window.openkRemote.client?.state?.solo === true &&
+      window.openkRemote.client.id !== ${JSON.stringify(partyRoom)} &&
+      document.querySelector('#roomScreen').hidden === false`), '离开聚会回到自己的房间而不是空白页');
+    assert.ok(await accountPhone.evaluate(`document.querySelector('#soloHint').hidden === false &&
+      document.querySelector('#playHere').getAttribute('href') === '/?view=player'`), '私人房间提供完整的本机演唱入口');
+    const accountLibrary = await page('/library', 1024, 768, phonePort, {origin:accountBase, headers:identity});
+    await waitFor(() => accountLibrary.evaluate(`!!room?.id &&
+      document.querySelectorAll('.song-row').length > 0 &&
+      document.querySelector('#accountChip .account-name')?.textContent === '小玲'`), '账号模式曲库载入');
+    await accountLibrary.click('.song-row[data-id="000000000002"] .sr-pick');
+    await waitFor(() => accountPhone.evaluate(`window.openkRemote.client.state.queue
+      .concat([window.openkRemote.client.state.current]).some(item => item)`), '曲库点歌进入当前房间');
+    await waitFor(() => accountLibrary.evaluate(`!document.querySelector('#instAudio').paused &&
+      document.querySelector('#instAudio').currentTime > .05`), '账号曲库点歌在当前房间真实本机起播');
+    assert.ok(await accountLibrary.evaluate(`!document.querySelector('#stage').classList.contains('hidden') &&
+      room.client.state.current.job_id === state.currentJobId &&
+      localStorage.getItem('openk.queue') === null`),
+      '账号曲库恢复完整播放器但不另开房间外的本地队列');
+    pass('账号模式下大厅、离开、曲库和完整本机播放都使用同一个当前房间');
+
     if (artifacts) {
       await waitFor(() => classic.evaluate(`!document.querySelector('#instAudio').paused`), '经典下一首真实起播');
       await classic.click('#playBtn');
@@ -493,7 +776,7 @@ async function main() {
       await add('一起唱首歌');
       await waitFor(() => remote.evaluate(`document.querySelector('#remoteQueueCount').textContent === '1'`),
         '演示歌曲入队');
-      await remote.click('#remoteNext');
+      await roomControl(remote, '#remoteNext');
       await waitFor(() => tv.evaluate(`document.querySelector('#songTitle').textContent === '一起唱首歌' &&
         document.querySelector('#instrumental').readyState >= 2`), '演示舞台歌曲');
       if (!await tv.evaluate(`document.querySelector('#instrumental').paused`)) await remote.click('#remotePlay');
@@ -504,14 +787,21 @@ async function main() {
           '演示待唱队列');
       }
       if (!await remote.evaluate(`document.querySelector('#remoteGuide').getAttribute('aria-pressed') === 'true'`)) {
-        await remote.click('#remoteGuide');
+        await roomControl(remote, '#remoteGuide');
       }
       await waitFor(() => remote.evaluate(`document.querySelector('#remoteNotice').hidden`), '点歌提示自然消失');
       await remote.evaluate(`const seek = document.querySelector('#seek');
         seek.value = 2; seek.dispatchEvent(new Event('change', {bubbles:true})); window.scrollTo(0, 0);`);
       await waitFor(() => tv.evaluate(`Math.abs(document.querySelector('#instrumental').currentTime - 2) < 0.3`),
         '演示逐字歌词位置');
-      await remote.click('#remotePlay');
+      await tv.send('Page.bringToFront');
+      if (!await tv.evaluate('window.openkStage.armed')) {
+        const activate = await tv.evaluate(`document.querySelector('#pairPanel').hidden ? '#activate' : '#pairActivate'`);
+        await tv.click(activate);
+        await waitFor(() => tv.evaluate('window.openkStage.armed && !window.openkStage.activating'),
+          '重新启用演示电视声音');
+      }
+      if (!await remote.evaluate('window.openkRemote.client.state.playback.playing')) await remote.click('#remotePlay');
       await waitFor(() => tv.evaluate(`!document.querySelector('#instrumental').paused &&
         document.querySelector('#lyricCurrent').textContent.includes('一起')`), '演示真实播放');
       await screenshot(tv, 'tv-stage.png');
@@ -624,4 +914,5 @@ async function main() {
     } finally { await cleanup(); }
   }
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = { CDP, chromePath, freePort, waitFor, sleep, stop, errors };
+if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

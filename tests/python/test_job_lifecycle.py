@@ -130,6 +130,69 @@ class LifecycleTests(unittest.TestCase):
                 self.queue.submit("transcribe", {"out_dir": str(self.manager.job_dir(job["id"]))})
         self.assertFalse(self.manager.job_dir(job["id"]).exists())
 
+    def test_failed_only_delete_preserves_originals_and_other_jobs(self):
+        original = self.root / "original.wav"
+        original.write_bytes(b"original imported media")
+        retained = self.manager.create("https://example.org/retained", state="done")
+        retained_status = self.manager._status_path(retained["id"]).read_bytes()
+        for state in ("error", "cancelled"):
+            with self.subTest(state=state):
+                job = self.manager.create(str(original), local_path=str(original), state=state)
+                directory = self.manager.job_dir(job["id"])
+                (directory / "partial.wav").write_bytes(b"failed working copy")
+                self.assertTrue(self.manager.delete(job["id"], failed_only=True))
+                self.assertIsNone(self.manager.get(job["id"]))
+                self.assertFalse(directory.exists())
+                self.assertEqual(original.read_bytes(), b"original imported media")
+                self.assertEqual(self.manager._status_path(retained["id"]).read_bytes(), retained_status)
+                self.assertFalse(self.manager.delete(job["id"], failed_only=True))
+
+    def test_failed_only_delete_rejects_nonfailed_states_without_mutation(self):
+        for state in ("pending", "queued", "running", "done"):
+            with self.subTest(state=state):
+                job = self.manager.create(f"https://example.org/protected-{state}", state=state)
+                before = self.manager._status_path(job["id"]).read_bytes()
+                with self.assertRaises(JobConflictError):
+                    self.manager.delete(job["id"], failed_only=True)
+                self.assertEqual(self.manager.get(job["id"]), job)
+                self.assertEqual(self.manager._status_path(job["id"]).read_bytes(), before)
+
+    def test_failed_only_delete_waits_for_execution_to_unwind(self):
+        job = self.manager.create("https://example.org/unwinding")
+        with self.manager.execution(job["id"], job["generation"]):
+            self.manager.update(job["id"], state="error")
+            with self.assertRaises(JobConflictError):
+                self.manager.delete(job["id"], failed_only=True)
+            self.manager.check_active()
+        self.assertTrue(self.manager.delete(job["id"], failed_only=True))
+
+    def test_failed_only_delete_fences_retry_during_queue_cancellation(self):
+        job = self.manager.create("https://example.org/cancel-race", state="error")
+        entered, release = threading.Event(), threading.Event()
+        def block_queue_cancellation(_predicate):
+            entered.set()
+            self.assertTrue(release.wait(5), "Release the cancellation checkpoint")
+        with patch.object(self.queue, "cancel_where", side_effect=block_queue_cancellation):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self.manager.delete, job["id"], failed_only=True)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(JobConflictError):
+                        self.manager.retry_if_idle(job["id"])
+                finally:
+                    release.set()
+                self.assertTrue(future.result(timeout=5))
+        self.assertIsNone(self.manager.get(job["id"]))
+
+    def test_failed_delete_filesystem_failure_is_visible_and_can_be_retried(self):
+        job = self.manager.create("https://example.org/delete-recovery", state="error")
+        with patch("backend.jobs.shutil.rmtree", side_effect=OSError("Deletion unavailable")):
+            with self.assertRaisesRegex(OSError, "Deletion unavailable"):
+                self.manager.delete(job["id"], failed_only=True)
+        self.assertEqual(self.manager.get(job["id"])["state"], "cancelled")
+        self.assertTrue(self.manager.job_dir(job["id"]).exists())
+        self.assertTrue(self.manager.delete(job["id"], failed_only=True))
+
     def test_restart_durable_requeue_rotates_generation_and_cleans_staging(self):
         job, _ = self.manager.create_or_reuse("https://youtu.be/abcdefghijk")
         self.manager.update(job["id"], state="running", language="zh", local_path="/music/song.wav")
