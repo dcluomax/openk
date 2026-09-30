@@ -804,4 +804,10 @@ room or recording APIs. See [guest trials](docs/guest-trials.md).
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) ·
 架构参考 [UltraSinger](https://github.com/rakuri255/UltraSinger)。
 
-openk 代码以 MIT 许可发布。使用其中的模型时请遵守各自的许可与署名要求。
+openk 自有代码以 [MIT License](LICENSE) 发布。仓库内附带的代码、运行时依赖、
+FFmpeg 构建和自动下载的模型仍受各自许可证约束，详见
+[第三方许可说明](THIRD_PARTY_NOTICES.md)。
+
+MIT 许可不授予歌曲、视频、歌词、字幕、录音、封面或其他媒体内容的使用权。
+使用者应自行确认其下载、处理、演唱、录制、公开播放和再分发行为已取得必要授权，
+并遵守内容来源、模型提供方和所在地区的适用规则。
