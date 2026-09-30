@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- Keep the guest-trial Chrome profile and singleton socket under a short system
+  temporary path so browser regression tests remain reliable in deep CI workspaces.
+
 - Add confirmed deletion for failed/cancelled processing tasks, refreshing the
   list and badge without interrupting playback. Atomically reject stale deletion
   after a retry or completion; keep imported originals outside the job directory.

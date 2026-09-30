@@ -4,6 +4,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const { CDP, chromePath, freePort, waitFor, sleep, stop, errors } = require('./test_browser');
@@ -16,6 +17,14 @@ async function main() {
     ? process.env.TMPDIR : path.join(ROOT, '.test-artifacts');
   await fs.mkdir(base, { recursive: true });
   const scratch = await fs.mkdtemp(path.join(base, 'openk-trial-'));
+  const browserDirectory = await fs.mkdtemp(path.join(
+    process.platform === 'win32' ? os.tmpdir() : '/tmp', 'openk-trial-chrome-'));
+  if (process.platform !== 'win32') {
+    const socket = path.join(
+      await fs.realpath(browserDirectory), 'com.google.Chrome.XXXXXX', 'SingletonSocket');
+    assert.ok(Buffer.byteLength(socket) < 104,
+      'Chrome temporary socket path must stay below the Unix path limit');
+  }
   const tabs = [], checks = [];
   let server, disabled, browser, log = '', cleanupPromise;
   const cleanup = () => cleanupPromise ||= (async () => {
@@ -24,6 +33,7 @@ async function main() {
     await stop(disabled);
     await stop(server);
     await fs.rm(scratch, { recursive: true, force: true, maxRetries: 4, retryDelay: 200 });
+    await fs.rm(browserDirectory, { recursive: true, force: true, maxRetries: 4, retryDelay: 200 });
   })();
   const interrupted = () => { cleanup().finally(() => process.exit(130)); };
   process.once('SIGINT', interrupted);
@@ -124,14 +134,17 @@ async function main() {
     disabled = null;
     pass('A deployment with guest trials disabled serves no trial page, asset or API');
 
-    const profile = path.join(scratch, 'chrome');
+    const profile = path.join(browserDirectory, 'profile');
     browser = spawn(await chromePath(), [
       '--headless=new', '--remote-debugging-port=0', '--user-data-dir=' + profile,
       '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--mute-audio',
       '--disable-background-networking', '--disable-component-update', '--disable-sync', '--no-pings',
       '--no-proxy-server', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
       '--disable-background-timer-throttling', '--disable-renderer-backgrounding', 'about:blank',
-    ], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, TMPDIR: scratch } });
+    ], {
+      detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...env, TMPDIR: browserDirectory },
+    });
     browser.stdout.on('data', () => {});
     browser.stderr.on('data', chunk => { log += chunk; });
     const debugPort = await waitFor(async () =>
